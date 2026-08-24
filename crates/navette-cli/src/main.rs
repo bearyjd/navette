@@ -1,15 +1,40 @@
-//! Navette CLI. Scaffolding only — every subcommand below prints a stub
-//! message and exits non-zero. Multi-host targeting (PRP §4.2,
-//! `navette <host> run <app>`) is not wired yet; that's part of the
-//! Navette API design at milestone M1 (see `docs/prp/startup.md`).
+use std::env;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use navette_cli::{Client, render_result};
+use navette_protocol::{AttachInfo, RequestCommand, ResponseResult};
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
+use serde::{Deserialize, Serialize};
+use tempfile::TempDir;
+use tokio::process::{Child, Command as TokioCommand};
 
-/// Navette CLI — start, list, attach to, detach from, and kill
-/// per-app GUI sessions running under `navetted`.
 #[derive(Parser, Debug)]
 #[command(name = "navette", version, about)]
 struct Cli {
+    /// navetted WebSocket endpoint.
+    #[arg(
+        long,
+        env = "NAVETTE_URL",
+        default_value = "ws://127.0.0.1:9417/v1/ws",
+        global = true
+    )]
+    url: String,
+
+    /// SSH host used to forward the wprs Unix socket for attach.
+    #[arg(long, env = "NAVETTE_SSH", global = true)]
+    ssh: Option<String>,
+
+    /// wprsc executable.
+    #[arg(long, default_value = "wprsc", global = true)]
+    wprsc: String,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -18,19 +43,22 @@ struct Cli {
 enum Command {
     /// List all sessions.
     Ls,
-    /// Start (or re-launch) a named app as a new session.
+    /// Start an app as a new session.
     Run {
-        /// Application to launch (an XDG desktop entry id for now).
+        /// XDG desktop entry ID.
         app: String,
+        /// Explicit session name.
+        #[arg(long)]
+        name: Option<String>,
     },
-    /// Attach to a running session.
+    /// Attach to a running session until wprsc exits.
     Attach {
         /// Session name to attach to.
         session: String,
     },
-    /// Detach from a session without killing it.
+    /// Stop a tracked local attachment without killing the remote app.
     Detach {
-        /// Session to detach from. Detaches the current session if omitted.
+        /// Session to detach. May be omitted when exactly one attach is tracked.
         session: Option<String>,
     },
     /// Kill a session.
@@ -40,16 +68,243 @@ enum Command {
     },
 }
 
-fn main() {
+#[derive(Debug, Deserialize, Serialize)]
+struct AttachRecord {
+    session: String,
+    wprsc_pid: u32,
+    ssh_pid: Option<u32>,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let client = Client::new(&cli.url);
     match cli.command {
-        Command::Ls => eprintln!("navette: not yet implemented"),
-        Command::Run { app: _ } => eprintln!("navette: not yet implemented"),
-        Command::Attach { session: _ } => eprintln!("navette: not yet implemented"),
-        Command::Detach { session: _ } => eprintln!("navette: not yet implemented"),
-        Command::Kill { session: _ } => eprintln!("navette: not yet implemented"),
+        Command::Ls => print_result(client.call(RequestCommand::ListSessions).await?),
+        Command::Run { app, name } => print_result(
+            client
+                .call(RequestCommand::Run { app_id: app, name })
+                .await?,
+        ),
+        Command::Attach { session } => {
+            attach(&client, &cli.wprsc, cli.ssh.as_deref(), session).await
+        }
+        Command::Detach { session } => detach(&client, session.as_deref()).await,
+        Command::Kill { session } => {
+            print_result(client.call(RequestCommand::Kill { session }).await?)
+        }
     }
-    std::process::exit(1);
+}
+
+fn print_result(result: ResponseResult) -> Result<()> {
+    let rendered = render_result(&result);
+    if !rendered.is_empty() {
+        println!("{rendered}");
+    }
+    Ok(())
+}
+
+async fn attach(client: &Client, wprsc: &str, ssh: Option<&str>, session: String) -> Result<()> {
+    let response = client
+        .call(RequestCommand::Attach {
+            session: session.clone(),
+        })
+        .await?;
+    let ResponseResult::Attach { attach } = response else {
+        bail!("daemon returned an unexpected response to attach");
+    };
+
+    let outcome = run_attachment(wprsc, ssh, &attach).await;
+    let detach_result = client.call(RequestCommand::Detach { session }).await;
+    outcome?;
+    detach_result?;
+    Ok(())
+}
+
+async fn run_attachment(wprsc: &str, ssh: Option<&str>, attach: &AttachInfo) -> Result<()> {
+    let mut forward = None;
+    let mut forward_dir = None;
+    let socket_path = if let Some(target) = ssh {
+        let directory = TempDir::new().context("failed to create SSH forwarding directory")?;
+        let local_socket = directory.path().join("wprs.sock");
+        let mut child = spawn_process(
+            "ssh",
+            &[
+                "-o".into(),
+                "ExitOnForwardFailure=yes".into(),
+                "-N".into(),
+                "-L".into(),
+                format!("{}:{}", local_socket.display(), attach.socket_path),
+                target.into(),
+            ],
+        )?;
+        wait_for_socket(&local_socket, &mut child).await?;
+        forward = Some(child);
+        forward_dir = Some(directory);
+        local_socket
+    } else {
+        PathBuf::from(&attach.socket_path)
+    };
+
+    let mut wprsc_child = spawn_process(wprsc, &[format!("--socket={}", socket_path.display())])?;
+    let record = AttachRecord {
+        session: attach.session.clone(),
+        wprsc_pid: wprsc_child.id().context("wprsc PID is unavailable")?,
+        ssh_pid: forward.as_ref().and_then(Child::id),
+    };
+    let record_path = attach_record_path(&attach.session)?;
+    persist_record(&record_path, &record)?;
+
+    let status = tokio::select! {
+        status = wprsc_child.wait() => Some(status.context("failed to wait for wprsc")?),
+        signal = tokio::signal::ctrl_c() => {
+            signal.context("failed to listen for Ctrl-C")?;
+            terminate_record(&record);
+            None
+        }
+    };
+    let _ = wprsc_child.wait().await;
+    if let Some(mut ssh_child) = forward {
+        let _ = ssh_child.kill().await;
+        let _ = ssh_child.wait().await;
+    }
+    drop(forward_dir);
+    remove_record_if_owned(&record_path, record.wprsc_pid);
+
+    if let Some(status) = status
+        && !status.success()
+    {
+        bail!("wprsc exited with {status}");
+    }
+    Ok(())
+}
+
+fn spawn_process(program: &str, args: &[String]) -> Result<Child> {
+    let mut command = TokioCommand::new(program);
+    command.args(args);
+    command.as_std_mut().process_group(0);
+    command
+        .spawn()
+        .with_context(|| format!("failed to start {program}"))
+}
+
+async fn wait_for_socket(path: &Path, child: &mut Child) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if path.exists() {
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait().context("failed to poll ssh")? {
+            bail!("ssh forwarding exited before creating its socket: {status}");
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let _ = child.kill().await;
+            bail!("timed out waiting for SSH Unix-socket forwarding");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn detach(client: &Client, requested: Option<&str>) -> Result<()> {
+    let (path, record) = find_record(requested)?;
+    terminate_record(&record);
+    let result = client
+        .call(RequestCommand::Detach {
+            session: record.session.clone(),
+        })
+        .await?;
+    fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
+    print_result(result)
+}
+
+fn attach_record_root() -> Result<PathBuf> {
+    let runtime = env::var_os("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is unset")?;
+    Ok(PathBuf::from(runtime).join("navette/clients"))
+}
+
+fn attach_record_path(session: &str) -> Result<PathBuf> {
+    validate_session_component(session)?;
+    Ok(attach_record_root()?.join(format!("{session}.json")))
+}
+
+fn persist_record(path: &Path, record: &AttachRecord) -> Result<()> {
+    let parent = path.parent().context("attach record has no parent")?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    fs::write(path, serde_json::to_vec(record)?)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn find_record(requested: Option<&str>) -> Result<(PathBuf, AttachRecord)> {
+    let root = attach_record_root()?;
+    let paths = if let Some(session) = requested {
+        validate_session_component(session)?;
+        vec![root.join(format!("{session}.json"))]
+    } else {
+        fs::read_dir(&root)
+            .context("no tracked attachments")?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .collect()
+    };
+    if paths.len() != 1 {
+        bail!("specify a session when zero or multiple attachments are tracked");
+    }
+    let path = paths.into_iter().next().expect("length checked");
+    let record = serde_json::from_slice(&fs::read(&path).with_context(|| {
+        format!(
+            "no tracked attachment for {}",
+            requested.unwrap_or("session")
+        )
+    })?)
+    .with_context(|| format!("invalid attach record {}", path.display()))?;
+    Ok((path, record))
+}
+
+fn validate_session_component(session: &str) -> Result<()> {
+    let valid = (1..=64).contains(&session.len())
+        && session
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && session.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        });
+    if !valid {
+        bail!("invalid session name: {session}");
+    }
+    Ok(())
+}
+
+fn terminate_record(record: &AttachRecord) {
+    terminate_owned_process(record.wprsc_pid, "wprsc");
+    if let Some(pid) = record.ssh_pid {
+        terminate_owned_process(pid, "ssh");
+    }
+}
+
+fn terminate_owned_process(pid: u32, expected: &str) {
+    let comm = fs::read_to_string(format!("/proc/{pid}/comm"));
+    if comm.is_ok_and(|comm| comm.trim() == expected)
+        && let Ok(pid) = i32::try_from(pid)
+    {
+        let _ = kill(Pid::from_raw(-pid), Signal::SIGTERM);
+    }
+}
+
+fn remove_record_if_owned(path: &Path, pid: u32) {
+    let Ok(bytes) = fs::read(path) else {
+        return;
+    };
+    let Ok(current) = serde_json::from_slice::<AttachRecord>(&bytes) else {
+        return;
+    };
+    if current.wprsc_pid == pid {
+        let _ = fs::remove_file(path);
+    }
 }
 
 #[cfg(test)]
@@ -63,53 +318,62 @@ mod tests {
     }
 
     #[test]
-    fn parses_run_with_app() {
-        let cli = Cli::try_parse_from(["navette", "run", "firefox"]).unwrap();
-        match cli.command {
-            Command::Run { app } => assert_eq!(app, "firefox"),
-            other => panic!("expected Run, got {other:?}"),
-        }
+    fn parses_run_with_app_and_name() {
+        let cli = Cli::try_parse_from(["navette", "run", "firefox", "--name", "work"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Run { app, name }
+                if app == "firefox" && name.as_deref() == Some("work")
+        ));
     }
 
     #[test]
     fn parses_attach_with_session() {
         let cli = Cli::try_parse_from(["navette", "attach", "work-browser"]).unwrap();
-        match cli.command {
-            Command::Attach { session } => assert_eq!(session, "work-browser"),
-            other => panic!("expected Attach, got {other:?}"),
-        }
+        assert!(matches!(
+            cli.command,
+            Command::Attach { session } if session == "work-browser"
+        ));
     }
 
     #[test]
     fn parses_detach_without_session() {
         let cli = Cli::try_parse_from(["navette", "detach"]).unwrap();
-        match cli.command {
-            Command::Detach { session } => assert_eq!(session, None),
-            other => panic!("expected Detach, got {other:?}"),
-        }
+        assert!(matches!(cli.command, Command::Detach { session: None }));
     }
 
     #[test]
     fn parses_detach_with_session() {
         let cli = Cli::try_parse_from(["navette", "detach", "work-browser"]).unwrap();
-        match cli.command {
-            Command::Detach { session } => assert_eq!(session, Some("work-browser".to_string())),
-            other => panic!("expected Detach, got {other:?}"),
-        }
+        assert!(matches!(
+            cli.command,
+            Command::Detach { session: Some(session) } if session == "work-browser"
+        ));
     }
 
     #[test]
-    fn parses_kill_with_session() {
-        let cli = Cli::try_parse_from(["navette", "kill", "work-browser"]).unwrap();
-        match cli.command {
-            Command::Kill { session } => assert_eq!(session, "work-browser"),
-            other => panic!("expected Kill, got {other:?}"),
-        }
+    fn parses_global_transport_options() {
+        let cli = Cli::try_parse_from([
+            "navette",
+            "--url",
+            "ws://tower:9417/v1/ws",
+            "--ssh",
+            "tower",
+            "ls",
+        ])
+        .unwrap();
+        assert_eq!(cli.url, "ws://tower:9417/v1/ws");
+        assert_eq!(cli.ssh.as_deref(), Some("tower"));
     }
 
     #[test]
     fn rejects_run_without_app() {
-        let result = Cli::try_parse_from(["navette", "run"]);
-        assert!(result.is_err());
+        assert!(Cli::try_parse_from(["navette", "run"]).is_err());
+    }
+
+    #[test]
+    fn rejects_session_path_traversal_for_tracking() {
+        assert!(validate_session_component("../../record").is_err());
+        assert!(validate_session_component("work_browser-2").is_ok());
     }
 }
