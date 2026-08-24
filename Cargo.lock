@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "navette-bridge"
+version = "0.1.0"
+
+[[package]]
 name = "navette-protocol"
 version = "0.1.0"
 dependencies = [
