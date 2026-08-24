@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod media;
+
 /// WebSocket subprotocol negotiated by v1 clients and servers.
 pub const WEBSOCKET_SUBPROTOCOL: &str = "navette.v1";
 
