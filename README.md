@@ -6,8 +6,8 @@ put on a host as named, persistent sessions; the Navette shuttle carries
 your window to whatever device you're holding — a Linux desktop as a real
 native Wayland window, a phone over a decoded video stream.
 
-Org: Grepon Labs LLC · License: AGPL-3.0-only · Status: early scaffolding,
-no working software yet.
+Org: Grepon Labs LLC · License: AGPL-3.0-only · Status: experimental M1
+host daemon and Linux CLI.
 
 ## Project layout
 
@@ -29,3 +29,8 @@ no working software yet.
 ```bash
 cargo build --workspace
 ```
+
+The M1 daemon discovers XDG applications, supervises named sessions through
+stock `wprsd`, and exposes a loopback WebSocket API. The CLI can list, run,
+attach, detach, and kill sessions. See the
+[M1 operator guide](docs/operators/m1.md) for setup and safety boundaries.
