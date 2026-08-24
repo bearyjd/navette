@@ -2,3 +2,4 @@
 
 pub mod app_index;
 pub mod registry;
+pub mod supervisor;
