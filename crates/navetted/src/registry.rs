@@ -107,8 +107,13 @@ impl Registry {
         if self.sessions.contains_key(&session.name) {
             return Err(RegistryError::AlreadyExists(session.name));
         }
-        self.sessions.insert(session.name.clone(), session);
-        self.save()
+        let name = session.name.clone();
+        self.sessions.insert(name.clone(), session);
+        if let Err(error) = self.save() {
+            self.sessions.remove(&name);
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn replace(&mut self, session: Session) -> Result<(), RegistryError> {
@@ -116,8 +121,16 @@ impl Registry {
         if !self.sessions.contains_key(&session.name) {
             return Err(RegistryError::NotFound(session.name));
         }
-        self.sessions.insert(session.name.clone(), session);
-        self.save()
+        let name = session.name.clone();
+        let previous = self
+            .sessions
+            .insert(name.clone(), session)
+            .expect("existence checked");
+        if let Err(error) = self.save() {
+            self.sessions.insert(name, previous);
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn remove(&mut self, name: &str) -> Result<Session, RegistryError> {
@@ -125,30 +138,47 @@ impl Registry {
             .sessions
             .remove(name)
             .ok_or_else(|| RegistryError::NotFound(name.to_string()))?;
-        self.save()?;
+        if let Err(error) = self.save() {
+            self.sessions.insert(name.to_string(), session);
+            return Err(error);
+        }
         Ok(session)
     }
 
     pub fn mark_attached(&mut self, name: &str, now_ms: u64) -> Result<Session, RegistryError> {
-        let session = self
+        let previous = self
             .sessions
-            .get_mut(name)
+            .get(name)
+            .cloned()
             .ok_or_else(|| RegistryError::NotFound(name.to_string()))?;
-        session.last_attached_at_ms = Some(now_ms);
-        session.client_count = session.client_count.saturating_add(1);
-        let result = session.clone();
-        self.save()?;
+        let result = {
+            let session = self.sessions.get_mut(name).expect("existence checked");
+            session.last_attached_at_ms = Some(now_ms);
+            session.client_count = session.client_count.saturating_add(1);
+            session.clone()
+        };
+        if let Err(error) = self.save() {
+            self.sessions.insert(name.to_string(), previous);
+            return Err(error);
+        }
         Ok(result)
     }
 
     pub fn mark_detached(&mut self, name: &str) -> Result<Session, RegistryError> {
-        let session = self
+        let previous = self
             .sessions
-            .get_mut(name)
+            .get(name)
+            .cloned()
             .ok_or_else(|| RegistryError::NotFound(name.to_string()))?;
-        session.client_count = session.client_count.saturating_sub(1);
-        let result = session.clone();
-        self.save()?;
+        let result = {
+            let session = self.sessions.get_mut(name).expect("existence checked");
+            session.client_count = session.client_count.saturating_sub(1);
+            session.clone()
+        };
+        if let Err(error) = self.save() {
+            self.sessions.insert(name.to_string(), previous);
+            return Err(error);
+        }
         Ok(result)
     }
 
@@ -156,6 +186,7 @@ impl Registry {
     where
         F: FnMut(u32) -> bool,
     {
+        let previous = self.sessions.clone();
         let mut changed = false;
         for session in self.sessions.values_mut() {
             if matches!(
@@ -168,8 +199,9 @@ impl Registry {
                 changed = true;
             }
         }
-        if changed {
-            self.save()?;
+        if changed && let Err(error) = self.save() {
+            self.sessions = previous;
+            return Err(error);
         }
         Ok(changed)
     }
@@ -327,6 +359,20 @@ mod tests {
         let error = registry.insert(session("work")).unwrap_err();
         assert!(matches!(error, RegistryError::AlreadyExists(_)));
         assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn failed_persist_rolls_back_in_memory_insert() {
+        let temp = TempDir::new().unwrap();
+        let blocker = temp.path().join("not-a-directory");
+        fs::write(&blocker, b"blocker").unwrap();
+        let mut registry = Registry::open(blocker.join("registry.json")).unwrap();
+
+        assert!(matches!(
+            registry.insert(session("work")),
+            Err(RegistryError::Persist { .. })
+        ));
+        assert!(registry.list().is_empty());
     }
 
     #[test]

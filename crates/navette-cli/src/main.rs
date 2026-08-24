@@ -122,6 +122,7 @@ async fn attach(client: &Client, wprsc: &str, ssh: Option<&str>, session: String
 }
 
 async fn run_attachment(wprsc: &str, ssh: Option<&str>, attach: &AttachInfo) -> Result<()> {
+    let record_path = attach_record_path(&attach.session)?;
     let mut forward = None;
     let mut forward_dir = None;
     let socket_path = if let Some(target) = ssh {
@@ -146,14 +147,25 @@ async fn run_attachment(wprsc: &str, ssh: Option<&str>, attach: &AttachInfo) -> 
         PathBuf::from(&attach.socket_path)
     };
 
-    let mut wprsc_child = spawn_process(wprsc, &[format!("--socket={}", socket_path.display())])?;
+    let mut wprsc_child =
+        match spawn_process(wprsc, &[format!("--socket={}", socket_path.display())]) {
+            Ok(child) => child,
+            Err(error) => {
+                stop_child(&mut forward).await;
+                return Err(error);
+            }
+        };
     let record = AttachRecord {
         session: attach.session.clone(),
         wprsc_pid: wprsc_child.id().context("wprsc PID is unavailable")?,
         ssh_pid: forward.as_ref().and_then(Child::id),
     };
-    let record_path = attach_record_path(&attach.session)?;
-    persist_record(&record_path, &record)?;
+    if let Err(error) = persist_record(&record_path, &record) {
+        let _ = wprsc_child.kill().await;
+        let _ = wprsc_child.wait().await;
+        stop_child(&mut forward).await;
+        return Err(error);
+    }
 
     let status = tokio::select! {
         status = wprsc_child.wait() => Some(status.context("failed to wait for wprsc")?),
@@ -164,10 +176,7 @@ async fn run_attachment(wprsc: &str, ssh: Option<&str>, attach: &AttachInfo) -> 
         }
     };
     let _ = wprsc_child.wait().await;
-    if let Some(mut ssh_child) = forward {
-        let _ = ssh_child.kill().await;
-        let _ = ssh_child.wait().await;
-    }
+    stop_child(&mut forward).await;
     drop(forward_dir);
     remove_record_if_owned(&record_path, record.wprsc_pid);
 
@@ -177,6 +186,13 @@ async fn run_attachment(wprsc: &str, ssh: Option<&str>, attach: &AttachInfo) -> 
         bail!("wprsc exited with {status}");
     }
     Ok(())
+}
+
+async fn stop_child(child: &mut Option<Child>) {
+    if let Some(mut child) = child.take() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
 }
 
 fn spawn_process(program: &str, args: &[String]) -> Result<Child> {
