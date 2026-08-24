@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/navette-protocol",
     "crates/navette-bridge",
+    "crates/navetted",
 ]
 
 [workspace.package]
