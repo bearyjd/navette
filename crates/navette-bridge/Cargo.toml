@@ -8,5 +8,6 @@ publish.workspace = true
 [dependencies]
 anyhow = "1"
 calloop = "0.14"
+nix = { version = "0.30", features = ["poll", "process", "signal"] }
 thiserror = "2"
 wprs = { git = "https://github.com/bearyjd/wprs.git", rev = "f45c5d5b9ce09e9030eb2cd144b9ac4f774062bc" }
