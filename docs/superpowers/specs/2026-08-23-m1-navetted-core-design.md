@@ -1,6 +1,6 @@
 # Navette M1 — navetted Core Design
 
-Status: Approved by M0 gate · Date: 2026-08-23
+Status: Implemented · Date: 2026-08-23
 
 ## Goal
 
@@ -153,4 +153,3 @@ the API contract lands now.
 - Android and generated Kotlin types (M3)
 - Icons/thumbnails and multi-host address book (M4)
 - Application-layer auth, public listeners, TLS termination, and relays
-

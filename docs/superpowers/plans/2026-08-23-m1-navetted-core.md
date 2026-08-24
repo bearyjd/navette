@@ -1,5 +1,7 @@
 # Navette M1 Core Implementation Plan
 
+Status: Complete · 2026-08-23
+
 Goal: implement the approved M1 design as small buildable commits.
 
 ## Task 1 — Protocol contract
