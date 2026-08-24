@@ -6,6 +6,12 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+anyhow = "1"
+freedesktop-desktop-entry = "0.8.1"
+navette-protocol = { path = "../navette-protocol" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
