@@ -14,6 +14,12 @@ pub struct AppIndex {
 }
 
 impl AppIndex {
+    pub fn from_apps(apps: impl IntoIterator<Item = App>) -> Self {
+        Self {
+            apps: apps.into_iter().map(|app| (app.id.clone(), app)).collect(),
+        }
+    }
+
     pub fn load() -> Self {
         let locales = get_languages_from_env();
         let desktops = current_desktop().unwrap_or_default();
