@@ -3,12 +3,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Json;
 use axum::Router;
-use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response as HttpResponse};
 use axum::routing::{any, get};
 use futures_util::{SinkExt, StreamExt};
+use navette_protocol::media::{
+    MAX_INPUT_MESSAGE, MEDIA_WEBSOCKET_SUBPROTOCOL, MediaInput, MediaServerMessage,
+};
 use navette_protocol::{
     API_VERSION, AttachInfo, ErrorCode, Request, RequestCommand, Response, ResponseResult,
     WEBSOCKET_SUBPROTOCOL,
@@ -16,14 +19,17 @@ use navette_protocol::{
 use serde_json::{Value, json};
 
 use crate::app_index::AppIndex;
+use crate::media::{MediaHub, MediaHubError};
 use crate::registry::{RegistryError, validate_session_name};
 use crate::supervisor::{ProcessRunner, Supervisor, SupervisorError};
 
 const MAX_CONTROL_MESSAGE_SIZE: usize = 1024 * 1024;
+const MAX_INPUT_MESSAGES_PER_SECOND: u32 = 240;
 
 pub struct ApiState<R: ProcessRunner> {
     pub apps: Arc<AppIndex>,
     pub supervisor: Arc<Supervisor<R>>,
+    pub media: MediaHub,
     clipboard: Arc<Mutex<Option<String>>>,
 }
 
@@ -32,6 +38,7 @@ impl<R: ProcessRunner> Clone for ApiState<R> {
         Self {
             apps: Arc::clone(&self.apps),
             supervisor: Arc::clone(&self.supervisor),
+            media: self.media.clone(),
             clipboard: Arc::clone(&self.clipboard),
         }
     }
@@ -42,6 +49,7 @@ impl<R: ProcessRunner> ApiState<R> {
         Self {
             apps,
             supervisor,
+            media: MediaHub::default(),
             clipboard: Arc::new(Mutex::new(None)),
         }
     }
@@ -51,7 +59,151 @@ pub fn router<R: ProcessRunner>(state: ApiState<R>) -> Router {
     Router::new()
         .route("/healthz", get(health))
         .route("/v1/ws", any(websocket::<R>))
+        .route("/v1/sessions/{session}/media", any(media_websocket::<R>))
         .with_state(state)
+}
+
+async fn media_websocket<R: ProcessRunner>(
+    ws: WebSocketUpgrade,
+    Path(session): Path<String>,
+    State(state): State<ApiState<R>>,
+) -> HttpResponse {
+    if validate_session_name(&session).is_err() {
+        return (StatusCode::BAD_REQUEST, "invalid session name").into_response();
+    }
+    let exists = state
+        .supervisor
+        .registry()
+        .lock()
+        .ok()
+        .and_then(|registry| registry.get(&session).cloned())
+        .is_some_and(|record| {
+            matches!(
+                record.status,
+                navette_protocol::SessionStatus::Starting
+                    | navette_protocol::SessionStatus::Running
+            )
+        });
+    if !exists {
+        return (StatusCode::NOT_FOUND, "session is not running").into_response();
+    }
+    if !ws
+        .requested_protocols()
+        .any(|protocol| protocol.as_bytes() == MEDIA_WEBSOCKET_SUBPROTOCOL.as_bytes())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("WebSocket subprotocol {MEDIA_WEBSOCKET_SUBPROTOCOL} is required"),
+        )
+            .into_response();
+    }
+    let Ok(attachment) = state.media.attach(&session) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "session media is not ready",
+        )
+            .into_response();
+    };
+
+    ws.protocols([MEDIA_WEBSOCKET_SUBPROTOCOL])
+        .max_message_size(MAX_INPUT_MESSAGE * 2)
+        .on_upgrade(move |socket| handle_media_socket(socket, attachment))
+}
+
+async fn handle_media_socket(socket: WebSocket, attachment: crate::media::MediaAttachment) {
+    let (mut sender, mut receiver) = socket.split();
+    let mut rate_window = std::time::Instant::now();
+    let mut rate_count = 0_u32;
+    loop {
+        tokio::select! {
+            packet = attachment.recv() => {
+                let Some(packet) = packet else {
+                    break;
+                };
+                let Ok(encoded) = packet.encode() else {
+                    tracing::error!("media hub produced an invalid packet");
+                    break;
+                };
+                if sender.send(Message::Binary(encoded.into())).await.is_err() {
+                    break;
+                }
+            }
+            incoming = receiver.next() => {
+                let Some(incoming) = incoming else {
+                    break;
+                };
+                let error = match incoming {
+                    Ok(Message::Text(text)) => {
+                        if text.len() > MAX_INPUT_MESSAGE {
+                            let response = MediaServerMessage::Error {
+                                code: "message_too_large".to_string(),
+                                message: format!(
+                                    "input message exceeds {MAX_INPUT_MESSAGE} bytes"
+                                ),
+                            };
+                            let Ok(encoded) = serde_json::to_string(&response) else {
+                                break;
+                            };
+                            if sender.send(Message::Text(encoded.into())).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        if rate_window.elapsed() >= std::time::Duration::from_secs(1) {
+                            rate_window = std::time::Instant::now();
+                            rate_count = 0;
+                        }
+                        rate_count = rate_count.saturating_add(1);
+                        if rate_count > MAX_INPUT_MESSAGES_PER_SECOND {
+                            Some(("rate_limited", "input rate limit exceeded".to_string()))
+                        } else {
+                            match serde_json::from_str::<MediaInput>(&text) {
+                                Ok(input) => attachment.submit_input(input).err().map(media_hub_error),
+                                Err(error) => Some(("invalid_input", format!("invalid input: {error}"))),
+                            }
+                        }
+                    }
+                    Ok(Message::Binary(_)) => Some((
+                        "invalid_input",
+                        "client media messages must be JSON text".to_string(),
+                    )),
+                    Ok(Message::Close(_)) => break,
+                    Ok(Message::Ping(_) | Message::Pong(_)) => None,
+                    Err(error) => {
+                        tracing::debug!(%error, "media WebSocket receive failed");
+                        break;
+                    }
+                };
+                if let Some((code, message)) = error {
+                    let response = MediaServerMessage::Error {
+                        code: code.to_string(),
+                        message,
+                    };
+                    let Ok(encoded) = serde_json::to_string(&response) else {
+                        break;
+                    };
+                    if sender.send(Message::Text(encoded.into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn media_hub_error(error: MediaHubError) -> (&'static str, String) {
+    let code = match error {
+        MediaHubError::InvalidInput(_) => "invalid_input",
+        MediaHubError::InputBackpressure => "rate_limited",
+        MediaHubError::UnknownSession(_)
+        | MediaHubError::InvalidPacket(_)
+        | MediaHubError::MissingConfig
+        | MediaHubError::WrongStream { .. }
+        | MediaHubError::NonMonotonicSequence
+        | MediaHubError::InvalidDimensions
+        | MediaHubError::Unavailable => "unavailable",
+    };
+    (code, error.to_string())
 }
 
 async fn health() -> Json<Value> {
@@ -278,7 +430,8 @@ mod tests {
     use std::time::Duration;
 
     use futures_util::{SinkExt, StreamExt};
-    use navette_protocol::{App, ResponseOutcome};
+    use navette_protocol::media::{MediaFlags, MediaHeader, MediaKind, MediaPacket};
+    use navette_protocol::{App, ResponseOutcome, Session, SessionStatus};
     use tempfile::TempDir;
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
@@ -329,6 +482,44 @@ mod tests {
             Duration::from_millis(1),
         );
         ApiState::new(Arc::new(apps), Arc::new(supervisor))
+    }
+
+    fn add_running_session(state: &ApiState<NoopRunner>, name: &str) {
+        state
+            .supervisor
+            .registry()
+            .lock()
+            .unwrap()
+            .insert(Session {
+                name: name.into(),
+                app_id: "firefox".into(),
+                app_pid: 10,
+                daemon_pid: 11,
+                wayland_display: format!("navette-{name}"),
+                socket_path: format!("/tmp/{name}.sock"),
+                created_at_ms: 1,
+                last_attached_at_ms: None,
+                client_count: 0,
+                status: SessionStatus::Running,
+            })
+            .unwrap();
+    }
+
+    fn media_packet(kind: MediaKind, sequence: u64, keyframe: bool) -> MediaPacket {
+        MediaPacket::new(
+            MediaHeader {
+                kind,
+                flags: MediaFlags::new(keyframe, false),
+                stream_id: 1,
+                sequence,
+                timestamp_us: sequence,
+                payload_len: 0,
+                width: 1280,
+                height: 720,
+            },
+            vec![sequence as u8],
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -454,6 +645,68 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("400"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn media_websocket_replays_bootstrap_and_routes_validated_input() {
+        let temp = TempDir::new().unwrap();
+        let state = test_state(&temp);
+        add_running_session(&state, "work");
+        let mut input = state.media.register_session("work");
+        state
+            .media
+            .publish("work", media_packet(MediaKind::StreamConfig, 1, false))
+            .unwrap();
+        state
+            .media
+            .publish("work", media_packet(MediaKind::Video, 2, true))
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(state)).await.unwrap();
+        });
+        let mut request = format!("ws://{address}/v1/sessions/work/media")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            MEDIA_WEBSOCKET_SUBPROTOCOL.parse().unwrap(),
+        );
+        let (mut socket, response) = connect_async(request).await.unwrap();
+        assert_eq!(
+            response.headers()["Sec-WebSocket-Protocol"],
+            MEDIA_WEBSOCKET_SUBPROTOCOL
+        );
+        let config = socket.next().await.unwrap().unwrap().into_data();
+        let keyframe = socket.next().await.unwrap().unwrap().into_data();
+        assert_eq!(
+            MediaPacket::decode(&config).unwrap().header.kind,
+            MediaKind::StreamConfig
+        );
+        assert!(
+            MediaPacket::decode(&keyframe)
+                .unwrap()
+                .header
+                .flags
+                .keyframe()
+        );
+
+        socket
+            .send(ClientMessage::Text(
+                r#"{"type":"viewport_resize","width":10,"height":10}"#.into(),
+            ))
+            .await
+            .unwrap();
+        let error = socket.next().await.unwrap().unwrap();
+        assert!(error.to_text().unwrap().contains("invalid_input"));
+        socket
+            .send(ClientMessage::Text(r#"{"type":"request_keyframe"}"#.into()))
+            .await
+            .unwrap();
+        assert_eq!(input.recv().await, Some(MediaInput::RequestKeyframe));
         server.abort();
     }
 
