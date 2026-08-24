@@ -6,3 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+anyhow = "1"
+calloop = "0.14"
+thiserror = "2"
+wprs = { git = "https://github.com/bearyjd/wprs.git", rev = "f45c5d5b9ce09e9030eb2cd144b9ac4f774062bc" }

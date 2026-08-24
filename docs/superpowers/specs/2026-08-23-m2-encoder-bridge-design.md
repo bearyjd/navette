@@ -11,10 +11,11 @@ remains M3.
 
 ## Upstream boundary
 
-M2 pins wprs commit `57139a03abf466c5f24b737835a61121bd25c8c0`, the
-revision exercised by M0. Stock `wprsd` remains an external per-session
-process. `navette-bridge` links wprs serialization and protocol types at the
-same revision and consumes the server's Unix socket directly.
+M2 starts from wprs commit `57139a03abf466c5f24b737835a61121bd25c8c0`, the
+revision exercised by M0, and pins reviewed fork merge
+`f45c5d5b9ce09e9030eb2cd144b9ac4f774062bc`. Stock `wprsd` remains an external
+per-session process. `navette-bridge` links wprs serialization and protocol
+types at the same revision and consumes the server's Unix socket directly.
 
 The public wprs `Serializer::new_client` currently terminates the whole process
 when its peer disconnects and uses an unbounded writer queue. That behavior is

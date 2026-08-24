@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install Wayland build dependencies
+        run: sudo apt-get update && sudo apt-get install --yes libwayland-dev libxkbcommon-dev
       - name: Install stable Rust
         run: |
           rustup update stable
