@@ -566,6 +566,101 @@ mod tests {
         assert!(router.handle(&video(1, 2)).is_empty());
     }
 
+    /// Buffers one access unit's frame instead of returning it immediately,
+    /// then hands back both frames together on the next call — modeling the
+    /// decode pipeline's lag with a queue depth greater than one, unlike
+    /// `FakeDecoder` (always exactly one frame per call, so popping the
+    /// timestamp queue's front is indistinguishable from using the current
+    /// packet's timestamp).
+    struct LaggingDecoder {
+        config: DecoderConfig,
+        buffered: Option<DecodedFrame>,
+        sequence: u8,
+    }
+
+    impl LaggingDecoder {
+        fn new(config: DecoderConfig) -> Result<Self, DecoderError> {
+            Ok(Self {
+                config: config.validate()?,
+                buffered: None,
+                sequence: 0,
+            })
+        }
+
+        fn next_frame(&mut self) -> DecodedFrame {
+            let shade = self.sequence;
+            self.sequence = self.sequence.wrapping_add(1);
+            DecodedFrame {
+                width: self.config.width,
+                height: self.config.height,
+                pixels: vec![shade; self.config.frame_len()],
+                decode_time: Duration::ZERO,
+            }
+        }
+    }
+
+    impl Decoder for LaggingDecoder {
+        fn config(&self) -> &DecoderConfig {
+            &self.config
+        }
+
+        fn decode(&mut self, access_unit: &[u8]) -> Result<Vec<DecodedFrame>, DecoderError> {
+            if access_unit.is_empty() {
+                return Err(DecoderError::EmptyAccessUnit);
+            }
+            let frame = self.next_frame();
+            match self.buffered.take() {
+                None => {
+                    self.buffered = Some(frame);
+                    Ok(Vec::new())
+                }
+                Some(previous) => Ok(vec![previous, frame]),
+            }
+        }
+
+        fn drain(&mut self) -> Vec<DecodedFrame> {
+            self.buffered.take().into_iter().collect()
+        }
+
+        fn reconfigure(&mut self, config: DecoderConfig) -> Result<(), DecoderError> {
+            self.config = config.validate()?;
+            self.buffered = None;
+            self.sequence = 0;
+            Ok(())
+        }
+
+        fn metrics(&self) -> DecoderMetrics {
+            DecoderMetrics::default()
+        }
+    }
+
+    #[test]
+    fn decoded_frames_are_paired_with_the_access_unit_that_actually_produced_them() {
+        let mut router = StreamRouter::new(Box::new(|config: &DecoderConfig| {
+            Ok(Box::new(LaggingDecoder::new(config.clone())?) as Box<dyn Decoder>)
+        }));
+        router.handle(&stream_config(1, 1, 11, 12, &CODEC_CONFIG));
+
+        // Access unit 2 (timestamp 2000us) is buffered internally by the
+        // decoder rather than returned, so nothing comes back yet.
+        assert!(router.handle(&video(1, 2)).is_empty());
+
+        // Access unit 3 (timestamp 3000us) drains both frames at once. If
+        // the router labeled every drained frame with the current packet's
+        // timestamp (3000) instead of popping the pending queue, the first
+        // frame — which was actually produced by access unit 2 — would be
+        // mislabeled 3000 instead of 2000.
+        let timestamps: Vec<u64> = router
+            .handle(&video(1, 3))
+            .into_iter()
+            .map(|event| match event {
+                StreamEvent::Frame(frame) => frame.timestamp_us,
+                other => panic!("expected a decoded frame, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(timestamps, vec![2000, 3000]);
+    }
+
     /// Buffers exactly one frame internally instead of returning it
     /// immediately, so `end`'s flush-before-`Ended` behaviour can be
     /// exercised: `decode` reports priming (nothing ready yet) and `drain`
