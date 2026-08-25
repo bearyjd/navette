@@ -357,8 +357,6 @@ pub enum MediaHubError {
     InputBackpressure,
     #[error("stream configuration has not been published")]
     MissingConfig,
-    #[error("packet stream {actual} does not match active stream {expected}")]
-    WrongStream { expected: u64, actual: u64 },
     #[error("media sequence must increase monotonically")]
     NonMonotonicSequence,
     #[error("coded dimensions are out of range")]

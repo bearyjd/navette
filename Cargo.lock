@@ -1097,6 +1097,7 @@ dependencies = [
  "calloop",
  "navette-protocol",
  "nix 0.30.1",
+ "tempfile",
  "thiserror 2.0.20",
  "wprs",
 ]

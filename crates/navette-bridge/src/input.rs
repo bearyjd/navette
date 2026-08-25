@@ -265,3 +265,653 @@ fn pointer_event(key: SurfaceKey, position: Point<f64>, kind: PointerEventKind) 
         kind,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::sync::mpsc::TryRecvError;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use calloop::channel::Channel;
+    use tempfile::TempDir;
+    use wprs::serialization::wayland::{
+        Buffer, BufferAssignment, BufferData, BufferFormat, BufferMetadata, Role, SubSurfaceState,
+        SurfaceRequest, SurfaceRequestPayload, SurfaceState,
+    };
+    use wprs::serialization::xdg_shell::{XdgToplevelId, XdgToplevelState};
+    use wprs::serialization::{ClientId, RecvType, Request, Serializer};
+
+    use super::*;
+    use crate::Scene;
+
+    fn surface_state(client: u64, surface: u64, role: Option<Role>) -> SurfaceState {
+        SurfaceState {
+            client: ClientId(client),
+            id: WlSurfaceId(surface),
+            buffer: None,
+            role,
+            buffer_scale: 1,
+            buffer_transform: None,
+            opaque_region: None,
+            input_region: None,
+            z_ordered_children: Vec::new(),
+            damage: None,
+            output_ids: Vec::new(),
+            viewport_state: None,
+            xdg_surface_state: None,
+        }
+    }
+
+    fn toplevel_role() -> Role {
+        Role::XdgToplevel(XdgToplevelState {
+            id: XdgToplevelId(1),
+            parent: None,
+            title: None,
+            app_id: None,
+            decoration_mode: None,
+            maximized: None,
+            fullscreen: None,
+        })
+    }
+
+    fn subsurface_role(parent: u64) -> Role {
+        Role::SubSurface(SubSurfaceState {
+            parent: WlSurfaceId(parent),
+            location: Point { x: 0, y: 0 },
+            sync: true,
+        })
+    }
+
+    fn external_buffer(width: i32, height: i32, format: BufferFormat) -> BufferAssignment {
+        BufferAssignment::New(Buffer {
+            metadata: BufferMetadata {
+                width,
+                height,
+                stride: width * 4,
+                format,
+            },
+            data: BufferData::External,
+        })
+    }
+
+    fn commit(state: SurfaceState) -> RecvType<Request> {
+        RecvType::Object(Request::Surface(SurfaceRequest {
+            client: state.client,
+            surface: state.id,
+            payload: SurfaceRequestPayload::Commit(state),
+        }))
+    }
+
+    /// Builds a scene containing one toplevel per `(client_id, surface_id)`
+    /// pair, each with a real `width`x`height` committed image so
+    /// `validate_surface` treats it as a known toplevel.
+    fn scene_with_toplevels(surfaces: &[(u64, u64, u32, u32)]) -> Scene {
+        let mut scene = Scene::default();
+        for &(client, surface, width, height) in surfaces {
+            scene
+                .apply(RecvType::RawBuffer(vec![
+                    0;
+                    width as usize
+                        * height as usize
+                        * 4
+                ]))
+                .unwrap();
+            let mut state = surface_state(client, surface, Some(toplevel_role()));
+            state.buffer = Some(external_buffer(
+                width as i32,
+                height as i32,
+                BufferFormat::Xrgb8888,
+            ));
+            scene.apply(commit(state)).unwrap();
+        }
+        scene
+    }
+
+    /// A toplevel plus a committed (but non-toplevel) subsurface child, used
+    /// to exercise `validate_surface`'s `NotToplevel` branch: the subsurface
+    /// has an image (so it's a *known* surface) but isn't a toplevel.
+    fn scene_with_toplevel_and_subsurface() -> Scene {
+        let mut scene = scene_with_toplevels(&[(1, 1, 8, 8)]);
+        scene.apply(RecvType::RawBuffer(vec![0; 4])).unwrap();
+        let mut child = surface_state(1, 2, Some(subsurface_role(1)));
+        child.buffer = Some(external_buffer(1, 1, BufferFormat::Argb8888));
+        scene.apply(commit(child)).unwrap();
+        scene
+    }
+
+    /// `wprs::utils::bind_user_socket` temporarily widens the process-wide
+    /// umask around each bind, without synchronization. Tests run in
+    /// parallel threads, so a concurrent `tempfile::tempdir()` (or any other
+    /// file creation) racing against that window can be created with a
+    /// mode that strips its own owner-execute bit, making the directory
+    /// untraversable and any later bind inside it fail with `EACCES`.
+    /// Serializing the temp-dir-creation-through-bind span here works
+    /// around that (upstream, not ours to fix) race.
+    static WPRSD_BIND_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A headless stand-in for `wprsd`: binds a real Unix socket, lets a
+    /// `WprsTransport` connect to it, and hands back the raw `Event`s the
+    /// transport sends so tests can assert on them without a mocking
+    /// framework.
+    struct FakeWprsd {
+        events: Channel<RecvType<Event>>,
+        _server: Serializer<Request, Event>,
+        _dir: TempDir,
+    }
+
+    impl FakeWprsd {
+        fn connect() -> (WprsTransport, Self) {
+            let guard = WPRSD_BIND_LOCK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let dir = tempfile::tempdir().expect("create temp dir for fake wprsd socket");
+            let socket = dir.path().join("wprs.sock");
+            let mut server: Serializer<Request, Event> =
+                Serializer::new_server(&socket).expect("bind fake wprsd socket");
+            drop(guard);
+            let events = server.reader().expect("fake wprsd reader already taken");
+            let transport = WprsTransport::connect(&socket).expect("connect to fake wprsd");
+            (
+                transport,
+                Self {
+                    events,
+                    _server: server,
+                    _dir: dir,
+                },
+            )
+        }
+
+        /// Returns the next event the transport sent, skipping the
+        /// connection preamble (`WprsClientConnect`, `Output`) that
+        /// `WprsTransport::connect` emits automatically.
+        fn recv(&self) -> Event {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match self.events.try_recv() {
+                    Ok(RecvType::Object(Event::WprsClientConnect | Event::Output(_))) => continue,
+                    Ok(RecvType::Object(event)) => return event,
+                    Ok(RecvType::RawBuffer(_)) => continue,
+                    Err(TryRecvError::Empty) => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "timed out waiting for a wprs event"
+                        );
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(TryRecvError::Disconnected) => panic!("fake wprsd channel disconnected"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pointer_input_routes_to_focused_toplevel_and_enters_once_per_focus_change() {
+        let scene = scene_with_toplevels(&[(1, 1, 8, 8), (1, 2, 8, 8)]);
+        let key2 = SurfaceKey {
+            client_id: 1,
+            surface_id: 2,
+        };
+        let (transport, fake) = FakeWprsd::connect();
+        let mut state = InputState::default();
+
+        state
+            .apply(
+                7,
+                MediaInput::PointerMotion {
+                    client_id: 1,
+                    surface_id: 1,
+                    x: 3.0,
+                    y: 4.0,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+        match fake.recv() {
+            Event::PointerFrame(events) => {
+                assert_eq!(events.len(), 2);
+                assert_eq!(events[0].surface_id, WlSurfaceId(1));
+                assert!(matches!(events[0].kind, PointerEventKind::Enter { .. }));
+                assert!(matches!(events[1].kind, PointerEventKind::Motion));
+                assert_eq!(events[1].position, Point { x: 3.0, y: 4.0 });
+            }
+            other => panic!("expected a pointer frame, got {other:?}"),
+        }
+
+        // A second motion to the same surface must not re-enter.
+        state
+            .apply(
+                7,
+                MediaInput::PointerMotion {
+                    client_id: 1,
+                    surface_id: 1,
+                    x: 5.0,
+                    y: 5.0,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+        match fake.recv() {
+            Event::PointerFrame(events) => {
+                assert_eq!(events.len(), 1);
+                assert!(matches!(events[0].kind, PointerEventKind::Motion));
+            }
+            other => panic!("expected a pointer frame, got {other:?}"),
+        }
+
+        // Motion to a different surface re-enters.
+        state
+            .apply(
+                7,
+                MediaInput::PointerMotion {
+                    client_id: 1,
+                    surface_id: 2,
+                    x: 1.0,
+                    y: 1.0,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+        match fake.recv() {
+            Event::PointerFrame(events) => {
+                assert_eq!(events.len(), 2);
+                assert_eq!(events[0].surface_id, WlSurfaceId(2));
+                assert!(matches!(events[0].kind, PointerEventKind::Enter { .. }));
+            }
+            other => panic!("expected a pointer frame, got {other:?}"),
+        }
+
+        state
+            .apply(
+                7,
+                MediaInput::PointerButton {
+                    client_id: 1,
+                    surface_id: 2,
+                    button: 0x110,
+                    pressed: true,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+        match fake.recv() {
+            Event::PointerFrame(events) => {
+                assert_eq!(events.len(), 1);
+                assert!(matches!(
+                    events[0].kind,
+                    PointerEventKind::Press { button: 0x110, .. }
+                ));
+            }
+            other => panic!("expected a pointer frame, got {other:?}"),
+        }
+        assert!(state.pressed_buttons[&7].contains(&(key2, 0x110)));
+
+        state
+            .apply(
+                7,
+                MediaInput::PointerButton {
+                    client_id: 1,
+                    surface_id: 2,
+                    button: 0x110,
+                    pressed: false,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+        match fake.recv() {
+            Event::PointerFrame(events) => assert!(matches!(
+                events[0].kind,
+                PointerEventKind::Release { button: 0x110, .. }
+            )),
+            other => panic!("expected a pointer frame, got {other:?}"),
+        }
+        assert!(!state.pressed_buttons[&7].contains(&(key2, 0x110)));
+
+        state
+            .apply(
+                7,
+                MediaInput::PointerAxis {
+                    client_id: 1,
+                    surface_id: 2,
+                    horizontal: 1.5,
+                    vertical: -2.0,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+        match fake.recv() {
+            Event::PointerFrame(events) => {
+                assert_eq!(events.len(), 1);
+                match events[0].kind {
+                    PointerEventKind::Axis {
+                        horizontal,
+                        vertical,
+                        source,
+                    } => {
+                        assert_eq!(horizontal.absolute, 1.5);
+                        assert_eq!(vertical.absolute, -2.0);
+                        assert_eq!(source, Some(AxisSource::Continuous));
+                    }
+                    other => panic!("expected an axis event, got {other:?}"),
+                }
+            }
+            other => panic!("expected a pointer frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_rejects_input_targeting_an_unknown_surface() {
+        let scene = scene_with_toplevels(&[(1, 1, 8, 8)]);
+        let (transport, _fake) = FakeWprsd::connect();
+        let mut state = InputState::default();
+
+        let error = state
+            .apply(
+                1,
+                MediaInput::PointerMotion {
+                    client_id: 9,
+                    surface_id: 9,
+                    x: 0.0,
+                    y: 0.0,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap_err();
+        assert_eq!(error, InputTranslationError::UnknownSurface);
+    }
+
+    #[test]
+    fn apply_rejects_input_targeting_a_known_non_toplevel_surface() {
+        let scene = scene_with_toplevel_and_subsurface();
+        let (transport, _fake) = FakeWprsd::connect();
+        let mut state = InputState::default();
+
+        let error = state
+            .apply(
+                1,
+                MediaInput::PointerButton {
+                    client_id: 1,
+                    surface_id: 2,
+                    button: 0x110,
+                    pressed: true,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap_err();
+        assert_eq!(error, InputTranslationError::NotToplevel);
+    }
+
+    #[test]
+    fn keyboard_input_enters_focus_once_per_surface_change() {
+        let scene = scene_with_toplevels(&[(1, 1, 8, 8), (1, 2, 8, 8)]);
+        let (transport, fake) = FakeWprsd::connect();
+        let mut state = InputState::default();
+
+        state
+            .apply(
+                3,
+                MediaInput::KeyboardKey {
+                    client_id: 1,
+                    surface_id: 1,
+                    keycode: 30,
+                    pressed: true,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+        match fake.recv() {
+            Event::KeyboardEvent(KeyboardEvent::Enter { surface_id, .. }) => {
+                assert_eq!(surface_id, WlSurfaceId(1));
+            }
+            other => panic!("expected a keyboard enter, got {other:?}"),
+        }
+        match fake.recv() {
+            Event::KeyboardEvent(KeyboardEvent::Key(KeyInner {
+                raw_code: 30,
+                state: KeyState::Pressed,
+                ..
+            })) => {}
+            other => panic!("expected a key press, got {other:?}"),
+        }
+        assert!(state.pressed_keys[&3].contains(&30));
+
+        // A second key on the already-focused surface must not re-enter.
+        state
+            .apply(
+                3,
+                MediaInput::KeyboardKey {
+                    client_id: 1,
+                    surface_id: 1,
+                    keycode: 31,
+                    pressed: true,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+        match fake.recv() {
+            Event::KeyboardEvent(KeyboardEvent::Key(KeyInner {
+                raw_code: 31,
+                state: KeyState::Pressed,
+                ..
+            })) => {}
+            other => panic!("expected a key press without a re-enter, got {other:?}"),
+        }
+
+        state
+            .apply(
+                3,
+                MediaInput::KeyboardKey {
+                    client_id: 1,
+                    surface_id: 1,
+                    keycode: 30,
+                    pressed: false,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+        match fake.recv() {
+            Event::KeyboardEvent(KeyboardEvent::Key(KeyInner {
+                raw_code: 30,
+                state: KeyState::Released,
+                ..
+            })) => {}
+            other => panic!("expected a key release, got {other:?}"),
+        }
+        assert!(!state.pressed_keys[&3].contains(&30));
+
+        // Modifiers on the already-focused surface must not re-enter either.
+        state
+            .apply(
+                3,
+                MediaInput::KeyboardModifiers {
+                    client_id: 1,
+                    surface_id: 1,
+                    ctrl: true,
+                    alt: false,
+                    shift: false,
+                    caps_lock: false,
+                    logo: false,
+                    num_lock: false,
+                    layout_index: 0,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+        match fake.recv() {
+            Event::KeyboardEvent(KeyboardEvent::Modifiers { modifier_state, .. }) => {
+                assert!(modifier_state.ctrl);
+            }
+            other => panic!("expected a modifiers event, got {other:?}"),
+        }
+
+        // Switching focus to a different surface re-enters.
+        state
+            .apply(
+                3,
+                MediaInput::KeyboardKey {
+                    client_id: 1,
+                    surface_id: 2,
+                    keycode: 32,
+                    pressed: true,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+        match fake.recv() {
+            Event::KeyboardEvent(KeyboardEvent::Enter { surface_id, .. }) => {
+                assert_eq!(surface_id, WlSurfaceId(2));
+            }
+            other => panic!("expected a re-enter on focus change, got {other:?}"),
+        }
+        match fake.recv() {
+            Event::KeyboardEvent(KeyboardEvent::Key(KeyInner { raw_code: 32, .. })) => {}
+            other => panic!("expected a key press, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn viewport_resize_configures_every_current_toplevel() {
+        let scene = scene_with_toplevels(&[(1, 1, 8, 8), (1, 2, 8, 8)]);
+        let (transport, fake) = FakeWprsd::connect();
+        let mut state = InputState::default();
+
+        state
+            .apply(
+                0,
+                MediaInput::ViewportResize {
+                    width: 1920,
+                    height: 1080,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+
+        for expected_surface in [WlSurfaceId(1), WlSurfaceId(2)] {
+            match fake.recv() {
+                Event::Toplevel(ToplevelEvent::Configure(configure)) => {
+                    assert_eq!(configure.surface_id, expected_surface);
+                    assert_eq!(configure.new_size.w, NonZeroU32::new(1920));
+                    assert_eq!(configure.new_size.h, NonZeroU32::new(1080));
+                }
+                other => panic!("expected a toplevel configure, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn disconnect_releases_only_that_attachments_held_input() {
+        let scene = scene_with_toplevels(&[(1, 1, 8, 8)]);
+        let (transport, fake) = FakeWprsd::connect();
+        let mut state = InputState::default();
+        let key = SurfaceKey {
+            client_id: 1,
+            surface_id: 1,
+        };
+
+        state
+            .apply(
+                10,
+                MediaInput::PointerButton {
+                    client_id: 1,
+                    surface_id: 1,
+                    button: 0x110,
+                    pressed: true,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+        fake.recv();
+        state
+            .apply(
+                20,
+                MediaInput::PointerButton {
+                    client_id: 1,
+                    surface_id: 1,
+                    button: 0x111,
+                    pressed: true,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+        fake.recv();
+        state
+            .apply(
+                10,
+                MediaInput::KeyboardKey {
+                    client_id: 1,
+                    surface_id: 1,
+                    keycode: 30,
+                    pressed: true,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+        fake.recv(); // keyboard enter
+        fake.recv(); // key press
+        state
+            .apply(
+                20,
+                MediaInput::KeyboardKey {
+                    client_id: 1,
+                    surface_id: 1,
+                    keycode: 31,
+                    pressed: true,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+        fake.recv(); // key press only: already focused
+
+        assert!(state.pressed_buttons[&10].contains(&(key, 0x110)));
+        assert!(state.pressed_buttons[&20].contains(&(key, 0x111)));
+        assert!(state.pressed_keys[&10].contains(&30));
+        assert!(state.pressed_keys[&20].contains(&31));
+
+        state.disconnect(10, &transport);
+
+        match fake.recv() {
+            Event::PointerFrame(events) => {
+                assert_eq!(events.len(), 1);
+                assert!(matches!(
+                    events[0].kind,
+                    PointerEventKind::Release { button: 0x110, .. }
+                ));
+            }
+            other => {
+                panic!("expected a release for the disconnected attachment's button, got {other:?}")
+            }
+        }
+        match fake.recv() {
+            Event::KeyboardEvent(KeyboardEvent::Key(KeyInner {
+                raw_code: 30,
+                state: KeyState::Released,
+                ..
+            })) => {}
+            other => {
+                panic!("expected a release for the disconnected attachment's key, got {other:?}")
+            }
+        }
+
+        assert!(!state.pressed_buttons.contains_key(&10));
+        assert!(!state.pressed_keys.contains_key(&10));
+        assert!(state.pressed_buttons[&20].contains(&(key, 0x111)));
+        assert!(state.pressed_keys[&20].contains(&31));
+    }
+}

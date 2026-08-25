@@ -33,6 +33,14 @@ struct BridgeHandle {
     thread: Option<JoinHandle<()>>,
 }
 
+impl BridgeHandle {
+    /// Whether the worker thread has exited, whether cleanly (via `stop`)
+    /// or on its own (a connection failure inside `run_bridge`).
+    fn is_finished(&self) -> bool {
+        self.thread.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+}
+
 impl BridgeManager {
     pub fn new(media: MediaHub) -> Self {
         Self {
@@ -46,6 +54,10 @@ impl BridgeManager {
             .workers
             .lock()
             .map_err(|_| anyhow!("bridge manager lock poisoned"))?;
+        // A worker thread that exited on its own (wprs socket gone, `run_bridge`
+        // returned an error) leaves a stale entry behind: reap it before the
+        // `contains_key` check below, or a dead session could never restart.
+        workers.retain(|_, handle| !handle.is_finished());
         if workers.contains_key(&session.name) {
             return Ok(());
         }
@@ -93,9 +105,11 @@ impl BridgeManager {
     }
 
     pub fn is_running(&self, session: &str) -> bool {
-        self.workers
-            .lock()
-            .is_ok_and(|workers| workers.contains_key(session))
+        self.workers.lock().is_ok_and(|workers| {
+            workers
+                .get(session)
+                .is_some_and(|handle| !handle.is_finished())
+        })
     }
 }
 
@@ -212,10 +226,7 @@ fn run_bridge(
                     &transport,
                 )
                 .ok();
-            for stream in worker.streams.values_mut() {
-                stream.force_keyframe = true;
-                stream.discontinuity = true;
-            }
+            force_keyframe_on_all_streams(&mut worker.streams);
             resize = None;
         }
     }
@@ -325,6 +336,16 @@ fn encode_frame(
     Ok(())
 }
 
+/// Forces the next frame on every live stream to be a keyframe and marks it
+/// as a discontinuity, e.g. after a viewport resize invalidates in-flight
+/// encoder state for every stream.
+fn force_keyframe_on_all_streams(streams: &mut HashMap<SurfaceKey, StreamState>) {
+    for stream in streams.values_mut() {
+        stream.force_keyframe = true;
+        stream.discontinuity = true;
+    }
+}
+
 fn end_stream(
     session: &str,
     media: &MediaHub,
@@ -377,5 +398,337 @@ fn normalize_frame(frame: Frame) -> Frame {
         width,
         height,
         pixels,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::UnixListener;
+    use std::process::{Command, Stdio};
+
+    use navette_protocol::SessionStatus;
+    use wprs::serialization::wayland::{
+        Buffer, BufferAssignment, BufferData, BufferFormat, BufferMetadata, Role, SurfaceRequest,
+        SurfaceRequestPayload, SurfaceState, WlSurfaceId,
+    };
+    use wprs::serialization::xdg_shell::{XdgToplevelId, XdgToplevelState};
+    use wprs::serialization::{ClientId, RecvType, Request};
+
+    use super::*;
+    use crate::media::MediaAttachment;
+
+    fn session_fixture(name: &str, socket_path: impl Into<String>) -> Session {
+        Session {
+            name: name.into(),
+            app_id: "firefox".into(),
+            app_pid: 10,
+            daemon_pid: 11,
+            wayland_display: format!("navette-{name}"),
+            socket_path: socket_path.into(),
+            created_at_ms: 100,
+            last_attached_at_ms: None,
+            client_count: 0,
+            status: SessionStatus::Running,
+        }
+    }
+
+    fn surface_state(client: u64, surface: u64) -> SurfaceState {
+        SurfaceState {
+            client: ClientId(client),
+            id: WlSurfaceId(surface),
+            buffer: None,
+            role: Some(Role::XdgToplevel(XdgToplevelState {
+                id: XdgToplevelId(1),
+                parent: None,
+                title: None,
+                app_id: None,
+                decoration_mode: None,
+                maximized: None,
+                fullscreen: None,
+            })),
+            buffer_scale: 1,
+            buffer_transform: None,
+            opaque_region: None,
+            input_region: None,
+            z_ordered_children: Vec::new(),
+            damage: None,
+            output_ids: Vec::new(),
+            viewport_state: None,
+            xdg_surface_state: None,
+        }
+    }
+
+    fn external_buffer(width: i32, height: i32, format: BufferFormat) -> BufferAssignment {
+        BufferAssignment::New(Buffer {
+            metadata: BufferMetadata {
+                width,
+                height,
+                stride: width * 4,
+                format,
+            },
+            data: BufferData::External,
+        })
+    }
+
+    fn commit(state: SurfaceState) -> RecvType<Request> {
+        RecvType::Object(Request::Surface(SurfaceRequest {
+            client: state.client,
+            surface: state.id,
+            payload: SurfaceRequestPayload::Commit(state),
+        }))
+    }
+
+    /// Builds a scene with one real, committed 64x64 toplevel per
+    /// `(client_id, surface_id)` pair. 64x64 is both a realistic size for
+    /// the real `ffmpeg` encode these tests drive and a pixel count that
+    /// avoids an alignment bug in the vendored `wprs` pixel filter's SIMD
+    /// path (it mishandles buffers whose pixel count is >=32 and not a
+    /// multiple of 16; 64x64 = 4096 pixels is safely a multiple of 16).
+    fn scene_with_toplevels(surfaces: &[(u64, u64)]) -> Scene {
+        let mut scene = Scene::default();
+        for &(client, surface) in surfaces {
+            scene
+                .apply(RecvType::RawBuffer(vec![0; 64 * 64 * 4]))
+                .unwrap();
+            let mut state = surface_state(client, surface);
+            state.buffer = Some(external_buffer(64, 64, BufferFormat::Xrgb8888));
+            scene.apply(commit(state)).unwrap();
+        }
+        scene
+    }
+
+    fn ffmpeg_available() -> bool {
+        Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+    }
+
+    async fn recv_packet(client: &MediaAttachment) -> std::sync::Arc<MediaPacket> {
+        tokio::time::timeout(Duration::from_secs(10), client.recv())
+            .await
+            .expect("a packet should have been published before the timeout")
+            .expect("media channel closed unexpectedly")
+    }
+
+    #[test]
+    fn normalize_frame_pads_odd_dimensions_and_preserves_pixel_rows() {
+        let frame = Frame {
+            width: 3,
+            height: 1,
+            pixels: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        };
+
+        let normalized = normalize_frame(frame);
+
+        assert_eq!(normalized.width, 4);
+        assert_eq!(normalized.height, 2);
+        assert_eq!(normalized.pixels.len(), 4 * 2 * 4);
+        // The original row is preserved byte-for-byte...
+        assert_eq!(
+            &normalized.pixels[0..12],
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        );
+        // ...and every padded pixel (the new column and the new row) is zeroed.
+        assert_eq!(&normalized.pixels[12..16], &[0, 0, 0, 0]);
+        assert_eq!(&normalized.pixels[16..32], &[0; 16]);
+    }
+
+    #[test]
+    fn normalize_frame_leaves_even_dimensions_unchanged() {
+        let frame = Frame {
+            width: 4,
+            height: 2,
+            pixels: vec![7; 4 * 2 * 4],
+        };
+
+        let normalized = normalize_frame(frame.clone());
+
+        assert_eq!(normalized, frame);
+    }
+
+    #[test]
+    fn start_reaps_a_dead_worker_and_restarts_the_session() {
+        let media = MediaHub::default();
+        let manager = BridgeManager::new(media.clone());
+        let dir = tempfile::tempdir().unwrap();
+
+        let dead_socket = dir.path().join("no-such-socket");
+        let dead_session = session_fixture("dead", dead_socket.to_string_lossy().into_owned());
+        manager.start(&dead_session).unwrap();
+        // `register_session` runs synchronously inside `start`, before the
+        // worker thread spawns, so the session is registered immediately.
+        assert!(media.attach(&dead_session.name).is_ok());
+
+        // Connecting to a socket nobody is listening on fails immediately, so
+        // the worker thread exits almost at once and unregisters its session
+        // on the way out.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while media.attach(&dead_session.name).is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "worker never exited and unregistered its session"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        // A live listener keeps the restarted worker's connection open so the
+        // second `start()` doesn't race its own worker's exit.
+        let live_socket = dir.path().join("live-socket");
+        let _listener = UnixListener::bind(&live_socket).unwrap();
+        let live_session = session_fixture("dead", live_socket.to_string_lossy().into_owned());
+        manager.start(&live_session).unwrap();
+
+        assert!(
+            media.attach(&live_session.name).is_ok(),
+            "a dead worker's session should be restartable, not silently no-op"
+        );
+        manager.stop("dead");
+    }
+
+    #[tokio::test]
+    async fn scene_commit_creates_independent_streams_with_config_before_video() {
+        if !ffmpeg_available() {
+            return;
+        }
+        let media = MediaHub::default();
+        let _input = media.register_session("s1");
+        let client = media.attach("s1").unwrap();
+
+        let scene = scene_with_toplevels(&[(1, 1), (1, 2)]);
+        let mut worker = WorkerState {
+            scene,
+            streams: HashMap::new(),
+            input: InputState::default(),
+        };
+        let key1 = SurfaceKey {
+            client_id: 1,
+            surface_id: 1,
+        };
+        let key2 = SurfaceKey {
+            client_id: 1,
+            surface_id: 2,
+        };
+
+        handle_scene_events(
+            "s1",
+            &media,
+            &mut worker,
+            vec![SceneEvent::SurfaceCommitted(key1)],
+        );
+
+        assert_eq!(worker.streams.len(), 2);
+        let stream1_id = worker.streams[&key1].id;
+        let stream2_id = worker.streams[&key2].id;
+        assert_ne!(stream1_id, stream2_id, "each toplevel gets its own stream");
+        assert_eq!(worker.streams[&key1].sequence, 2);
+        assert_eq!(worker.streams[&key2].sequence, 2);
+
+        let mut by_stream: HashMap<u64, Vec<(MediaKind, u64, bool)>> = HashMap::new();
+        for _ in 0..4 {
+            let packet = recv_packet(&client).await;
+            by_stream.entry(packet.header.stream_id).or_default().push((
+                packet.header.kind,
+                packet.header.sequence,
+                packet.header.flags.discontinuity(),
+            ));
+        }
+        for stream_id in [stream1_id, stream2_id] {
+            let packets = by_stream
+                .remove(&stream_id)
+                .expect("each stream published packets");
+            assert_eq!(packets.len(), 2);
+            assert_eq!(packets[0].0, MediaKind::StreamConfig);
+            assert_eq!(packets[1].0, MediaKind::Video);
+            assert!(
+                packets[0].1 < packets[1].1,
+                "sequence must ascend within a stream"
+            );
+            assert!(packets[0].2, "a stream's first frame is a discontinuity");
+            assert!(packets[1].2, "a stream's first frame is a discontinuity");
+        }
+
+        // Publishing another frame to just one stream must not disturb the
+        // other's sequence numbering.
+        let frame = normalize_frame(worker.scene.compose_toplevel(key1).unwrap());
+        encode_frame("s1", &media, &mut worker.streams, key1, frame).unwrap();
+        assert!(worker.streams[&key1].sequence > 2);
+        assert_eq!(
+            worker.streams[&key2].sequence, 2,
+            "publishing to one stream must not disturb the other's sequencing"
+        );
+
+        // The resize path forces every live stream to re-key on its next frame.
+        force_keyframe_on_all_streams(&mut worker.streams);
+        assert!(worker.streams[&key1].force_keyframe);
+        assert!(worker.streams[&key1].discontinuity);
+        assert!(worker.streams[&key2].force_keyframe);
+        assert!(worker.streams[&key2].discontinuity);
+    }
+
+    #[tokio::test]
+    async fn destroy_and_disconnect_end_only_the_affected_stream() {
+        if !ffmpeg_available() {
+            return;
+        }
+        let media = MediaHub::default();
+        let _input = media.register_session("s1");
+        let client = media.attach("s1").unwrap();
+
+        // Two different clients, so `ClientDisconnected` for one must not
+        // touch the other's stream.
+        let scene = scene_with_toplevels(&[(1, 1), (2, 1)]);
+        let mut worker = WorkerState {
+            scene,
+            streams: HashMap::new(),
+            input: InputState::default(),
+        };
+        let key_a = SurfaceKey {
+            client_id: 1,
+            surface_id: 1,
+        };
+        let key_b = SurfaceKey {
+            client_id: 2,
+            surface_id: 1,
+        };
+
+        handle_scene_events(
+            "s1",
+            &media,
+            &mut worker,
+            vec![SceneEvent::SurfaceCommitted(key_a)],
+        );
+        assert_eq!(worker.streams.len(), 2);
+        for _ in 0..4 {
+            recv_packet(&client).await; // drain the initial config+video pairs
+        }
+
+        handle_scene_events(
+            "s1",
+            &media,
+            &mut worker,
+            vec![SceneEvent::ClientDisconnected(1)],
+        );
+        assert!(!worker.streams.contains_key(&key_a));
+        assert!(worker.streams.contains_key(&key_b));
+        assert_eq!(
+            worker.streams[&key_b].sequence, 2,
+            "client B's stream must be untouched by client A's disconnect"
+        );
+        let end_a = recv_packet(&client).await;
+        assert_eq!(end_a.header.kind, MediaKind::StreamEnd);
+
+        handle_scene_events(
+            "s1",
+            &media,
+            &mut worker,
+            vec![SceneEvent::SurfaceDestroyed(key_b)],
+        );
+        assert!(worker.streams.is_empty());
+        let end_b = recv_packet(&client).await;
+        assert_eq!(end_b.header.kind, MediaKind::StreamEnd);
+        assert_ne!(end_a.header.stream_id, end_b.header.stream_id);
     }
 }

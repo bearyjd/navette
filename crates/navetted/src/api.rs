@@ -219,7 +219,6 @@ fn media_hub_error(error: MediaHubError) -> (&'static str, String) {
         MediaHubError::UnknownSession(_)
         | MediaHubError::InvalidPacket(_)
         | MediaHubError::MissingConfig
-        | MediaHubError::WrongStream { .. }
         | MediaHubError::NonMonotonicSequence
         | MediaHubError::InvalidDimensions
         | MediaHubError::Unavailable => "unavailable",
