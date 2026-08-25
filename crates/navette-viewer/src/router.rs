@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use navette_protocol::media::{MediaKind, MediaPacket, StreamConfig};
 
@@ -37,6 +37,12 @@ struct StreamDecoder {
     client_id: u64,
     surface_id: u64,
     decoder: Box<dyn Decoder>,
+    /// Timestamps of access units submitted but not yet paired with a
+    /// decoded frame, oldest first. The decode pipeline runs a few access
+    /// units behind, so the frame `decode` returns is never the one just
+    /// submitted — it is whichever access unit is at the front of this
+    /// queue.
+    pending_timestamps: VecDeque<u64>,
 }
 
 /// Routes the packets of one media session to a decoder per `stream_id`.
@@ -62,18 +68,21 @@ impl StreamRouter {
         self.streams.len()
     }
 
-    /// Feeds one packet through the router. At most one event comes back: a
-    /// packet can bootstrap a stream, produce a frame, end a stream or, when
-    /// the decode pipeline is still priming, produce nothing at all.
-    pub fn handle(&mut self, packet: &MediaPacket) -> Option<StreamEvent> {
+    /// Feeds one packet through the router. Zero or more events come back: a
+    /// packet can bootstrap a stream (no event), produce zero, one, or
+    /// several frames (the decode pipeline runs a few access units behind
+    /// and its output is fully drained on every call), end a stream (a
+    /// flush of any buffered frames followed by `Ended`), or fail to decode
+    /// (`DecodeFailed`).
+    pub fn handle(&mut self, packet: &MediaPacket) -> Vec<StreamEvent> {
         match packet.header.kind {
             MediaKind::StreamConfig => {
                 self.configure(packet);
-                None
+                Vec::new()
             }
             MediaKind::Video => self.decode(packet),
             MediaKind::StreamEnd => self.end(packet.header.stream_id),
-            MediaKind::Metrics => None,
+            MediaKind::Metrics => Vec::new(),
         }
     }
 
@@ -108,6 +117,9 @@ impl StreamRouter {
             }
             stream.client_id = config.client_id;
             stream.surface_id = config.surface_id;
+            // The rebuilt decoder's output no longer corresponds to any
+            // access unit submitted before the reconfigure.
+            stream.pending_timestamps.clear();
             tracing::debug!(stream_id, "decoder reconfigured");
             return;
         }
@@ -126,6 +138,7 @@ impl StreamRouter {
                         client_id: config.client_id,
                         surface_id: config.surface_id,
                         decoder,
+                        pending_timestamps: VecDeque::new(),
                     },
                 );
             }
@@ -133,54 +146,90 @@ impl StreamRouter {
         }
     }
 
-    fn decode(&mut self, packet: &MediaPacket) -> Option<StreamEvent> {
+    fn decode(&mut self, packet: &MediaPacket) -> Vec<StreamEvent> {
         let stream_id = packet.header.stream_id;
         if packet.payload.is_empty() {
             // Malformed rather than fatal: an empty access unit says nothing
             // about the decoder, so it is dropped like any other bad input.
             tracing::warn!(stream_id, "dropping video packet with an empty payload");
-            return None;
+            return Vec::new();
         }
         let Some(stream) = self.streams.get_mut(&stream_id) else {
             tracing::warn!(stream_id, "dropping video for an unconfigured stream");
-            return None;
+            return Vec::new();
         };
+        stream
+            .pending_timestamps
+            .push_back(packet.header.timestamp_us);
         match stream.decoder.decode(&packet.payload) {
-            Ok(Some(frame)) => Some(StreamEvent::Frame(StreamFrame {
-                stream_id,
-                client_id: stream.client_id,
-                surface_id: stream.surface_id,
-                timestamp_us: packet.header.timestamp_us,
-                frame,
-            })),
-            Ok(None) => None,
+            Ok(frames) => frames
+                .into_iter()
+                .map(|frame| {
+                    // Each drained frame is paired with the oldest still
+                    // outstanding access unit, not the one just submitted —
+                    // the pipeline is a few access units behind.
+                    let timestamp_us = stream
+                        .pending_timestamps
+                        .pop_front()
+                        .unwrap_or(packet.header.timestamp_us);
+                    StreamEvent::Frame(StreamFrame {
+                        stream_id,
+                        client_id: stream.client_id,
+                        surface_id: stream.surface_id,
+                        timestamp_us,
+                        frame,
+                    })
+                })
+                .collect(),
             Err(error) => {
                 tracing::warn!(stream_id, %error, "decode failed; requesting a keyframe");
                 // A decode error leaves this stream's decoder in an unknown
                 // state — for `FfmpegDecoder` every reachable variant means
-                // its subprocess is gone — so the decoder is discarded rather
-                // than left to fail on every later frame. The keyframe request
-                // the client sends next is expected to bring a fresh
-                // `stream_config` that rebuilds it. Malformed input never
-                // reaches here: it is dropped above.
+                // its subprocess is gone, or it has stalled without ever
+                // recovering — so the decoder is discarded rather than left
+                // to fail (or spin silently) on every later frame. The
+                // keyframe request the client sends next is expected to
+                // bring a fresh `stream_config` that rebuilds it. Malformed
+                // input never reaches here: it is dropped above.
                 self.streams.remove(&stream_id);
-                Some(StreamEvent::DecodeFailed { stream_id })
+                vec![StreamEvent::DecodeFailed { stream_id }]
             }
         }
     }
 
-    fn end(&mut self, stream_id: u64) -> Option<StreamEvent> {
-        if self.streams.remove(&stream_id).is_none() {
+    fn end(&mut self, stream_id: u64) -> Vec<StreamEvent> {
+        let Some(mut stream) = self.streams.remove(&stream_id) else {
             tracing::debug!(stream_id, "ignoring end of an unconfigured stream");
-            return None;
-        }
+            return Vec::new();
+        };
+        // Flush whatever the pipeline had already decoded but this router
+        // never retrieved — otherwise the last pictures of a closing window
+        // vanish silently instead of reaching the caller.
+        let mut events: Vec<StreamEvent> = stream
+            .decoder
+            .drain()
+            .into_iter()
+            .map(|frame| {
+                let timestamp_us = stream.pending_timestamps.pop_front().unwrap_or(0);
+                StreamEvent::Frame(StreamFrame {
+                    stream_id,
+                    client_id: stream.client_id,
+                    surface_id: stream.surface_id,
+                    timestamp_us,
+                    frame,
+                })
+            })
+            .collect();
         tracing::debug!(stream_id, "stream ended");
-        Some(StreamEvent::Ended { stream_id })
+        events.push(StreamEvent::Ended { stream_id });
+        events
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use navette_protocol::media::{MediaFlags, MediaHeader};
 
     use super::*;
@@ -213,6 +262,28 @@ mod tests {
         surface_id: u64,
         codec_config: &[u8],
     ) -> MediaPacket {
+        stream_config_sized(
+            stream_id,
+            sequence,
+            client_id,
+            surface_id,
+            codec_config,
+            4,
+            2,
+        )
+    }
+
+    /// Like [`stream_config`] but with caller-chosen coded dimensions, so a
+    /// resize can be exercised without changing the codec bootstrap.
+    fn stream_config_sized(
+        stream_id: u64,
+        sequence: u64,
+        client_id: u64,
+        surface_id: u64,
+        codec_config: &[u8],
+        width: u32,
+        height: u32,
+    ) -> MediaPacket {
         let payload = StreamConfig {
             client_id,
             surface_id,
@@ -220,7 +291,20 @@ mod tests {
         }
         .encode()
         .unwrap();
-        packet(MediaKind::StreamConfig, stream_id, sequence, payload)
+        MediaPacket::new(
+            MediaHeader {
+                kind: MediaKind::StreamConfig,
+                flags: MediaFlags::new(false, false),
+                stream_id,
+                sequence,
+                timestamp_us: sequence * 1000,
+                payload_len: 0,
+                width,
+                height,
+            },
+            payload,
+        )
+        .unwrap()
     }
 
     fn video(stream_id: u64, sequence: u64) -> MediaPacket {
@@ -238,8 +322,16 @@ mod tests {
         }))
     }
 
-    fn frame_of(event: Option<StreamEvent>) -> StreamFrame {
-        match event {
+    /// Expects exactly one decoded-frame event and unwraps it. `FakeDecoder`
+    /// always yields exactly one frame per access unit, so every test below
+    /// that drives it can rely on `handle` returning a single-element vec.
+    fn frame_of(mut events: Vec<StreamEvent>) -> StreamFrame {
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one event, got {events:?}"
+        );
+        match events.pop() {
             Some(StreamEvent::Frame(frame)) => frame,
             other => panic!("expected a decoded frame, got {other:?}"),
         }
@@ -251,7 +343,7 @@ mod tests {
         assert!(
             router
                 .handle(&stream_config(7, 1, 11, 12, &CODEC_CONFIG))
-                .is_none()
+                .is_empty()
         );
         assert_eq!(router.live_streams(), 1);
 
@@ -267,7 +359,7 @@ mod tests {
     #[test]
     fn video_without_configuration_is_dropped_without_decoding() {
         let mut router = fake_router();
-        assert!(router.handle(&video(7, 1)).is_none());
+        assert!(router.handle(&video(7, 1)).is_empty());
         assert_eq!(router.live_streams(), 0);
 
         // The stream still bootstraps cleanly afterwards, and its decoder
@@ -301,16 +393,50 @@ mod tests {
 
         assert_eq!(
             router.handle(&packet(MediaKind::StreamEnd, 1, 3, Vec::new())),
-            Some(StreamEvent::Ended { stream_id: 1 })
+            vec![StreamEvent::Ended { stream_id: 1 }]
         );
         assert_eq!(router.live_streams(), 1);
-        assert!(router.handle(&video(1, 4)).is_none());
+        assert!(router.handle(&video(1, 4)).is_empty());
         assert_eq!(frame_of(router.handle(&video(2, 2))).frame.pixels[0], 0);
         assert!(
             router
                 .handle(&packet(MediaKind::StreamEnd, 1, 5, Vec::new()))
-                .is_none()
+                .is_empty()
         );
+    }
+
+    #[test]
+    fn stream_end_flushes_frames_the_pipeline_had_not_yet_delivered() {
+        let mut router = StreamRouter::new(Box::new(|config: &DecoderConfig| {
+            Ok(Box::new(BufferingDecoder::new(config.clone())?) as Box<dyn Decoder>)
+        }));
+        router.handle(&stream_config(1, 1, 11, 12, &CODEC_CONFIG));
+        // Priming: the pipeline buffers this access unit's frame internally
+        // and reports nothing yet.
+        assert!(router.handle(&video(1, 2)).is_empty());
+
+        // The window goes idle and its toplevel closes with a picture still
+        // sitting undelivered inside the decoder. `end` must surface it
+        // rather than discard it, and the `Ended` event must come after it.
+        assert_eq!(
+            router.handle(&packet(MediaKind::StreamEnd, 1, 3, Vec::new())),
+            vec![
+                StreamEvent::Frame(StreamFrame {
+                    stream_id: 1,
+                    client_id: 11,
+                    surface_id: 12,
+                    timestamp_us: 2000,
+                    frame: DecodedFrame {
+                        width: 4,
+                        height: 2,
+                        pixels: vec![0; 4 * 2 * 4],
+                        decode_time: Duration::ZERO,
+                    },
+                }),
+                StreamEvent::Ended { stream_id: 1 },
+            ]
+        );
+        assert_eq!(router.live_streams(), 0);
     }
 
     #[test]
@@ -330,13 +456,30 @@ mod tests {
     }
 
     #[test]
+    fn a_resized_stream_configuration_resets_that_stream_decoder() {
+        // The identical codec_config is reused deliberately: only the coded
+        // dimensions differ, so this test fails unless the router's reset
+        // interlock also compares width/height, not just codec_config.
+        let mut router = fake_router();
+        router.handle(&stream_config(1, 1, 11, 12, &CODEC_CONFIG));
+        assert_eq!(frame_of(router.handle(&video(1, 2))).frame.pixels[0], 0);
+        assert_eq!(frame_of(router.handle(&video(1, 3))).frame.pixels[0], 1);
+
+        router.handle(&stream_config_sized(1, 4, 11, 12, &CODEC_CONFIG, 4, 6));
+        assert_eq!(router.live_streams(), 1);
+        let resized = frame_of(router.handle(&video(1, 5)));
+        assert_eq!(resized.frame.pixels[0], 0);
+        assert_eq!((resized.frame.width, resized.frame.height), (4, 6));
+    }
+
+    #[test]
     fn an_empty_video_payload_is_dropped_without_disturbing_the_decoder() {
         let mut router = fake_router();
         router.handle(&stream_config(1, 1, 11, 12, &CODEC_CONFIG));
         assert!(
             router
                 .handle(&packet(MediaKind::Video, 1, 2, Vec::new()))
-                .is_none()
+                .is_empty()
         );
         assert_eq!(router.live_streams(), 1);
         // The decoder never saw the empty packet, so it is still at zero.
@@ -348,7 +491,7 @@ mod tests {
         let mut router = fake_router();
         router.handle(&packet(MediaKind::StreamConfig, 1, 1, vec![9, 9, 9]));
         assert_eq!(router.live_streams(), 0);
-        assert!(router.handle(&video(1, 2)).is_none());
+        assert!(router.handle(&video(1, 2)).is_empty());
     }
 
     /// Reports a priming gap and then a hard failure, so the router's two
@@ -363,12 +506,16 @@ mod tests {
             &self.config
         }
 
-        fn decode(&mut self, _access_unit: &[u8]) -> Result<Option<DecodedFrame>, DecoderError> {
+        fn decode(&mut self, _access_unit: &[u8]) -> Result<Vec<DecodedFrame>, DecoderError> {
             self.calls += 1;
             match self.calls {
-                1 => Ok(None),
+                1 => Ok(Vec::new()),
                 _ => Err(DecoderError::ProcessExited),
             }
+        }
+
+        fn drain(&mut self) -> Vec<DecodedFrame> {
+            Vec::new()
         }
 
         fn reconfigure(&mut self, config: DecoderConfig) -> Result<(), DecoderError> {
@@ -392,21 +539,21 @@ mod tests {
         router.handle(&stream_config(2, 1, 21, 22, &CODEC_CONFIG));
         router.handle(&stream_config(1, 1, 11, 12, &CODEC_CONFIG));
         // Priming is silent, and it is not a failure.
-        assert!(router.handle(&video(1, 2)).is_none());
+        assert!(router.handle(&video(1, 2)).is_empty());
         assert_eq!(router.live_streams(), 2);
 
         assert_eq!(
             router.handle(&video(1, 3)),
-            Some(StreamEvent::DecodeFailed { stream_id: 1 })
+            vec![StreamEvent::DecodeFailed { stream_id: 1 }]
         );
         // Only the broken stream's decoder is discarded; the keyframe request
         // the client sends next brings a fresh `stream_config` that rebuilds
         // it, and the other stream is untouched throughout.
         assert_eq!(router.live_streams(), 1);
-        assert!(router.handle(&video(1, 4)).is_none());
+        assert!(router.handle(&video(1, 4)).is_empty());
         router.handle(&stream_config(1, 5, 11, 12, &CODEC_CONFIG));
         assert_eq!(router.live_streams(), 2);
-        assert!(router.handle(&video(1, 6)).is_none());
+        assert!(router.handle(&video(1, 6)).is_empty());
     }
 
     #[test]
@@ -416,6 +563,57 @@ mod tests {
         }));
         router.handle(&stream_config(1, 1, 11, 12, &CODEC_CONFIG));
         assert_eq!(router.live_streams(), 0);
-        assert!(router.handle(&video(1, 2)).is_none());
+        assert!(router.handle(&video(1, 2)).is_empty());
+    }
+
+    /// Buffers exactly one frame internally instead of returning it
+    /// immediately, so `end`'s flush-before-`Ended` behaviour can be
+    /// exercised: `decode` reports priming (nothing ready yet) and `drain`
+    /// later hands back what was buffered.
+    struct BufferingDecoder {
+        config: DecoderConfig,
+        buffered: Option<DecodedFrame>,
+    }
+
+    impl BufferingDecoder {
+        fn new(config: DecoderConfig) -> Result<Self, DecoderError> {
+            Ok(Self {
+                config: config.validate()?,
+                buffered: None,
+            })
+        }
+    }
+
+    impl Decoder for BufferingDecoder {
+        fn config(&self) -> &DecoderConfig {
+            &self.config
+        }
+
+        fn decode(&mut self, access_unit: &[u8]) -> Result<Vec<DecodedFrame>, DecoderError> {
+            if access_unit.is_empty() {
+                return Err(DecoderError::EmptyAccessUnit);
+            }
+            self.buffered = Some(DecodedFrame {
+                width: self.config.width,
+                height: self.config.height,
+                pixels: vec![0; self.config.frame_len()],
+                decode_time: Duration::ZERO,
+            });
+            Ok(Vec::new())
+        }
+
+        fn drain(&mut self) -> Vec<DecodedFrame> {
+            self.buffered.take().into_iter().collect()
+        }
+
+        fn reconfigure(&mut self, config: DecoderConfig) -> Result<(), DecoderError> {
+            self.config = config.validate()?;
+            self.buffered = None;
+            Ok(())
+        }
+
+        fn metrics(&self) -> DecoderMetrics {
+            DecoderMetrics::default()
+        }
     }
 }

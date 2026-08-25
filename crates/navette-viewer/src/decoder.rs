@@ -21,6 +21,14 @@ const OUTPUT_QUEUE_CAPACITY: usize = 4;
 /// of times per stream and never in steady state.
 const FRAME_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Number of access units that may be submitted with zero frames decoded
+/// before a decoder is considered stalled rather than still priming.
+/// Measured priming depth is ~3 access units; this leaves a wide margin so a
+/// merely slow (but working) decode is never mistaken for a broken one,
+/// while still recovering quickly when FFmpeg genuinely cannot decode the
+/// stream (malformed SPS, a mismatched bootstrap, a rejected codec feature).
+const STALL_ESCALATION_THRESHOLD: u64 = 10;
+
 /// Coded dimensions and codec bootstrap for one H.264 stream.
 ///
 /// The dimensions come from `MediaHeader::width`/`height`, which the bridge
@@ -76,13 +84,25 @@ pub struct DecoderMetrics {
 pub trait Decoder: Send {
     fn config(&self) -> &DecoderConfig;
 
-    /// Submits one Annex-B access unit and returns the next decoded frame.
+    /// Submits one Annex-B access unit and returns every frame the pipeline
+    /// currently has ready.
     ///
-    /// Returns `Ok(None)` while FFmpeg's pipeline is still priming: that is a
-    /// normal part of stream startup, not a decode failure, and it must not be
-    /// answered with a keyframe request. Once primed the decoder produces one
-    /// frame per access unit.
-    fn decode(&mut self, access_unit: &[u8]) -> Result<Option<DecodedFrame>, DecoderError>;
+    /// The pipeline runs a few access units behind, so this is not a strict
+    /// 1:1 submit-then-collect relationship: it can return zero frames while
+    /// FFmpeg is still priming (normal at stream startup, not a decode
+    /// failure, and must not be answered with a keyframe request), one frame
+    /// in steady state, or more than one when previously buffered output is
+    /// drained alongside the frame this access unit triggered. A decoder that
+    /// stays alive but genuinely cannot decode the stream (malformed SPS, a
+    /// mismatched bootstrap, a rejected codec feature) escalates to `Err`
+    /// once it has gone unambiguously too long without producing a frame,
+    /// rather than reporting priming forever.
+    fn decode(&mut self, access_unit: &[u8]) -> Result<Vec<DecodedFrame>, DecoderError>;
+
+    /// Returns any frames already decoded but not yet retrieved, without
+    /// submitting more input. Used to flush the last pictures of an idle or
+    /// closing stream instead of discarding them.
+    fn drain(&mut self) -> Vec<DecodedFrame>;
 
     fn reconfigure(&mut self, config: DecoderConfig) -> Result<(), DecoderError>;
 
@@ -126,7 +146,7 @@ impl Decoder for FfmpegDecoder {
         &self.config
     }
 
-    fn decode(&mut self, access_unit: &[u8]) -> Result<Option<DecodedFrame>, DecoderError> {
+    fn decode(&mut self, access_unit: &[u8]) -> Result<Vec<DecodedFrame>, DecoderError> {
         if access_unit.is_empty() {
             return Err(DecoderError::EmptyAccessUnit);
         }
@@ -136,27 +156,84 @@ impl Decoder for FfmpegDecoder {
             .bytes_submitted
             .saturating_add(access_unit.len() as u64);
         let started = Instant::now();
-        let process = self.process.as_mut().ok_or(DecoderError::ProcessExited)?;
-        process
-            .stdin
-            .write_all(access_unit)
-            .map_err(DecoderError::Write)?;
-        process.stdin.flush().map_err(DecoderError::Write)?;
-        let pixels = match process.output.recv_timeout(FRAME_TIMEOUT) {
-            Ok(pixels) => pixels,
-            Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(DecoderError::ProcessExited),
-        };
+
+        let mut buffers = Vec::new();
+        {
+            let process = self.process.as_mut().ok_or(DecoderError::ProcessExited)?;
+            process
+                .stdin
+                .write_all(access_unit)
+                .map_err(DecoderError::Write)?;
+            process.stdin.flush().map_err(DecoderError::Write)?;
+            match process.output.recv_timeout(FRAME_TIMEOUT) {
+                Ok(pixels) => buffers.push(pixels),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if self.metrics.frames_decoded == 0
+                        && self.metrics.access_units_submitted >= STALL_ESCALATION_THRESHOLD
+                    {
+                        return Err(DecoderError::Stalled(self.metrics.access_units_submitted));
+                    }
+                    tracing::debug!(
+                        access_units_submitted = self.metrics.access_units_submitted,
+                        "decoder still priming; no frame yet"
+                    );
+                    return Ok(Vec::new());
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(DecoderError::ProcessExited);
+                }
+            }
+            // The pipeline may have finished more than one frame between the
+            // previous call and this one; drain everything already
+            // available rather than assuming a strict 1:1 relationship.
+            while let Ok(pixels) = process.output.try_recv() {
+                buffers.push(pixels);
+            }
+            self.metrics.frames_dropped = process.dropped.load(Ordering::Relaxed);
+        }
+
         let decode_time = started.elapsed();
-        self.metrics.frames_decoded = self.metrics.frames_decoded.saturating_add(1);
-        self.metrics.frames_dropped = process.dropped.load(Ordering::Relaxed);
+        self.metrics.frames_decoded = self
+            .metrics
+            .frames_decoded
+            .saturating_add(buffers.len() as u64);
         self.metrics.last_decode_time = decode_time;
-        Ok(Some(DecodedFrame {
-            width: self.config.width,
-            height: self.config.height,
-            pixels,
-            decode_time,
-        }))
+        Ok(buffers
+            .into_iter()
+            .map(|pixels| DecodedFrame {
+                width: self.config.width,
+                height: self.config.height,
+                pixels,
+                decode_time,
+            })
+            .collect())
+    }
+
+    fn drain(&mut self) -> Vec<DecodedFrame> {
+        let Some(process) = self.process.as_mut() else {
+            return Vec::new();
+        };
+        let mut buffers = Vec::new();
+        while let Ok(pixels) = process.output.try_recv() {
+            buffers.push(pixels);
+        }
+        if buffers.is_empty() {
+            return Vec::new();
+        }
+        self.metrics.frames_decoded = self
+            .metrics
+            .frames_decoded
+            .saturating_add(buffers.len() as u64);
+        let decode_time = self.metrics.last_decode_time;
+        buffers
+            .into_iter()
+            .map(|pixels| DecodedFrame {
+                width: self.config.width,
+                height: self.config.height,
+                pixels,
+                decode_time,
+            })
+            .collect()
     }
 
     fn reconfigure(&mut self, config: DecoderConfig) -> Result<(), DecoderError> {
@@ -195,7 +272,7 @@ impl Decoder for FakeDecoder {
         &self.config
     }
 
-    fn decode(&mut self, access_unit: &[u8]) -> Result<Option<DecodedFrame>, DecoderError> {
+    fn decode(&mut self, access_unit: &[u8]) -> Result<Vec<DecodedFrame>, DecoderError> {
         if access_unit.is_empty() {
             return Err(DecoderError::EmptyAccessUnit);
         }
@@ -207,12 +284,18 @@ impl Decoder for FakeDecoder {
         let shade = self.sequence as u8;
         self.sequence = self.sequence.saturating_add(1);
         self.metrics.frames_decoded = self.metrics.frames_decoded.saturating_add(1);
-        Ok(Some(DecodedFrame {
+        Ok(vec![DecodedFrame {
             width: self.config.width,
             height: self.config.height,
             pixels: vec![shade; self.config.frame_len()],
             decode_time: Duration::ZERO,
-        }))
+        }])
+    }
+
+    fn drain(&mut self) -> Vec<DecodedFrame> {
+        // Every access unit yields its frame synchronously; there is never a
+        // backlog to flush.
+        Vec::new()
     }
 
     fn reconfigure(&mut self, config: DecoderConfig) -> Result<(), DecoderError> {
@@ -371,6 +454,8 @@ pub enum DecoderError {
     Write(std::io::Error),
     #[error("FFmpeg exited")]
     ProcessExited,
+    #[error("decoder produced no frames after {0} submitted access units")]
+    Stalled(u64),
 }
 
 #[cfg(test)]
@@ -447,13 +532,22 @@ mod tests {
             first.decode(&[0, 0, 0, 1, 0x65]).unwrap(),
             second.decode(&[0, 0, 0, 1, 0x41]).unwrap()
         );
-        let next = first.decode(&[0, 0, 0, 1, 0x41]).unwrap().unwrap();
+        let next = first
+            .decode(&[0, 0, 0, 1, 0x41])
+            .unwrap()
+            .pop()
+            .expect("fake decoder always yields exactly one frame");
         assert_eq!(next.pixels, vec![1; 4 * 2 * 4]);
         assert_eq!(next.width, 4);
         assert_eq!(next.height, 2);
+        assert!(first.drain().is_empty());
 
         first.reconfigure(config(2, 2)).unwrap();
-        let reset = first.decode(&[0, 0, 0, 1, 0x65]).unwrap().unwrap();
+        let reset = first
+            .decode(&[0, 0, 0, 1, 0x65])
+            .unwrap()
+            .pop()
+            .expect("fake decoder always yields exactly one frame");
         assert_eq!(reset.pixels, vec![0; 2 * 2 * 4]);
         assert_eq!(first.metrics().frames_decoded, 3);
         assert!(matches!(
@@ -482,20 +576,43 @@ mod tests {
         )
         .unwrap();
 
-        let mut decoded = Vec::new();
-        if let Some(frame) = decoder.decode(&first.annex_b).unwrap() {
-            decoded.push(frame);
-        }
+        let mut decoded = decoder.decode(&first.annex_b).unwrap();
         for _ in 0..11 {
             let encoded = encoder.encode(&frame(64, 64), false).unwrap();
-            if let Some(frame) = decoder.decode(&encoded.annex_b).unwrap() {
-                decoded.push(frame);
+            decoded.extend(decoder.decode(&encoded.annex_b).unwrap());
+        }
+        // Give the decoder a moment to catch up and poll `drain` the way
+        // `StreamRouter::end` would, so this reflects full draining rather
+        // than the old fixed 1:1 submit-then-collect assumption its previous
+        // `>= 8` bound was compensating for.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while decoded.len() < 12 && Instant::now() < deadline {
+            let more = decoder.drain();
+            if more.is_empty() {
+                thread::sleep(Duration::from_millis(10));
+            } else {
+                decoded.extend(more);
             }
         }
+        // Even with full draining and no channel drops (`frames_dropped ==
+        // 0`, verified via metrics below), FFmpeg's own H.264 decoder keeps
+        // a small, constant number of pictures inside its internal decode
+        // pipeline (measured at 2 here) that are only released on an EOF
+        // flush — a decoder-internal latency distinct from, and not fixed
+        // by, this layer's output-channel draining. Closing the pipe to
+        // force that flush is out of scope for this round, so the bound
+        // reflects what full draining actually recovers rather than the
+        // full 12.
         assert!(
-            decoded.len() >= 8,
-            "expected the pipeline to prime and stay 1:1, got {} frames",
+            decoded.len() >= 10,
+            "expected full draining to recover all but a small constant decoder-internal \
+             backlog, got {} of 12",
             decoded.len()
+        );
+        assert_eq!(
+            decoder.metrics().frames_dropped,
+            0,
+            "no frame should be dropped by the output channel once every call drains it"
         );
         for frame in &decoded {
             assert_eq!((frame.width, frame.height), (64, 64));
@@ -539,7 +656,7 @@ mod tests {
         let mut decoded = None;
         let mut access_unit = resized.annex_b;
         for _ in 0..12 {
-            if let Some(frame) = decoder.decode(&access_unit).unwrap() {
+            if let Some(frame) = decoder.decode(&access_unit).unwrap().into_iter().next() {
                 decoded = Some(frame);
                 break;
             }
@@ -548,5 +665,39 @@ mod tests {
         let decoded = decoded.expect("resized stream produced no frame");
         assert_eq!((decoded.width, decoded.height), (96, 64));
         assert_eq!(decoded.pixels.len(), 96 * 64 * 4);
+    }
+
+    #[test]
+    fn ffmpeg_decoder_escalates_once_it_never_produces_a_frame() {
+        if !ffmpeg_available() {
+            return;
+        }
+        // `config`'s bootstrap bytes are not real SPS/PPS, so FFmpeg's H.264
+        // parser never has enough to decode a picture from — the process
+        // stays alive (no crash on malformed input) but can never produce a
+        // frame, exactly the "alive but broken" case this escalation exists
+        // to catch. A real NAL type but never a real IDR keeps the parser
+        // fed without ever completing a picture.
+        let mut decoder = FfmpegDecoder::new("ffmpeg", config(64, 64)).unwrap();
+        let not_a_frame = [0, 0, 0, 1, 0x09, 0x10];
+
+        let mut last_error = None;
+        for _ in 0..(STALL_ESCALATION_THRESHOLD + 2) {
+            match decoder.decode(&not_a_frame) {
+                Ok(frames) => assert!(
+                    frames.is_empty(),
+                    "no valid picture should ever come from a bogus bootstrap"
+                ),
+                Err(error) => {
+                    last_error = Some(error);
+                    break;
+                }
+            }
+        }
+        assert!(
+            matches!(last_error, Some(DecoderError::Stalled(_))),
+            "expected escalation to Stalled once past the priming threshold, got {last_error:?}"
+        );
+        assert_eq!(decoder.metrics().frames_decoded, 0);
     }
 }

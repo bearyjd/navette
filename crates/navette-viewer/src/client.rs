@@ -79,7 +79,7 @@ async fn run(
     mut router: StreamRouter,
     sender: mpsc::Sender<StreamEvent>,
 ) {
-    while let Some(message) = stream.next().await {
+    'connection: while let Some(message) = stream.next().await {
         let message = match message {
             Ok(message) => message,
             Err(error) => {
@@ -96,20 +96,23 @@ async fn run(
                         continue;
                     }
                 };
-                let Some(event) = router.handle(&packet) else {
-                    continue;
-                };
-                if let StreamEvent::DecodeFailed { stream_id } = event {
-                    tracing::info!(stream_id, "requesting a keyframe after a decode failure");
-                    if send_input(&mut sink, MediaInput::RequestKeyframe)
-                        .await
-                        .is_err()
-                    {
-                        break;
+                // One packet can drain several buffered frames at once (the
+                // decode pipeline runs a few access units behind), so every
+                // event it produces is forwarded in order rather than at
+                // most one.
+                for event in router.handle(&packet) {
+                    if let StreamEvent::DecodeFailed { stream_id } = event {
+                        tracing::info!(stream_id, "requesting a keyframe after a decode failure");
+                        if send_input(&mut sink, MediaInput::RequestKeyframe)
+                            .await
+                            .is_err()
+                        {
+                            break 'connection;
+                        }
                     }
-                }
-                if sender.send(event).await.is_err() {
-                    break;
+                    if sender.send(event).await.is_err() {
+                        break 'connection;
+                    }
                 }
             }
             // The server reports protocol problems as JSON text; they are
