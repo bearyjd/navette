@@ -77,6 +77,18 @@ impl ViewerSession {
         self.windows.contains_key(&stream_id)
     }
 
+    /// A stream's last-computed HUD sample, if it has an open window.
+    ///
+    /// Test-only: it exists so a test can observe `refresh_hud`'s effect
+    /// directly, rather than by capturing `tracing` output, which is
+    /// unreliable across a parallel test binary (a callsite's interest gets
+    /// cached process-wide the first time *any* test — with or without a
+    /// subscriber installed — reaches it).
+    #[cfg(test)]
+    fn hud_snapshot(&self, stream_id: u64) -> Option<HudSample> {
+        self.windows.get(&stream_id).map(|stream| stream.hud)
+    }
+
     /// Applies one event from the media client.
     pub fn handle(&mut self, event: StreamEvent, now: Instant) {
         match event {
@@ -100,7 +112,8 @@ impl ViewerSession {
         }
     }
 
-    /// Drains every window's input and reports what should go on the wire.
+    /// Drains every window's input, refreshes each stream's HUD on its own
+    /// clock, and reports what should go on the wire.
     pub fn poll(&mut self, now: Instant) -> Vec<MediaInput> {
         let mut inputs = Vec::new();
         let mut resized = Vec::new();
@@ -114,6 +127,14 @@ impl ViewerSession {
                 }
             }
         }
+        // The HUD's ~1Hz log line is the evidence path for a stalling
+        // stream, so it must fire on a time boundary rather than only when a
+        // frame arrives — see `refresh_hud`. Checked on every poll tick;
+        // `refresh_hud` itself is a no-op until the interval has elapsed.
+        let stream_ids: Vec<u64> = self.windows.keys().copied().collect();
+        for stream_id in stream_ids {
+            self.refresh_hud(stream_id, now);
+        }
         // Last writer wins: there is one viewport, so if several windows were
         // resized in the same pass the most recent size is the one that
         // eventually goes out.
@@ -121,7 +142,7 @@ impl ViewerSession {
             self.resize.observe(width, height, now);
         }
         for stream_id in dismissed {
-            self.dismiss(stream_id);
+            inputs.extend(self.dismiss(stream_id));
         }
         inputs.extend(self.resize.take_due(now));
         inputs
@@ -145,17 +166,45 @@ impl ViewerSession {
         stream.client_id = frame.client_id;
         stream.surface_id = frame.surface_id;
 
-        let hud = self.huds.entry(stream_id).or_default();
-        hud.record_frame(now);
-        if stream
-            .hud_computed
-            .is_none_or(|at| now.saturating_duration_since(at) >= HUD_INTERVAL)
-        {
-            stream.hud = hud.sample(now);
-            stream.hud_computed = Some(now);
-            tracing::info!(stream_id, hud = %stream.hud, "stream performance");
-        }
+        self.huds.entry(stream_id).or_default().record_frame(now);
+        self.refresh_hud(stream_id, now);
+
+        let Some(stream) = self.windows.get_mut(&stream_id) else {
+            return;
+        };
         stream.window.present(&frame.frame, &stream.hud);
+    }
+
+    /// Recomputes and logs a stream's HUD figures, if the interval has
+    /// elapsed since the last time this ran for it.
+    ///
+    /// `present` and `poll` both drive this on the same clock: `present`
+    /// keeps the on-screen overlay reasonably fresh whenever a frame
+    /// happens to land, and `poll` — which runs on a timer regardless of
+    /// whether frames are arriving — is what keeps the ~1Hz `tracing::info!`
+    /// line firing. That line is the evidence path for a stalling stream,
+    /// and the one scenario where it actually matters is a stream stalling
+    /// *because* the hub is dropping its packets, which is exactly the
+    /// scenario where frames stop arriving. Gating this only on frame
+    /// arrival, as it used to be, made the diagnostic go dark right when it
+    /// was needed.
+    fn refresh_hud(&mut self, stream_id: u64, now: Instant) {
+        let due = self.windows.get(&stream_id).is_some_and(|stream| {
+            stream
+                .hud_computed
+                .is_none_or(|at| now.saturating_duration_since(at) >= HUD_INTERVAL)
+        });
+        if !due {
+            return;
+        }
+        let Some(sample) = self.huds.get_mut(&stream_id).map(|hud| hud.sample(now)) else {
+            return;
+        };
+        if let Some(stream) = self.windows.get_mut(&stream_id) {
+            stream.hud = sample;
+            stream.hud_computed = Some(now);
+            tracing::info!(stream_id, hud = %sample, "stream performance");
+        }
     }
 
     /// Opens a window for a stream's first frame. A failure is reported and
@@ -197,6 +246,10 @@ impl ViewerSession {
     }
 
     /// The toplevel closed: its window goes away and its accounting with it.
+    ///
+    /// No release synthesis is needed here the way `dismiss` needs it: the
+    /// application itself is gone, so there is nothing left in the guest to
+    /// leave a key stuck down in.
     fn end(&mut self, stream_id: u64) {
         if let Some(mut stream) = self.windows.remove(&stream_id) {
             stream.window.close();
@@ -209,12 +262,21 @@ impl ViewerSession {
     /// The user closed the window while the toplevel is still alive. Frames
     /// keep arriving until the application itself goes away; they are dropped
     /// rather than allowed to pop the window back open.
-    fn dismiss(&mut self, stream_id: u64) {
+    ///
+    /// The stream stays attached — only the window closes — so the bridge's
+    /// per-attachment release-on-detach safety net never fires here: there is
+    /// no detach. Anything the window still considers held is released
+    /// explicitly instead, addressed to the surface it was actually held on.
+    fn dismiss(&mut self, stream_id: u64) -> Vec<MediaInput> {
+        let mut inputs = Vec::new();
         if let Some(mut stream) = self.windows.remove(&stream_id) {
-            stream.window.close();
+            for event in stream.window.close() {
+                inputs.extend(to_input(stream.client_id, stream.surface_id, event));
+            }
         }
         self.ignored.insert(stream_id);
         tracing::info!(stream_id, "window dismissed; ignoring further frames");
+        inputs
     }
 }
 
@@ -705,6 +767,135 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dismissing_a_window_synthesizes_releases_for_whatever_it_still_holds() {
+        // The stream stays attached when only the window closes, so the
+        // bridge's per-attachment release-on-detach backstop never fires:
+        // there is no detach. A key or button still held at close time must
+        // be released explicitly instead, or it stays stuck down in the
+        // guest for the rest of the session.
+        let desktop = Desktop::default();
+        let mut session = ViewerSession::new(desktop.factory());
+        let base = Instant::now();
+        session.handle(frame(1, 11, 12, 1), base);
+
+        desktop.window(1).inject(WindowEvent::Key {
+            keycode: KEY_A,
+            pressed: true,
+        });
+        desktop.window(1).inject(WindowEvent::PointerButton {
+            button: BTN_LEFT,
+            pressed: true,
+        });
+        desktop.window(1).inject(WindowEvent::CloseRequested);
+
+        let inputs = session.poll(at(base, 10));
+        assert!(desktop.window(1).is_closed());
+        assert_eq!(session.open_windows(), 0);
+        assert_eq!(
+            inputs,
+            vec![
+                // The press events themselves were real input and are
+                // forwarded like any other, ahead of the synthesized
+                // releases `close` produces once the window actually shuts.
+                MediaInput::KeyboardKey {
+                    client_id: 11,
+                    surface_id: 12,
+                    keycode: KEY_A,
+                    pressed: true,
+                },
+                MediaInput::PointerButton {
+                    client_id: 11,
+                    surface_id: 12,
+                    button: BTN_LEFT,
+                    pressed: true,
+                },
+                MediaInput::KeyboardKey {
+                    client_id: 11,
+                    surface_id: 12,
+                    keycode: KEY_A,
+                    pressed: false,
+                },
+                MediaInput::PointerButton {
+                    client_id: 11,
+                    surface_id: 12,
+                    button: BTN_LEFT,
+                    pressed: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_dismissed_windows_synthesized_release_is_addressed_to_its_own_surface_only() {
+        // `dismiss` is a new translation call site distinct from `poll`'s own
+        // loop, so the identity-never-crosses guarantee has to be reproven
+        // here specifically rather than assumed from the general-purpose
+        // test above. Same deliberately confusable identities: stream A is
+        // client 11 / surface 12, stream B is client 12 / surface 11.
+        let desktop = Desktop::default();
+        let mut session = ViewerSession::new(desktop.factory());
+        let base = Instant::now();
+        session.handle(frame(1, 11, 12, 1), base);
+        session.handle(frame(2, 12, 11, 2), base);
+
+        desktop.window(1).inject(WindowEvent::Key {
+            keycode: KEY_A,
+            pressed: true,
+        });
+        desktop.window(1).inject(WindowEvent::CloseRequested);
+
+        let inputs = session.poll(at(base, 10));
+        assert!(desktop.window(1).is_closed());
+        assert!(!desktop.window(2).is_closed());
+        assert_eq!(session.open_windows(), 1);
+        assert!(session.is_open(2));
+
+        let release = inputs
+            .iter()
+            .find(|input| matches!(input, MediaInput::KeyboardKey { pressed: false, .. }))
+            .expect("the still-held key must be released on dismissal");
+        assert_eq!(
+            identity_of(release),
+            Some((11, 12)),
+            "the synthesized release must be addressed to window 1's own surface, \
+             never to the confusable identity window 2 happens to carry"
+        );
+    }
+
+    #[test]
+    fn a_key_released_before_dismissal_is_not_released_a_second_time() {
+        let desktop = Desktop::default();
+        let mut session = ViewerSession::new(desktop.factory());
+        let base = Instant::now();
+        session.handle(frame(1, 11, 12, 1), base);
+
+        desktop.window(1).inject(WindowEvent::Key {
+            keycode: KEY_A,
+            pressed: true,
+        });
+        // Drained (and observed as held) before the release and the close
+        // request arrive.
+        session.poll(base);
+        desktop.window(1).inject(WindowEvent::Key {
+            keycode: KEY_A,
+            pressed: false,
+        });
+        desktop.window(1).inject(WindowEvent::CloseRequested);
+
+        let inputs = session.poll(at(base, 10));
+        assert_eq!(
+            inputs,
+            vec![MediaInput::KeyboardKey {
+                client_id: 11,
+                surface_id: 12,
+                keycode: KEY_A,
+                pressed: false,
+            }],
+            "the explicit release must not be followed by a synthesized duplicate"
+        );
+    }
+
     /// Decodes only access units that start with an Annex-B start code, and
     /// reports a hard failure on anything else — the way a real decoder
     /// reacts to a corrupt stream.
@@ -898,6 +1089,73 @@ mod tests {
             (latest.hud.fps - 30.0).abs() < 2.0,
             "expected ~30 fps after a second of frames, got {}",
             latest.hud.fps
+        );
+    }
+
+    #[test]
+    fn the_hud_refresh_runs_on_pollings_own_clock_not_only_when_a_frame_arrives() {
+        // `refresh_hud` feeds both the on-screen overlay and the ~1Hz
+        // `tracing::info!` line, and the one scenario where that log line
+        // actually matters is a stream stalling *because* the hub is
+        // dropping its packets — exactly the scenario in which frames stop
+        // arriving. So the recompute it performs must happen on a time
+        // boundary `poll` can reach on its own, not only when `present` is
+        // called from a frame arrival.
+        let desktop = Desktop::default();
+        let mut session = ViewerSession::new(desktop.factory());
+        let base = Instant::now();
+
+        session.handle(frame(1, 11, 12, 1), base);
+        assert_eq!(
+            session.hud_snapshot(1).map(|hud| hud.dropped_packets),
+            Some(0),
+            "no packets have been observed yet"
+        );
+
+        // The stream stalls here: only packets arrive from now on, no more
+        // frames. Three baseline packets establish the sequence, then a real
+        // gap of six.
+        for sequence in 1..=3u64 {
+            session.handle(
+                StreamEvent::Packet(StreamPacket {
+                    stream_id: 1,
+                    kind: MediaKind::Video,
+                    sequence,
+                    wire_bytes: 1_000,
+                    discontinuity: false,
+                    decoder: None,
+                }),
+                at(base, 100),
+            );
+        }
+        session.handle(
+            StreamEvent::Packet(StreamPacket {
+                stream_id: 1,
+                kind: MediaKind::Video,
+                sequence: 10,
+                wire_bytes: 1_000,
+                discontinuity: false,
+                decoder: None,
+            }),
+            at(base, 200),
+        );
+
+        // Before the HUD interval elapses, polling must not force an early
+        // recompute.
+        session.poll(at(base, 500));
+        assert_eq!(
+            session.hud_snapshot(1).map(|hud| hud.dropped_packets),
+            Some(0),
+            "the HUD must not be refreshed before its interval elapses"
+        );
+
+        // Once the interval elapses, `poll` alone — with no new frame in
+        // between — refreshes it.
+        session.poll(at(base, 1_100));
+        assert_eq!(
+            session.hud_snapshot(1).map(|hud| hud.dropped_packets),
+            Some(6),
+            "poll() must refresh the HUD on its own clock, not only when a frame arrives"
         );
     }
 }

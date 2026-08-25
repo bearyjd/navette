@@ -13,6 +13,8 @@
 //! [`RecordingWindow`](crate::window::RecordingWindow) instead. Keep the logic
 //! here to translation only.
 
+use std::collections::BTreeSet;
+
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, ScaleMode, WindowOptions};
 
 use crate::decoder::DecodedFrame;
@@ -48,9 +50,20 @@ pub struct NativeWindow {
     /// Scratch `0RGB` buffer the decoded BGRA frame is converted into. Kept
     /// between frames so a steady stream does not reallocate.
     buffer: Vec<u32>,
+    /// Set by `present` when `buffer` holds a picture not yet shown, and
+    /// cleared once `poll_events` has passed it to minifb. Only one minifb
+    /// update call is allowed to run per loop iteration (see `poll_events`),
+    /// so `present` cannot call it directly and instead leaves this for the
+    /// next poll to pick up.
+    pending_present: Option<(usize, usize)>,
     size: (u32, u32),
     pointer: Option<(f64, f64)>,
     buttons: [bool; TRACKED_BUTTONS.len()],
+    /// Keys this window has reported pressed and not yet reported released.
+    /// Reconciled against minifb's own down-state every poll and drained
+    /// into synthetic releases on `close`, so a transition this window
+    /// missed cannot leave a key stuck down in the guest.
+    held_keys: BTreeSet<Key>,
     modifiers: Modifiers,
     open: bool,
 }
@@ -71,9 +84,11 @@ impl NativeWindow {
         let mut window = Self {
             window,
             buffer: Vec::new(),
+            pending_present: None,
             size: (spec.width, spec.height),
             pointer: None,
             buttons: [false; TRACKED_BUTTONS.len()],
+            held_keys: BTreeSet::new(),
             modifiers: Modifiers::default(),
             open: true,
         };
@@ -180,6 +195,20 @@ impl NativeWindow {
 }
 
 impl Window for NativeWindow {
+    /// Converts and draws the HUD into the scratch buffer, but does not hand
+    /// it to minifb. minifb's own docs say only one of `update()` /
+    /// `update_with_buffer()` should be called per window: each one clears
+    /// `scroll_x`/`scroll_y` and advances `keys_down_duration` (the state
+    /// `is_key_index_pressed`/`is_key_index_released` are single-cycle pulses
+    /// derived from) before it processes new platform events. Calling
+    /// `update_with_buffer` here as well as `update()` in `poll_events` would
+    /// run two of those cycles per loop iteration, and a press, release or
+    /// scroll delta that landed in this cycle would be shifted or cleared
+    /// before `poll_events` ever reads it — silently dropping input at
+    /// whichever rate `present` is invoked, which for a 30-60fps stream
+    /// against a 125Hz poll is not a rare edge case. So `present` only
+    /// prepares the buffer; `poll_events` is the sole place a minifb update
+    /// runs, and it always runs exactly one.
     fn present(&mut self, frame: &DecodedFrame, hud: &HudSample) {
         if !self.open {
             return;
@@ -194,9 +223,7 @@ impl Window for NativeWindow {
             &hud.to_string(),
             HUD_STYLE,
         );
-        if let Err(error) = self.window.update_with_buffer(&self.buffer, width, height) {
-            tracing::warn!(%error, "failed to present a frame");
-        }
+        self.pending_present = Some((width, height));
     }
 
     fn poll_events(&mut self) -> Vec<WindowEvent> {
@@ -207,9 +234,19 @@ impl Window for NativeWindow {
             self.open = false;
             return vec![WindowEvent::CloseRequested];
         }
-        // Pumps the platform event queue even on frames where nothing was
-        // presented, so an idle stream's window still responds.
-        self.window.update();
+        // Exactly one minifb update per call, whichever kind is due: the
+        // frame `present` prepared, or (on a tick with nothing new to show)
+        // a bare pump of the platform event queue so an idle stream's window
+        // still responds. See the note on `present` for why running both in
+        // the same cycle is what used to lose input.
+        match self.pending_present.take() {
+            Some((width, height)) => {
+                if let Err(error) = self.window.update_with_buffer(&self.buffer, width, height) {
+                    tracing::warn!(%error, "failed to present a frame");
+                }
+            }
+            None => self.window.update(),
+        }
 
         let mut events = Vec::new();
         events.extend(self.pointer_motion());
@@ -225,25 +262,68 @@ impl Window for NativeWindow {
         let pressed = self.window.get_keys_pressed(KeyRepeat::Yes);
         self.modifier_changes(&pressed, &mut events);
         for key in pressed {
-            events.extend(evdev_code(key).map(|keycode| WindowEvent::Key {
-                keycode,
-                pressed: true,
-            }));
+            if let Some(keycode) = evdev_code(key) {
+                self.held_keys.insert(key);
+                events.push(WindowEvent::Key {
+                    keycode,
+                    pressed: true,
+                });
+            }
         }
         for key in self.window.get_keys_released() {
-            events.extend(evdev_code(key).map(|keycode| WindowEvent::Key {
-                keycode,
-                pressed: false,
-            }));
+            self.held_keys.remove(&key);
+            if let Some(keycode) = evdev_code(key) {
+                events.push(WindowEvent::Key {
+                    keycode,
+                    pressed: false,
+                });
+            }
+        }
+        // Self-heals a release this window's own press/release edges missed:
+        // anything still in `held_keys` that minifb no longer reports down is
+        // released here instead of staying wrong for the rest of the
+        // session.
+        let stale: Vec<Key> = self
+            .held_keys
+            .iter()
+            .copied()
+            .filter(|key| !self.window.is_key_down(*key))
+            .collect();
+        for key in stale {
+            self.held_keys.remove(&key);
+            if let Some(keycode) = evdev_code(key) {
+                events.push(WindowEvent::Key {
+                    keycode,
+                    pressed: false,
+                });
+            }
         }
         events.extend(self.resize());
         events
     }
 
-    fn close(&mut self) {
+    fn close(&mut self) -> Vec<WindowEvent> {
         // minifb tears the OS window down on drop, which happens as soon as
         // the session lets go of this box; until then, stop touching it.
         self.open = false;
+        let mut released: Vec<WindowEvent> = std::mem::take(&mut self.held_keys)
+            .into_iter()
+            .filter_map(|key| {
+                evdev_code(key).map(|keycode| WindowEvent::Key {
+                    keycode,
+                    pressed: false,
+                })
+            })
+            .collect();
+        for (index, (_, code)) in TRACKED_BUTTONS.into_iter().enumerate() {
+            if std::mem::replace(&mut self.buttons[index], false) {
+                released.push(WindowEvent::PointerButton {
+                    button: code,
+                    pressed: false,
+                });
+            }
+        }
+        released
     }
 }
 

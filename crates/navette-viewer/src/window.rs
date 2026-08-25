@@ -7,7 +7,7 @@
 //! driven headlessly in CI, where no display exists.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::rc::Rc;
 
 use thiserror::Error;
@@ -86,7 +86,15 @@ pub trait Window {
     /// Drains everything the user has done since the last call.
     fn poll_events(&mut self) -> Vec<WindowEvent>;
 
-    fn close(&mut self);
+    /// Closes the window and returns synthetic release events for any key or
+    /// pointer button this window still considers held.
+    ///
+    /// A window can be closed while its stream stays attached (the user
+    /// closed it, but the toplevel it belongs to is still running), so there
+    /// is no `detach` for a release-on-detach safety net elsewhere to catch
+    /// this on. Without a synthesized release here, a key held at close time
+    /// stays down in the guest for the rest of the session.
+    fn close(&mut self) -> Vec<WindowEvent>;
 }
 
 /// Opens a window for a newly seen stream. The real viewer hands back a
@@ -123,6 +131,12 @@ struct RecorderState {
     presented: Vec<Presented>,
     pending: VecDeque<WindowEvent>,
     closed: bool,
+    /// Keys and pointer buttons this window believes are currently held,
+    /// tracked from the press/release events the last `poll_events` drained.
+    /// Mirrors what a real window derives from live device state, so tests
+    /// can exercise `close`'s release synthesis without a display.
+    held_keys: BTreeSet<u32>,
+    held_buttons: BTreeSet<u32>,
 }
 
 impl WindowRecorder {
@@ -180,11 +194,59 @@ impl Window for RecordingWindow {
     }
 
     fn poll_events(&mut self) -> Vec<WindowEvent> {
-        self.state.borrow_mut().pending.drain(..).collect()
+        let mut state = self.state.borrow_mut();
+        let events: Vec<WindowEvent> = state.pending.drain(..).collect();
+        for event in &events {
+            match *event {
+                WindowEvent::Key {
+                    keycode,
+                    pressed: true,
+                } => {
+                    state.held_keys.insert(keycode);
+                }
+                WindowEvent::Key {
+                    keycode,
+                    pressed: false,
+                } => {
+                    state.held_keys.remove(&keycode);
+                }
+                WindowEvent::PointerButton {
+                    button,
+                    pressed: true,
+                } => {
+                    state.held_buttons.insert(button);
+                }
+                WindowEvent::PointerButton {
+                    button,
+                    pressed: false,
+                } => {
+                    state.held_buttons.remove(&button);
+                }
+                _ => {}
+            }
+        }
+        events
     }
 
-    fn close(&mut self) {
-        self.state.borrow_mut().closed = true;
+    fn close(&mut self) -> Vec<WindowEvent> {
+        let mut state = self.state.borrow_mut();
+        state.closed = true;
+        let mut released: Vec<WindowEvent> = std::mem::take(&mut state.held_keys)
+            .into_iter()
+            .map(|keycode| WindowEvent::Key {
+                keycode,
+                pressed: false,
+            })
+            .collect();
+        released.extend(
+            std::mem::take(&mut state.held_buttons)
+                .into_iter()
+                .map(|button| WindowEvent::PointerButton {
+                    button,
+                    pressed: false,
+                }),
+        );
+        released
     }
 }
 
@@ -241,5 +303,66 @@ mod tests {
         assert!(recorder.is_closed());
         window.present(&frame(), &HudSample::default());
         assert_eq!(recorder.presented().len(), 1);
+    }
+
+    #[test]
+    fn closing_a_window_releases_keys_and_buttons_still_held() {
+        let recorder = WindowRecorder::new();
+        let mut window = recorder.window(WindowSpec {
+            stream_id: 1,
+            width: 4,
+            height: 2,
+        });
+
+        recorder.inject(WindowEvent::Key {
+            keycode: 30,
+            pressed: true,
+        });
+        recorder.inject(WindowEvent::PointerButton {
+            button: 0x110,
+            pressed: true,
+        });
+        // Pressed and released before close: must not be reported as still
+        // held.
+        recorder.inject(WindowEvent::Key {
+            keycode: 31,
+            pressed: true,
+        });
+        recorder.inject(WindowEvent::Key {
+            keycode: 31,
+            pressed: false,
+        });
+        // The window only learns what is held from events it has actually
+        // drained, same as a real window only knows what it observed.
+        window.poll_events();
+
+        assert_eq!(
+            window.close(),
+            vec![
+                WindowEvent::Key {
+                    keycode: 30,
+                    pressed: false,
+                },
+                WindowEvent::PointerButton {
+                    button: 0x110,
+                    pressed: false,
+                },
+            ]
+        );
+        // Nothing is left to release a second time.
+        assert_eq!(window.close(), Vec::new());
+    }
+
+    #[test]
+    fn closing_a_window_with_nothing_held_releases_nothing() {
+        let recorder = WindowRecorder::new();
+        let mut window = recorder.window(WindowSpec {
+            stream_id: 1,
+            width: 4,
+            height: 2,
+        });
+        recorder.inject(WindowEvent::PointerMotion { x: 0.0, y: 0.0 });
+        window.poll_events();
+        assert_eq!(window.close(), Vec::new());
     }
 }
