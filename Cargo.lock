@@ -1095,6 +1095,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "calloop",
+ "navette-protocol",
  "nix 0.30.1",
  "thiserror 2.0.20",
  "wprs",
@@ -1130,9 +1131,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "calloop",
  "clap",
  "freedesktop-desktop-entry",
  "futures-util",
+ "navette-bridge",
  "navette-protocol",
  "nix 0.30.1",
  "serde",
@@ -1143,6 +1146,7 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tracing",
  "tracing-subscriber",
+ "wprs",
 ]
 
 [[package]]
@@ -2557,7 +2561,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "wprs"
 version = "0.1.0"
-source = "git+https://github.com/bearyjd/wprs.git?rev=f45c5d5b9ce09e9030eb2cd144b9ac4f774062bc#f45c5d5b9ce09e9030eb2cd144b9ac4f774062bc"
+source = "git+https://github.com/bearyjd/wprs.git?rev=2dcbbcdfde716c34034f89e2a31dbc7bcdc56643#2dcbbcdfde716c34034f89e2a31dbc7bcdc56643"
 dependencies = [
  "anyhow",
  "bimap",

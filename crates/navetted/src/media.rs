@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -23,11 +23,26 @@ struct HubState {
 
 struct SessionMedia {
     clients: HashMap<u64, Arc<ClientQueue>>,
-    input: mpsc::Sender<MediaInput>,
+    input: mpsc::Sender<MediaCommand>,
+    streams: HashMap<u64, StreamBootstrap>,
+}
+
+#[derive(Default)]
+struct StreamBootstrap {
     config: Option<Arc<MediaPacket>>,
     keyframe: Option<Arc<MediaPacket>>,
-    stream_id: Option<u64>,
     last_sequence: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum MediaCommand {
+    Input {
+        attachment_id: u64,
+        input: MediaInput,
+    },
+    Disconnected {
+        attachment_id: u64,
+    },
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -52,7 +67,7 @@ impl MediaHub {
         }
     }
 
-    pub fn register_session(&self, session: impl Into<String>) -> mpsc::Receiver<MediaInput> {
+    pub fn register_session(&self, session: impl Into<String>) -> mpsc::Receiver<MediaCommand> {
         let (input, receiver) = mpsc::channel(INPUT_QUEUE_CAPACITY);
         let mut state = self.inner.lock().expect("media hub lock poisoned");
         if let Some(previous) = state.sessions.insert(
@@ -60,10 +75,7 @@ impl MediaHub {
             SessionMedia {
                 clients: HashMap::new(),
                 input,
-                config: None,
-                keyframe: None,
-                stream_id: None,
-                last_sequence: None,
+                streams: HashMap::new(),
             },
         ) {
             for queue in previous.clients.values() {
@@ -95,11 +107,16 @@ impl MediaHub {
             .sessions
             .get_mut(session)
             .ok_or_else(|| MediaHubError::UnknownSession(session.to_string()))?;
-        if let Some(config) = session_state.config.clone() {
-            queue.push(config);
-        }
-        if let Some(keyframe) = session_state.keyframe.clone() {
-            queue.push(keyframe);
+        let mut stream_ids = session_state.streams.keys().copied().collect::<Vec<_>>();
+        stream_ids.sort_unstable();
+        for stream_id in stream_ids {
+            let stream = &session_state.streams[&stream_id];
+            if let Some(config) = stream.config.clone() {
+                queue.push(config);
+            }
+            if let Some(keyframe) = stream.keyframe.clone() {
+                queue.push(keyframe);
+            }
         }
         session_state.clients.insert(client_id, Arc::clone(&queue));
         Ok(MediaAttachment {
@@ -129,35 +146,30 @@ impl MediaHub {
         {
             return Err(MediaHubError::InvalidDimensions);
         }
-        if packet.header.kind != MediaKind::StreamConfig {
-            let stream_id = session_state
-                .stream_id
-                .ok_or(MediaHubError::MissingConfig)?;
-            if packet.header.stream_id != stream_id {
-                return Err(MediaHubError::WrongStream {
-                    expected: stream_id,
-                    actual: packet.header.stream_id,
-                });
-            }
+        let stream = session_state
+            .streams
+            .entry(packet.header.stream_id)
+            .or_default();
+        if packet.header.kind != MediaKind::StreamConfig && stream.config.is_none() {
+            return Err(MediaHubError::MissingConfig);
         }
-        let starts_new_stream = packet.header.kind == MediaKind::StreamConfig
-            && session_state.stream_id != Some(packet.header.stream_id);
-        if !starts_new_stream
-            && session_state
-                .last_sequence
-                .is_some_and(|sequence| packet.header.sequence <= sequence)
+        if stream
+            .last_sequence
+            .is_some_and(|sequence| packet.header.sequence <= sequence)
         {
             return Err(MediaHubError::NonMonotonicSequence);
         }
-        session_state.stream_id = Some(packet.header.stream_id);
-        session_state.last_sequence = Some(packet.header.sequence);
+        stream.last_sequence = Some(packet.header.sequence);
         match packet.header.kind {
             MediaKind::StreamConfig => {
-                session_state.config = Some(Arc::clone(&packet));
-                session_state.keyframe = None;
+                stream.config = Some(Arc::clone(&packet));
+                stream.keyframe = None;
             }
             MediaKind::Video if packet.header.flags.keyframe() => {
-                session_state.keyframe = Some(Arc::clone(&packet));
+                stream.keyframe = Some(Arc::clone(&packet));
+            }
+            MediaKind::StreamEnd => {
+                stream.keyframe = None;
             }
             _ => {}
         }
@@ -205,10 +217,16 @@ impl MediaAttachment {
             .sessions
             .get(&self.session)
             .ok_or_else(|| MediaHubError::UnknownSession(self.session.clone()))?;
-        session.input.try_send(input).map_err(|error| match error {
-            mpsc::error::TrySendError::Full(_) => MediaHubError::InputBackpressure,
-            mpsc::error::TrySendError::Closed(_) => MediaHubError::Unavailable,
-        })
+        session
+            .input
+            .try_send(MediaCommand::Input {
+                attachment_id: self.client_id,
+                input,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => MediaHubError::InputBackpressure,
+                mpsc::error::TrySendError::Closed(_) => MediaHubError::Unavailable,
+            })
     }
 }
 
@@ -223,6 +241,9 @@ impl Drop for MediaAttachment {
         };
         if let Some(session) = state.sessions.get_mut(&self.session) {
             session.clients.remove(&self.client_id);
+            let _ = session.input.try_send(MediaCommand::Disconnected {
+                attachment_id: self.client_id,
+            });
         }
     }
 }
@@ -236,7 +257,7 @@ struct ClientQueue {
 #[derive(Default)]
 struct ClientQueueState {
     packets: VecDeque<Arc<MediaPacket>>,
-    needs_keyframe: bool,
+    needs_keyframe: HashSet<u64>,
     closed: bool,
 }
 
@@ -262,30 +283,37 @@ impl ClientQueue {
         }
         let is_video = packet.header.kind == MediaKind::Video;
         let is_keyframe = is_video && packet.header.flags.keyframe();
-        if is_video && state.needs_keyframe && !is_keyframe {
+        if is_video && state.needs_keyframe.contains(&packet.header.stream_id) && !is_keyframe {
             return QueuePush::Dropped { count: 1 };
         }
         let mut evicted = 0;
         if state.packets.len() >= self.capacity {
             let previous_len = state.packets.len();
-            let config = state
-                .packets
-                .iter()
-                .rev()
-                .find(|item| item.header.kind == MediaKind::StreamConfig)
-                .cloned();
+            let mut configs = HashMap::new();
+            let mut video_streams = HashSet::new();
+            for item in state.packets.iter().rev() {
+                if item.header.kind == MediaKind::StreamConfig {
+                    configs
+                        .entry(item.header.stream_id)
+                        .or_insert_with(|| Arc::clone(item));
+                }
+                if item.header.kind == MediaKind::Video {
+                    video_streams.insert(item.header.stream_id);
+                }
+            }
+            state.needs_keyframe.extend(video_streams);
             state.packets.clear();
-            if let Some(config) = config {
+            for config in configs.into_values().take(self.capacity.saturating_sub(1)) {
                 state.packets.push_back(config);
             }
             evicted = previous_len - state.packets.len();
-            state.needs_keyframe = true;
+            state.needs_keyframe.insert(packet.header.stream_id);
             if is_video && !is_keyframe {
                 return QueuePush::Dropped { count: evicted + 1 };
             }
         }
         if is_keyframe {
-            state.needs_keyframe = false;
+            state.needs_keyframe.remove(&packet.header.stream_id);
         }
         state.packets.push_back(packet);
         drop(state);
@@ -444,10 +472,20 @@ mod tests {
         let mut two = hub.register_session("two");
         let client = hub.attach("one").unwrap();
         client.submit_input(MediaInput::RequestKeyframe).unwrap();
-        assert_eq!(one.recv().await, Some(MediaInput::RequestKeyframe));
+        assert_eq!(
+            one.recv().await,
+            Some(MediaCommand::Input {
+                attachment_id: 1,
+                input: MediaInput::RequestKeyframe
+            })
+        );
         assert!(two.try_recv().is_err());
         assert_eq!(hub.active_clients("one"), 1);
         drop(client);
+        assert_eq!(
+            one.recv().await,
+            Some(MediaCommand::Disconnected { attachment_id: 1 })
+        );
         assert_eq!(hub.active_clients("one"), 0);
         assert!(matches!(
             hub.attach("missing"),

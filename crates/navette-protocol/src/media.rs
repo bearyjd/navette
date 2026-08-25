@@ -8,6 +8,8 @@ pub const MEDIA_VERSION: u16 = 1;
 pub const MEDIA_HEADER_LEN: usize = 44;
 pub const MAX_MEDIA_PAYLOAD: usize = 16 * 1024 * 1024;
 pub const MAX_INPUT_MESSAGE: usize = 16 * 1024;
+pub const STREAM_CONFIG_VERSION: u8 = 1;
+pub const STREAM_CONFIG_PREFIX_LEN: usize = 21;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -118,6 +120,53 @@ pub struct MediaPacket {
     pub payload: Vec<u8>,
 }
 
+/// Bounded codec bootstrap and scene identity carried by `stream_config`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamConfig {
+    pub client_id: u64,
+    pub surface_id: u64,
+    /// Annex-B SPS/PPS bytes for the H.264 stream.
+    pub codec_config: Vec<u8>,
+}
+
+impl StreamConfig {
+    pub fn encode(&self) -> Result<Vec<u8>, MediaDecodeError> {
+        if self.codec_config.len() > MAX_MEDIA_PAYLOAD - STREAM_CONFIG_PREFIX_LEN
+            || self.codec_config.len() > u32::MAX as usize
+        {
+            return Err(MediaDecodeError::PayloadTooLarge(u32::MAX));
+        }
+        let mut output = Vec::with_capacity(STREAM_CONFIG_PREFIX_LEN + self.codec_config.len());
+        output.push(STREAM_CONFIG_VERSION);
+        output.extend_from_slice(&self.client_id.to_be_bytes());
+        output.extend_from_slice(&self.surface_id.to_be_bytes());
+        output.extend_from_slice(&(self.codec_config.len() as u32).to_be_bytes());
+        output.extend_from_slice(&self.codec_config);
+        Ok(output)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, MediaDecodeError> {
+        if bytes.len() < STREAM_CONFIG_PREFIX_LEN {
+            return Err(MediaDecodeError::TruncatedStreamConfig);
+        }
+        if bytes[0] != STREAM_CONFIG_VERSION {
+            return Err(MediaDecodeError::UnsupportedStreamConfigVersion(bytes[0]));
+        }
+        let codec_len = u32::from_be_bytes(bytes[17..21].try_into().expect("fixed slice"));
+        let expected = STREAM_CONFIG_PREFIX_LEN
+            .checked_add(codec_len as usize)
+            .ok_or(MediaDecodeError::LengthMismatch)?;
+        if bytes.len() != expected || expected > MAX_MEDIA_PAYLOAD {
+            return Err(MediaDecodeError::LengthMismatch);
+        }
+        Ok(Self {
+            client_id: u64::from_be_bytes(bytes[1..9].try_into().expect("fixed slice")),
+            surface_id: u64::from_be_bytes(bytes[9..17].try_into().expect("fixed slice")),
+            codec_config: bytes[STREAM_CONFIG_PREFIX_LEN..].to_vec(),
+        })
+    }
+}
+
 impl MediaPacket {
     pub fn new(mut header: MediaHeader, payload: Vec<u8>) -> Result<Self, MediaDecodeError> {
         if payload.len() > MAX_MEDIA_PAYLOAD || payload.len() > u32::MAX as usize {
@@ -173,6 +222,8 @@ pub enum MediaDecodeError {
     UnknownFlags(u8),
     PayloadTooLarge(u32),
     LengthMismatch,
+    TruncatedStreamConfig,
+    UnsupportedStreamConfigVersion(u8),
 }
 
 impl fmt::Display for MediaDecodeError {
@@ -205,14 +256,21 @@ pub enum MediaInput {
         vertical: f64,
     },
     KeyboardKey {
+        client_id: u64,
+        surface_id: u64,
         keycode: u32,
         pressed: bool,
     },
     KeyboardModifiers {
-        depressed: u32,
-        latched: u32,
-        locked: u32,
-        group: u32,
+        client_id: u64,
+        surface_id: u64,
+        ctrl: bool,
+        alt: bool,
+        shift: bool,
+        caps_lock: bool,
+        logo: bool,
+        num_lock: bool,
+        layout_index: u32,
     },
     ViewportResize {
         width: u32,
@@ -298,6 +356,23 @@ mod tests {
         assert_eq!(encoded[6], MediaKind::Video as u8);
         assert_eq!(encoded[7], 3);
         assert_eq!(MediaPacket::decode(&encoded).unwrap(), packet);
+    }
+
+    #[test]
+    fn stream_config_round_trips_with_surface_identity() {
+        let config = StreamConfig {
+            client_id: 11,
+            surface_id: 12,
+            codec_config: vec![0, 0, 0, 1, 0x67],
+        };
+        assert_eq!(
+            StreamConfig::decode(&config.encode().unwrap()).unwrap(),
+            config
+        );
+        assert_eq!(
+            StreamConfig::decode(&[]),
+            Err(MediaDecodeError::TruncatedStreamConfig)
+        );
     }
 
     #[test]

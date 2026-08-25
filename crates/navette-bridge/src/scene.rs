@@ -189,6 +189,13 @@ impl Scene {
         self.surfaces.get(&key).map(|node| node.damage.as_slice())
     }
 
+    pub fn surface_dimensions(&self, key: SurfaceKey) -> Option<(u32, u32)> {
+        self.surfaces
+            .get(&key)
+            .and_then(|node| node.image.as_ref())
+            .map(|image| (image.width, image.height))
+    }
+
     pub fn compose_toplevel(&self, root: SurfaceKey) -> Result<Frame, SceneError> {
         let node = self
             .surfaces

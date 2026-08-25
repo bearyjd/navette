@@ -46,6 +46,12 @@ impl WprsTransport {
         self.serializer.writer().send(SendType::Object(event));
     }
 
+    pub fn update_output(&self, width: u32, height: u32) {
+        self.send(Event::Output(OutputEvent::Update(output_info(
+            width, height,
+        ))));
+    }
+
     pub fn is_connected(&self) -> bool {
         self.serializer.other_end_connected()
     }
