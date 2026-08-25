@@ -168,9 +168,6 @@ impl MediaHub {
             MediaKind::Video if packet.header.flags.keyframe() => {
                 stream.keyframe = Some(Arc::clone(&packet));
             }
-            MediaKind::StreamEnd => {
-                stream.keyframe = None;
-            }
             _ => {}
         }
 
@@ -184,6 +181,15 @@ impl MediaHub {
                 QueuePush::Dropped { count } => stats.dropped += count,
                 QueuePush::Closed => {}
             }
+        }
+        // An ended stream must stop being bootstrapped: `attach` replays every
+        // entry in `streams`, so keeping a dead one there would hand each new
+        // client a `StreamConfig` for a stream no packet will ever follow --
+        // and the viewer eagerly spawns a decoder per replayed config. The
+        // removal happens only after the fan-out above so currently attached
+        // clients still receive the `StreamEnd` itself and can tear down.
+        if packet.header.kind == MediaKind::StreamEnd {
+            session_state.streams.remove(&packet.header.stream_id);
         }
         Ok(stats)
     }
@@ -372,11 +378,20 @@ mod tests {
     use super::*;
 
     fn packet(kind: MediaKind, sequence: u64, keyframe: bool) -> MediaPacket {
+        stream_packet(1, kind, sequence, keyframe)
+    }
+
+    fn stream_packet(
+        stream_id: u64,
+        kind: MediaKind,
+        sequence: u64,
+        keyframe: bool,
+    ) -> MediaPacket {
         MediaPacket::new(
             MediaHeader {
                 kind,
                 flags: MediaFlags::new(keyframe, false),
-                stream_id: 1,
+                stream_id,
                 sequence,
                 timestamp_us: sequence,
                 payload_len: 0,
@@ -461,6 +476,72 @@ mod tests {
             MediaKind::StreamConfig
         );
         assert_eq!(client.recv().await.unwrap().header.sequence, 5);
+    }
+
+    /// A stream that has ended must disappear from the bootstrap replay, or
+    /// every future attachment is handed a `StreamConfig` for a stream no
+    /// packet will ever follow -- which costs the viewer an idle decoder
+    /// subprocess per dead stream. The `StreamEnd` packet itself must still
+    /// reach the clients attached at the time so they can tear down.
+    #[tokio::test]
+    async fn stream_end_stops_the_bootstrap_replay_but_still_reaches_attached_clients() {
+        let hub = MediaHub::default();
+        let _input = hub.register_session("one");
+        let attached = hub.attach("one").unwrap();
+
+        hub.publish("one", stream_packet(1, MediaKind::StreamConfig, 1, false))
+            .unwrap();
+        hub.publish("one", stream_packet(1, MediaKind::Video, 2, true))
+            .unwrap();
+        // A second stream stays live throughout: only the ended stream may
+        // drop out of the replay.
+        hub.publish("one", stream_packet(2, MediaKind::StreamConfig, 1, false))
+            .unwrap();
+        hub.publish("one", stream_packet(2, MediaKind::Video, 2, true))
+            .unwrap();
+        hub.publish("one", stream_packet(1, MediaKind::StreamEnd, 3, false))
+            .unwrap();
+
+        let received = {
+            let mut received = Vec::new();
+            for _ in 0..5 {
+                let packet = attached.recv().await.unwrap();
+                received.push((packet.header.stream_id, packet.header.kind));
+            }
+            received
+        };
+        assert_eq!(
+            received,
+            vec![
+                (1, MediaKind::StreamConfig),
+                (1, MediaKind::Video),
+                (2, MediaKind::StreamConfig),
+                (2, MediaKind::Video),
+                (1, MediaKind::StreamEnd),
+            ],
+            "an already-attached client must still see the stream's end"
+        );
+
+        // A client attaching afterwards is bootstrapped with the live stream
+        // only.
+        let late = hub.attach("one").unwrap();
+        let config = late.recv().await.unwrap();
+        assert_eq!(
+            (config.header.stream_id, config.header.kind),
+            (2, MediaKind::StreamConfig),
+            "the ended stream must not be replayed to a new client"
+        );
+        let keyframe = late.recv().await.unwrap();
+        assert_eq!(
+            (keyframe.header.stream_id, keyframe.header.kind),
+            (2, MediaKind::Video)
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), late.recv())
+                .await
+                .is_err(),
+            "the replay must end with the live stream's keyframe"
+        );
     }
 
     #[tokio::test]
