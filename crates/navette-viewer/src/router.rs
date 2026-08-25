@@ -135,6 +135,12 @@ impl StreamRouter {
 
     fn decode(&mut self, packet: &MediaPacket) -> Option<StreamEvent> {
         let stream_id = packet.header.stream_id;
+        if packet.payload.is_empty() {
+            // Malformed rather than fatal: an empty access unit says nothing
+            // about the decoder, so it is dropped like any other bad input.
+            tracing::warn!(stream_id, "dropping video packet with an empty payload");
+            return None;
+        }
         let Some(stream) = self.streams.get_mut(&stream_id) else {
             tracing::warn!(stream_id, "dropping video for an unconfigured stream");
             return None;
@@ -150,11 +156,13 @@ impl StreamRouter {
             Ok(None) => None,
             Err(error) => {
                 tracing::warn!(stream_id, %error, "decode failed; requesting a keyframe");
-                // Every decode error means this stream's FFmpeg process is
-                // unusable, so the decoder goes with it. The keyframe request
-                // the client sends next makes the bridge re-emit SPS/PPS as a
-                // fresh `stream_config`, which rebuilds the decoder — the rest
-                // of the session keeps running throughout.
+                // A decode error leaves this stream's decoder in an unknown
+                // state — for `FfmpegDecoder` every reachable variant means
+                // its subprocess is gone — so the decoder is discarded rather
+                // than left to fail on every later frame. The keyframe request
+                // the client sends next is expected to bring a fresh
+                // `stream_config` that rebuilds it. Malformed input never
+                // reaches here: it is dropped above.
                 self.streams.remove(&stream_id);
                 Some(StreamEvent::DecodeFailed { stream_id })
             }
@@ -319,6 +327,20 @@ mod tests {
         router.handle(&stream_config(1, 6, 11, 12, &OTHER_CODEC_CONFIG));
         assert_eq!(router.live_streams(), 1);
         assert_eq!(frame_of(router.handle(&video(1, 7))).frame.pixels[0], 0);
+    }
+
+    #[test]
+    fn an_empty_video_payload_is_dropped_without_disturbing_the_decoder() {
+        let mut router = fake_router();
+        router.handle(&stream_config(1, 1, 11, 12, &CODEC_CONFIG));
+        assert!(
+            router
+                .handle(&packet(MediaKind::Video, 1, 2, Vec::new()))
+                .is_none()
+        );
+        assert_eq!(router.live_streams(), 1);
+        // The decoder never saw the empty packet, so it is still at zero.
+        assert_eq!(frame_of(router.handle(&video(1, 3))).frame.pixels[0], 0);
     }
 
     #[test]
