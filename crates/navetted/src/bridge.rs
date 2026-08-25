@@ -515,25 +515,37 @@ mod tests {
 
     #[test]
     fn normalize_frame_pads_odd_dimensions_and_preserves_pixel_rows() {
+        // 3x3 source: three rows, each with a distinguishable byte value, so
+        // a bug that uses the wrong row stride for source or target (or
+        // swaps them) lands each row's pixels at the wrong offset instead of
+        // silently reproducing the same output.
+        let mut pixels = Vec::with_capacity(3 * 3 * 4);
+        pixels.extend(std::iter::repeat_n(0x11, 3 * 4)); // row 0
+        pixels.extend(std::iter::repeat_n(0x22, 3 * 4)); // row 1
+        pixels.extend(std::iter::repeat_n(0x33, 3 * 4)); // row 2
         let frame = Frame {
             width: 3,
-            height: 1,
-            pixels: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            height: 3,
+            pixels,
         };
 
         let normalized = normalize_frame(frame);
 
         assert_eq!(normalized.width, 4);
-        assert_eq!(normalized.height, 2);
-        assert_eq!(normalized.pixels.len(), 4 * 2 * 4);
-        // The original row is preserved byte-for-byte...
-        assert_eq!(
-            &normalized.pixels[0..12],
-            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-        );
-        // ...and every padded pixel (the new column and the new row) is zeroed.
-        assert_eq!(&normalized.pixels[12..16], &[0, 0, 0, 0]);
-        assert_eq!(&normalized.pixels[16..32], &[0; 16]);
+        assert_eq!(normalized.height, 4);
+        assert_eq!(normalized.pixels.len(), 4 * 4 * 4);
+
+        // Source stride is 3 pixels/row (12 bytes), target stride is the
+        // padded 4 pixels/row (16 bytes) -- row 1 must land at target byte
+        // offset 16, not 12, and row 2 at 32, not 24.
+        assert_eq!(&normalized.pixels[0..12], &[0x11; 12], "row 0 pixels");
+        assert_eq!(&normalized.pixels[12..16], &[0; 4], "row 0 padding column");
+        assert_eq!(&normalized.pixels[16..28], &[0x22; 12], "row 1 pixels");
+        assert_eq!(&normalized.pixels[28..32], &[0; 4], "row 1 padding column");
+        assert_eq!(&normalized.pixels[32..44], &[0x33; 12], "row 2 pixels");
+        assert_eq!(&normalized.pixels[44..48], &[0; 4], "row 2 padding column");
+        // The entire padded row 3 is zero-fill.
+        assert_eq!(&normalized.pixels[48..64], &[0; 16], "padding row");
     }
 
     #[test]
@@ -563,13 +575,17 @@ mod tests {
         assert!(media.attach(&dead_session.name).is_ok());
 
         // Connecting to a socket nobody is listening on fails immediately, so
-        // the worker thread exits almost at once and unregisters its session
-        // on the way out.
+        // the worker thread exits almost at once. `start()`'s reap decision
+        // is keyed on `JoinHandle::is_finished()`, which only flips after the
+        // spawned closure's last statement (`unregister_session`) returns --
+        // so the test must wait on that same predicate via
+        // `BridgeManager::is_running`, not on a looser proxy signal like
+        // `media.attach` succeeding/failing, which can flip earlier.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while media.attach(&dead_session.name).is_ok() {
+        while manager.is_running(&dead_session.name) {
             assert!(
                 Instant::now() < deadline,
-                "worker never exited and unregistered its session"
+                "worker never exited and reaped itself"
             );
             thread::sleep(Duration::from_millis(5));
         }
