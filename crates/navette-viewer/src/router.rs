@@ -150,6 +150,12 @@ impl StreamRouter {
             Ok(None) => None,
             Err(error) => {
                 tracing::warn!(stream_id, %error, "decode failed; requesting a keyframe");
+                // Every decode error means this stream's FFmpeg process is
+                // unusable, so the decoder goes with it. The keyframe request
+                // the client sends next makes the bridge re-emit SPS/PPS as a
+                // fresh `stream_config`, which rebuilds the decoder — the rest
+                // of the session keeps running throughout.
+                self.streams.remove(&stream_id);
                 Some(StreamEvent::DecodeFailed { stream_id })
             }
         }
@@ -361,14 +367,24 @@ mod tests {
                 calls: 0,
             }) as Box<dyn Decoder>)
         }));
+        router.handle(&stream_config(2, 1, 21, 22, &CODEC_CONFIG));
         router.handle(&stream_config(1, 1, 11, 12, &CODEC_CONFIG));
+        // Priming is silent, and it is not a failure.
         assert!(router.handle(&video(1, 2)).is_none());
+        assert_eq!(router.live_streams(), 2);
+
         assert_eq!(
             router.handle(&video(1, 3)),
             Some(StreamEvent::DecodeFailed { stream_id: 1 })
         );
-        // A failed access unit must not tear the stream down.
+        // Only the broken stream's decoder is discarded; the keyframe request
+        // the client sends next brings a fresh `stream_config` that rebuilds
+        // it, and the other stream is untouched throughout.
         assert_eq!(router.live_streams(), 1);
+        assert!(router.handle(&video(1, 4)).is_none());
+        router.handle(&stream_config(1, 5, 11, 12, &CODEC_CONFIG));
+        assert_eq!(router.live_streams(), 2);
+        assert!(router.handle(&video(1, 6)).is_none());
     }
 
     #[test]
