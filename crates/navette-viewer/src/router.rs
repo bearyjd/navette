@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 
 use navette_protocol::media::{MediaKind, MediaPacket, StreamConfig};
 
-use crate::decoder::{DecodedFrame, Decoder, DecoderConfig, DecoderError};
+use crate::decoder::{DecodedFrame, Decoder, DecoderConfig, DecoderError, DecoderMetrics};
 
 /// Builds a decoder for a newly configured stream. The real viewer hands back
 /// an `FfmpegDecoder`; tests hand back a `FakeDecoder`.
@@ -19,8 +19,33 @@ pub struct StreamFrame {
     pub frame: DecodedFrame,
 }
 
+/// On-the-wire accounting for one packet of a stream, reported alongside the
+/// frames it produced.
+///
+/// The viewer's performance HUD is computed entirely client-side, so the byte
+/// count and sequence number a packet arrived with — neither of which survives
+/// into a [`StreamFrame`], and a packet can yield zero or several of those —
+/// have to reach the consumer some other way. This is that way; it is
+/// bookkeeping about a packet, not a second copy of its payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamPacket {
+    pub stream_id: u64,
+    pub kind: MediaKind,
+    pub sequence: u64,
+    /// Header plus payload, i.e. what the socket actually carried.
+    pub wire_bytes: usize,
+    /// The bridge flagged this packet as following an encoder discontinuity.
+    pub discontinuity: bool,
+    /// The stream's decoder counters after this packet was routed, or `None`
+    /// when the stream has no live decoder (not yet configured, or torn down
+    /// by this very packet).
+    pub decoder: Option<DecoderMetrics>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StreamEvent {
+    /// A packet arrived. Reported before any frame it decoded into.
+    Packet(StreamPacket),
     Frame(StreamFrame),
     /// The toplevel closed; the stream's decoder has been torn down.
     Ended {
@@ -66,6 +91,16 @@ impl StreamRouter {
     /// Number of streams with a live decoder.
     pub fn live_streams(&self) -> usize {
         self.streams.len()
+    }
+
+    /// Decoder counters for one stream, or `None` when it has no live
+    /// decoder. The router owns the only handle on each decoder, so this is
+    /// the sole way for a consumer to reach the real per-stream decode timing
+    /// rather than re-measuring it around the consumption loop.
+    pub fn metrics(&self, stream_id: u64) -> Option<DecoderMetrics> {
+        self.streams
+            .get(&stream_id)
+            .map(|stream| stream.decoder.metrics())
     }
 
     /// Feeds one packet through the router. Zero or more events come back: a
@@ -354,6 +389,32 @@ mod tests {
         assert_eq!(frame.timestamp_us, 2000);
         assert_eq!((frame.frame.width, frame.frame.height), (4, 2));
         assert_eq!(frame.frame.pixels, vec![0; 4 * 2 * 4]);
+    }
+
+    #[test]
+    fn decoder_metrics_are_readable_per_stream_for_as_long_as_the_stream_lives() {
+        let mut router = fake_router();
+        assert_eq!(router.metrics(1), None, "an unknown stream has no decoder");
+
+        router.handle(&stream_config(1, 1, 11, 12, &CODEC_CONFIG));
+        router.handle(&stream_config(2, 1, 21, 22, &CODEC_CONFIG));
+        assert_eq!(router.metrics(1).map(|m| m.frames_decoded), Some(0));
+
+        router.handle(&video(1, 2));
+        router.handle(&video(1, 3));
+        // Counters are the decoder's own and are kept per stream, so one
+        // stream's traffic never shows up in another's.
+        assert_eq!(router.metrics(1).map(|m| m.frames_decoded), Some(2));
+        assert_eq!(router.metrics(2).map(|m| m.frames_decoded), Some(0));
+        assert_eq!(
+            router.metrics(1).map(|m| m.bytes_submitted),
+            Some(12),
+            "two six-byte access units were submitted"
+        );
+
+        router.handle(&packet(MediaKind::StreamEnd, 1, 4, Vec::new()));
+        assert_eq!(router.metrics(1), None, "a torn-down stream has no decoder");
+        assert_eq!(router.metrics(2).map(|m| m.frames_decoded), Some(0));
     }
 
     #[test]

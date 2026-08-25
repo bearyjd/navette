@@ -7,10 +7,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use navette_protocol::media::{
-    MediaFlags, MediaHeader, MediaKind, MediaPacket, StreamConfig as MediaStreamConfig,
+    MediaFlags, MediaHeader, MediaInput, MediaKind, MediaPacket, StreamConfig as MediaStreamConfig,
 };
 use navette_protocol::{App, Session, SessionStatus};
-use navette_viewer::{Decoder, DecoderConfig, FakeDecoder, MediaClient, StreamEvent, media_url};
+use navette_viewer::client::INPUT_QUEUE_CAPACITY;
+use navette_viewer::{
+    ClientError, Decoder, DecoderConfig, FakeDecoder, MediaClient, StreamEvent, StreamFrame,
+    media_url,
+};
 use navetted::api::{ApiState, router};
 use navetted::app_index::AppIndex;
 use navetted::media::MediaCommand;
@@ -120,6 +124,18 @@ fn video_packet(stream_id: u64, sequence: u64) -> MediaPacket {
     .unwrap()
 }
 
+/// Waits for the next decoded picture, stepping over the per-packet
+/// accounting the HUD consumes.
+async fn next_frame(client: &mut MediaClient) -> StreamFrame {
+    loop {
+        match client.next_event().await {
+            Some(StreamEvent::Packet(_)) => continue,
+            Some(StreamEvent::Frame(frame)) => return frame,
+            other => panic!("expected a decoded frame, got {other:?}"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn client_decodes_the_bootstrap_replayed_on_attach() {
     let temp = TempDir::new().unwrap();
@@ -158,10 +174,20 @@ async fn client_decodes_the_bootstrap_replayed_on_attach() {
         })
     );
 
-    let frame = match client.next_event().await {
-        Some(StreamEvent::Frame(frame)) => frame,
-        other => panic!("expected the replayed keyframe to decode, got {other:?}"),
-    };
+    // Each packet is accounted for before whatever it decoded into, so the
+    // HUD sees a packet's wire cost and sequence alongside its own frames.
+    for (kind, sequence) in [(MediaKind::StreamConfig, 1), (MediaKind::Video, 2)] {
+        match client.next_event().await {
+            Some(StreamEvent::Packet(packet)) => {
+                assert_eq!((packet.kind, packet.sequence), (kind, sequence));
+                assert_eq!(packet.stream_id, 1);
+                assert!(packet.wire_bytes > 0);
+            }
+            other => panic!("expected accounting for the {kind:?} packet, got {other:?}"),
+        }
+    }
+
+    let frame = next_frame(&mut client).await;
     assert_eq!(frame.stream_id, 1);
     assert_eq!(frame.client_id, 11);
     assert_eq!(frame.surface_id, 12);
@@ -171,20 +197,111 @@ async fn client_decodes_the_bootstrap_replayed_on_attach() {
     // Live traffic published after the attach keeps flowing to the same
     // decoder, and closing the toplevel tears that stream down.
     hub.publish("work", video_packet(1, 3)).unwrap();
-    let next = match client.next_event().await {
-        Some(StreamEvent::Frame(frame)) => frame,
-        other => panic!("expected a live frame, got {other:?}"),
-    };
-    assert_eq!(next.frame.pixels[0], 1);
+    assert_eq!(next_frame(&mut client).await.frame.pixels[0], 1);
 
     hub.publish(
         "work",
         MediaPacket::new(header(MediaKind::StreamEnd, 1, 4, false), Vec::new()).unwrap(),
     )
     .unwrap();
+    loop {
+        match client.next_event().await {
+            Some(StreamEvent::Packet(_)) => continue,
+            other => {
+                assert_eq!(other, Some(StreamEvent::Ended { stream_id: 1 }));
+                break;
+            }
+        }
+    }
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn window_input_reaches_the_bridge_over_the_same_connection() {
+    let temp = TempDir::new().unwrap();
+    let state = test_state(&temp);
+    add_running_session(&state, "work");
+    let mut commands = state.media.register_session("work");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router(state)).await.unwrap();
+    });
+
+    let url = media_url(&format!("ws://{address}"), "work");
+    let client = MediaClient::connect(
+        &url,
+        Box::new(|config: &DecoderConfig| {
+            Ok(Box::new(FakeDecoder::new(config.clone())?) as Box<dyn Decoder>)
+        }),
+    )
+    .await
+    .unwrap();
     assert_eq!(
-        client.next_event().await,
-        Some(StreamEvent::Ended { stream_id: 1 })
+        commands.recv().await,
+        Some(MediaCommand::Input {
+            attachment_id: 1,
+            input: MediaInput::RequestKeyframe,
+        })
+    );
+
+    // Out-of-range input is refused locally and never queued, so it cannot
+    // arrive ahead of — or instead of — the valid message that follows it.
+    let refused = client.send_input(MediaInput::ViewportResize {
+        width: 16,
+        height: 16,
+    });
+    assert!(
+        matches!(refused, Err(ClientError::InvalidInput(_))),
+        "expected a local rejection, got {refused:?}"
+    );
+
+    let pointer = MediaInput::PointerMotion {
+        client_id: 11,
+        surface_id: 12,
+        x: 4.5,
+        y: 6.5,
+    };
+    let resize = MediaInput::ViewportResize {
+        width: 1280,
+        height: 720,
+    };
+    client.send_input(pointer.clone()).unwrap();
+    client.send_input(resize.clone()).unwrap();
+
+    for input in [pointer.clone(), resize] {
+        assert_eq!(
+            commands.recv().await,
+            Some(MediaCommand::Input {
+                attachment_id: 1,
+                input,
+            })
+        );
+    }
+
+    // Sending must never wait on the connection: a window loop drives both
+    // this and `next_event`, so a send that blocked would stop the loop
+    // draining events, which would block the connection task, which is the
+    // only thing that drains input — a deadlock neither side can break.
+    //
+    // `send_input` returns without awaiting, so on this single-threaded test
+    // runtime the connection task cannot be scheduled part-way through the
+    // loop below and the queue is guaranteed to saturate. Every call still
+    // returns; the overflow is refused rather than waited on.
+    let overflow = 8;
+    let mut refused = 0;
+    for _ in 0..(INPUT_QUEUE_CAPACITY + overflow) {
+        match client.send_input(pointer.clone()) {
+            Ok(()) => {}
+            Err(ClientError::InputBackpressure) => refused += 1,
+            Err(error) => panic!("unexpected send failure: {error}"),
+        }
+    }
+    assert_eq!(
+        refused, overflow,
+        "a saturated queue must refuse the excess rather than wait for room"
     );
 
     server.abort();

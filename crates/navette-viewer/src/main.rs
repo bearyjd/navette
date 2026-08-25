@@ -1,6 +1,14 @@
+use std::time::{Duration, Instant};
+
 use anyhow::{Context, Result};
 use clap::Parser;
-use navette_viewer::{MediaClient, StreamEvent, ffmpeg_decoder_factory, media_url};
+use navette_viewer::{
+    MediaClient, ViewerSession, ffmpeg_decoder_factory, media_url, native_window_factory,
+};
+
+/// How often each window's input queue is drained. Fast enough that pointer
+/// motion feels continuous, cheap enough to run alongside decoding.
+const POLL_INTERVAL: Duration = Duration::from_millis(8);
 
 #[derive(Parser, Debug)]
 #[command(name = "navette-viewer", version, about)]
@@ -27,6 +35,12 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to attach to {url}"))?;
     tracing::info!(session = %cli.session, %url, "attached to session media");
 
+    // Windows are not `Send`, so they stay on the thread `block_on` is
+    // driving: this future is never moved to a worker.
+    let mut session = ViewerSession::new(native_window_factory());
+    let mut poll = tokio::time::interval(POLL_INTERVAL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
             event = client.next_event() => {
@@ -34,31 +48,24 @@ async fn main() -> Result<()> {
                     tracing::info!("session media closed");
                     return Ok(());
                 };
-                report(event);
+                session.handle(event, Instant::now());
+            }
+            _ = poll.tick() => {
+                for input in session.poll(Instant::now()) {
+                    // Sending never waits, so this handler always returns to
+                    // the select and keeps draining events. One rejected or
+                    // undeliverable event must not end the session; the
+                    // connection closing is what ends it.
+                    if let Err(error) = client.send_input(input) {
+                        tracing::warn!(%error, "dropping an input event");
+                    }
+                }
             }
             result = tokio::signal::ctrl_c() => {
                 result.context("failed to listen for interrupts")?;
                 tracing::info!("detaching");
                 return Ok(());
             }
-        }
-    }
-}
-
-fn report(event: StreamEvent) {
-    match event {
-        StreamEvent::Frame(frame) => tracing::info!(
-            stream_id = frame.stream_id,
-            client_id = frame.client_id,
-            surface_id = frame.surface_id,
-            width = frame.frame.width,
-            height = frame.frame.height,
-            timestamp_us = frame.timestamp_us,
-            "decoded frame"
-        ),
-        StreamEvent::Ended { stream_id } => tracing::info!(stream_id, "stream ended"),
-        StreamEvent::DecodeFailed { stream_id } => {
-            tracing::warn!(stream_id, "decode failed")
         }
     }
 }
