@@ -1127,6 +1127,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "navette-viewer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "futures-util",
+ "navette-bridge",
+ "navette-protocol",
+ "navetted",
+ "nix 0.30.1",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "navetted"
 version = "0.1.0"
 dependencies = [
