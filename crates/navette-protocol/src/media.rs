@@ -10,6 +10,9 @@ pub const MAX_MEDIA_PAYLOAD: usize = 16 * 1024 * 1024;
 pub const MAX_INPUT_MESSAGE: usize = 16 * 1024;
 pub const STREAM_CONFIG_VERSION: u8 = 1;
 pub const STREAM_CONFIG_PREFIX_LEN: usize = 21;
+/// Number of keyboard layouts a client may index into, matching the ceiling
+/// common desktop layout switchers impose. Valid indices are `0..MAX_LAYOUTS`.
+pub const MAX_LAYOUTS: u32 = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -298,6 +301,9 @@ impl MediaInput {
             Self::KeyboardKey { keycode, .. } if *keycode > 767 => {
                 Err(InputValidationError::KeyOutOfRange(*keycode))
             }
+            Self::KeyboardModifiers { layout_index, .. } if *layout_index >= MAX_LAYOUTS => {
+                Err(InputValidationError::LayoutOutOfRange(*layout_index))
+            }
             Self::ViewportResize { width, height }
                 if !(320..=3840).contains(width) || !(240..=2160).contains(height) =>
             {
@@ -313,6 +319,7 @@ pub enum InputValidationError {
     NonFiniteCoordinate,
     ButtonOutOfRange(u32),
     KeyOutOfRange(u32),
+    LayoutOutOfRange(u32),
     ViewportOutOfRange,
 }
 
@@ -420,6 +427,31 @@ mod tests {
             }
             .validate(),
             Err(InputValidationError::ViewportOutOfRange)
+        );
+    }
+
+    #[test]
+    fn input_validation_bounds_the_keyboard_layout_index() {
+        let modifiers = |layout_index| MediaInput::KeyboardModifiers {
+            client_id: 1,
+            surface_id: 2,
+            ctrl: false,
+            alt: false,
+            shift: false,
+            caps_lock: false,
+            logo: false,
+            num_lock: false,
+            layout_index,
+        };
+        assert_eq!(modifiers(0).validate(), Ok(()));
+        assert_eq!(modifiers(MAX_LAYOUTS - 1).validate(), Ok(()));
+        assert_eq!(
+            modifiers(MAX_LAYOUTS).validate(),
+            Err(InputValidationError::LayoutOutOfRange(MAX_LAYOUTS))
+        );
+        assert_eq!(
+            modifiers(u32::MAX).validate(),
+            Err(InputValidationError::LayoutOutOfRange(u32::MAX))
         );
     }
 }
