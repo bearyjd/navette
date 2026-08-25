@@ -26,7 +26,14 @@ pub enum InputTranslationError {
 #[derive(Debug, Default)]
 pub struct InputState {
     serial: u32,
-    focused: Option<SurfaceKey>,
+    /// Pointer and keyboard focus are independent in Wayland, and wprs's
+    /// server treats them independently too: only `KeyboardEvent::Enter`
+    /// establishes keyboard focus, and pointer events never touch it. They
+    /// must therefore be tracked separately -- sharing one field lets a
+    /// pointer motion suppress the keyboard enter a surface needs before it
+    /// can receive any key at all.
+    pointer_focus: Option<SurfaceKey>,
+    keyboard_focus: Option<SurfaceKey>,
     pressed_keys: BTreeMap<u64, BTreeSet<u32>>,
     pressed_buttons: BTreeMap<u64, BTreeSet<(SurfaceKey, u32)>>,
 }
@@ -55,7 +62,7 @@ impl InputState {
                     y: y.clamp(0.0, f64::from(height.saturating_sub(1))),
                 };
                 let mut events = Vec::new();
-                if self.focused != Some(key) {
+                if self.pointer_focus != Some(key) {
                     events.push(pointer_event(
                         key,
                         position,
@@ -63,7 +70,7 @@ impl InputState {
                             serial: self.next_serial(),
                         },
                     ));
-                    self.focused = Some(key);
+                    self.pointer_focus = Some(key);
                 }
                 events.push(pointer_event(key, position, PointerEventKind::Motion));
                 transport.send(Event::PointerFrame(events));
@@ -197,6 +204,10 @@ impl InputState {
         Ok(())
     }
 
+    /// Releases the input `attachment_id` still held down. Neither focus
+    /// field is cleared: focus is a property of the shared wprs seat, not of
+    /// one attachment, so a client leaving must not revoke the focus other
+    /// attached clients are still typing and pointing into.
     pub fn disconnect(&mut self, attachment_id: u64, transport: &WprsTransport) {
         if let Some(buttons) = self.pressed_buttons.remove(&attachment_id) {
             for (key, button) in buttons {
@@ -221,7 +232,7 @@ impl InputState {
     }
 
     fn focus_keyboard(&mut self, key: SurfaceKey, transport: &WprsTransport) {
-        if self.focused != Some(key) {
+        if self.keyboard_focus != Some(key) {
             let serial = self.next_serial();
             transport.send(Event::KeyboardEvent(KeyboardEvent::Enter {
                 serial,
@@ -229,7 +240,7 @@ impl InputState {
                 keycodes: Vec::new(),
                 keysyms: Vec::new(),
             }));
-            self.focused = Some(key);
+            self.keyboard_focus = Some(key);
         }
     }
 
@@ -778,6 +789,130 @@ mod tests {
         match fake.recv() {
             Event::KeyboardEvent(KeyboardEvent::Key(KeyInner { raw_code: 32, .. })) => {}
             other => panic!("expected a key press, got {other:?}"),
+        }
+    }
+
+    /// Pointer focus and keyboard focus are independent: a pointer motion
+    /// over a surface must not stand in for the `KeyboardEvent::Enter` that
+    /// surface needs before wprs will route any key to it, and vice versa.
+    /// The viewer always sends a pointer motion before any keyboard event, so
+    /// conflating the two focus fields kills keyboard input outright.
+    #[test]
+    fn pointer_focus_does_not_suppress_keyboard_enter_on_the_same_surface() {
+        let scene = scene_with_toplevels(&[(1, 1, 8, 8)]);
+        let (transport, fake) = FakeWprsd::connect();
+        let mut state = InputState::default();
+
+        state
+            .apply(
+                7,
+                MediaInput::PointerMotion {
+                    client_id: 1,
+                    surface_id: 1,
+                    x: 2.0,
+                    y: 2.0,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+        match fake.recv() {
+            Event::PointerFrame(events) => {
+                assert!(matches!(events[0].kind, PointerEventKind::Enter { .. }));
+            }
+            other => panic!("expected a pointer frame, got {other:?}"),
+        }
+
+        // The very same surface now takes keyboard input: it must still be
+        // entered for the keyboard, because the pointer enter above did not
+        // give it keyboard focus server-side.
+        state
+            .apply(
+                7,
+                MediaInput::KeyboardKey {
+                    client_id: 1,
+                    surface_id: 1,
+                    keycode: 30,
+                    pressed: true,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+        match fake.recv() {
+            Event::KeyboardEvent(KeyboardEvent::Enter { surface_id, .. }) => {
+                assert_eq!(surface_id, WlSurfaceId(1));
+            }
+            other => panic!(
+                "a pointer motion must not suppress the keyboard enter for the same surface, got {other:?}"
+            ),
+        }
+        match fake.recv() {
+            Event::KeyboardEvent(KeyboardEvent::Key(KeyInner { raw_code: 30, .. })) => {}
+            other => panic!("expected the key press after the enter, got {other:?}"),
+        }
+    }
+
+    /// The mirror image: a keyboard enter must not consume the pointer's
+    /// `Enter` for the same surface either.
+    #[test]
+    fn keyboard_focus_does_not_suppress_pointer_enter_on_the_same_surface() {
+        let scene = scene_with_toplevels(&[(1, 1, 8, 8)]);
+        let (transport, fake) = FakeWprsd::connect();
+        let mut state = InputState::default();
+
+        state
+            .apply(
+                7,
+                MediaInput::KeyboardModifiers {
+                    client_id: 1,
+                    surface_id: 1,
+                    ctrl: true,
+                    alt: false,
+                    shift: false,
+                    caps_lock: false,
+                    logo: false,
+                    num_lock: false,
+                    layout_index: 0,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+        match fake.recv() {
+            Event::KeyboardEvent(KeyboardEvent::Enter { surface_id, .. }) => {
+                assert_eq!(surface_id, WlSurfaceId(1));
+            }
+            other => panic!("expected a keyboard enter, got {other:?}"),
+        }
+        match fake.recv() {
+            Event::KeyboardEvent(KeyboardEvent::Modifiers { .. }) => {}
+            other => panic!("expected the modifiers event, got {other:?}"),
+        }
+
+        state
+            .apply(
+                7,
+                MediaInput::PointerMotion {
+                    client_id: 1,
+                    surface_id: 1,
+                    x: 1.0,
+                    y: 1.0,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+        match fake.recv() {
+            Event::PointerFrame(events) => {
+                assert_eq!(events.len(), 2);
+                assert!(
+                    matches!(events[0].kind, PointerEventKind::Enter { .. }),
+                    "a keyboard enter must not suppress the pointer enter for the same surface"
+                );
+                assert!(matches!(events[1].kind, PointerEventKind::Motion));
+            }
+            other => panic!("expected a pointer frame, got {other:?}"),
         }
     }
 
