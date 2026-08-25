@@ -241,20 +241,27 @@ fn handle_scene_events(
 ) {
     for event in events {
         match event {
-            SceneEvent::SurfaceCommitted(_) => {
-                for key in worker.scene.toplevels() {
-                    let Ok(frame) = worker.scene.compose_toplevel(key) else {
-                        continue;
-                    };
-                    if let Err(error) = encode_frame(
-                        session,
-                        media,
-                        &mut worker.streams,
-                        key,
-                        normalize_frame(frame),
-                    ) {
-                        tracing::warn!(?key, %error, "failed to encode captured frame");
-                    }
+            SceneEvent::SurfaceCommitted(key) => {
+                // Only the committed surface's own window is re-encoded. A
+                // subsurface commit still recomposites its toplevel ancestor
+                // (its pixels land in that frame), but unrelated toplevels are
+                // untouched: encoding all of them on every commit would stream
+                // every open window at the busiest window's commit rate.
+                let Some(toplevel) = worker.scene.toplevel_ancestor(key) else {
+                    tracing::trace!(?key, "commit belongs to no toplevel; nothing to encode");
+                    continue;
+                };
+                let Ok(frame) = worker.scene.compose_toplevel(toplevel) else {
+                    continue;
+                };
+                if let Err(error) = encode_frame(
+                    session,
+                    media,
+                    &mut worker.streams,
+                    toplevel,
+                    normalize_frame(frame),
+                ) {
+                    tracing::warn!(?toplevel, %error, "failed to encode captured frame");
                 }
             }
             SceneEvent::SurfaceDestroyed(key) => {
@@ -407,9 +414,10 @@ mod tests {
     use std::process::{Command, Stdio};
 
     use navette_protocol::SessionStatus;
+    use wprs::serialization::geometry::Point;
     use wprs::serialization::wayland::{
-        Buffer, BufferAssignment, BufferData, BufferFormat, BufferMetadata, Role, SurfaceRequest,
-        SurfaceRequestPayload, SurfaceState, WlSurfaceId,
+        Buffer, BufferAssignment, BufferData, BufferFormat, BufferMetadata, Role, SubSurfaceState,
+        SubsurfacePosition, SurfaceRequest, SurfaceRequestPayload, SurfaceState, WlSurfaceId,
     };
     use wprs::serialization::xdg_shell::{XdgToplevelId, XdgToplevelState};
     use wprs::serialization::{ClientId, RecvType, Request};
@@ -494,6 +502,36 @@ mod tests {
             state.buffer = Some(external_buffer(64, 64, BufferFormat::Xrgb8888));
             scene.apply(commit(state)).unwrap();
         }
+        scene
+    }
+
+    /// A 64x64 toplevel that lists a 4x4 subsurface child, plus that child.
+    /// Both pixel counts (4096 and 16) stay clear of the vendored `wprs`
+    /// filter's alignment bug described on `scene_with_toplevels`.
+    fn scene_with_toplevel_and_subsurface(client: u64, parent: u64, child: u64) -> Scene {
+        let mut scene = Scene::default();
+        scene
+            .apply(RecvType::RawBuffer(vec![0; 64 * 64 * 4]))
+            .unwrap();
+        let mut parent_state = surface_state(client, parent);
+        parent_state.buffer = Some(external_buffer(64, 64, BufferFormat::Xrgb8888));
+        parent_state.z_ordered_children.push(SubsurfacePosition {
+            id: WlSurfaceId(child),
+            position: Point { x: 0, y: 0 },
+        });
+        scene.apply(commit(parent_state)).unwrap();
+
+        scene
+            .apply(RecvType::RawBuffer(vec![0; 4 * 4 * 4]))
+            .unwrap();
+        let mut child_state = surface_state(client, child);
+        child_state.role = Some(Role::SubSurface(SubSurfaceState {
+            parent: WlSurfaceId(parent),
+            location: Point { x: 0, y: 0 },
+            sync: true,
+        }));
+        child_state.buffer = Some(external_buffer(4, 4, BufferFormat::Argb8888));
+        scene.apply(commit(child_state)).unwrap();
         scene
     }
 
@@ -628,11 +666,16 @@ mod tests {
             surface_id: 2,
         };
 
+        // Each toplevel is encoded off its own commit, so both must commit
+        // for both streams to exist.
         handle_scene_events(
             "s1",
             &media,
             &mut worker,
-            vec![SceneEvent::SurfaceCommitted(key1)],
+            vec![
+                SceneEvent::SurfaceCommitted(key1),
+                SceneEvent::SurfaceCommitted(key2),
+            ],
         );
 
         assert_eq!(worker.streams.len(), 2);
@@ -684,6 +727,153 @@ mod tests {
         assert!(worker.streams[&key2].discontinuity);
     }
 
+    /// A commit belongs to one window. Re-encoding every open toplevel on
+    /// every commit makes each window stream at the busiest window's commit
+    /// rate, burning encode time and bandwidth on frames nothing changed in.
+    #[tokio::test]
+    async fn commit_encodes_only_the_committed_surfaces_own_toplevel() {
+        if !ffmpeg_available() {
+            return;
+        }
+        let media = MediaHub::default();
+        let _input = media.register_session("s1");
+        let client = media.attach("s1").unwrap();
+
+        let scene = scene_with_toplevels(&[(1, 1), (1, 2)]);
+        let mut worker = WorkerState {
+            scene,
+            streams: HashMap::new(),
+            input: InputState::default(),
+        };
+        let key1 = SurfaceKey {
+            client_id: 1,
+            surface_id: 1,
+        };
+        let key2 = SurfaceKey {
+            client_id: 1,
+            surface_id: 2,
+        };
+
+        handle_scene_events(
+            "s1",
+            &media,
+            &mut worker,
+            vec![SceneEvent::SurfaceCommitted(key1)],
+        );
+
+        assert_eq!(
+            worker.streams.len(),
+            1,
+            "only the committed toplevel may be encoded"
+        );
+        let stream1 = worker.streams[&key1].id;
+        for expected in [MediaKind::StreamConfig, MediaKind::Video] {
+            let packet = recv_packet(&client).await;
+            assert_eq!(packet.header.stream_id, stream1);
+            assert_eq!(packet.header.kind, expected);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), client.recv())
+                .await
+                .is_err(),
+            "an untouched toplevel must publish nothing on another window's commit"
+        );
+
+        // The other window starts streaming on its own commit, and repeated
+        // commits to it leave the first window's stream alone.
+        handle_scene_events(
+            "s1",
+            &media,
+            &mut worker,
+            vec![SceneEvent::SurfaceCommitted(key2)],
+        );
+        assert_eq!(worker.streams.len(), 2);
+        let sequence1 = worker.streams[&key1].sequence;
+        for expected in [MediaKind::StreamConfig, MediaKind::Video] {
+            let packet = recv_packet(&client).await;
+            assert_eq!(packet.header.stream_id, worker.streams[&key2].id);
+            assert_eq!(packet.header.kind, expected);
+        }
+
+        handle_scene_events(
+            "s1",
+            &media,
+            &mut worker,
+            vec![SceneEvent::SurfaceCommitted(key2)],
+        );
+        assert_eq!(
+            worker.streams[&key1].sequence, sequence1,
+            "a commit to one window must not advance another window's stream"
+        );
+        let packet = recv_packet(&client).await;
+        assert_eq!(packet.header.stream_id, worker.streams[&key2].id);
+    }
+
+    /// `Scene::compose_toplevel` draws subsurfaces into their toplevel's
+    /// frame, so a subsurface commit has to recomposite that toplevel rather
+    /// than be dropped for not being a toplevel itself.
+    #[tokio::test]
+    async fn subsurface_commit_reencodes_its_toplevel_ancestor() {
+        if !ffmpeg_available() {
+            return;
+        }
+        let media = MediaHub::default();
+        let _input = media.register_session("s1");
+        let client = media.attach("s1").unwrap();
+
+        let scene = scene_with_toplevel_and_subsurface(1, 1, 2);
+        let mut worker = WorkerState {
+            scene,
+            streams: HashMap::new(),
+            input: InputState::default(),
+        };
+        let toplevel = SurfaceKey {
+            client_id: 1,
+            surface_id: 1,
+        };
+        let child = SurfaceKey {
+            client_id: 1,
+            surface_id: 2,
+        };
+
+        handle_scene_events(
+            "s1",
+            &media,
+            &mut worker,
+            vec![SceneEvent::SurfaceCommitted(child)],
+        );
+
+        assert!(
+            worker.streams.contains_key(&toplevel),
+            "a subsurface commit must re-encode its toplevel ancestor"
+        );
+        assert!(
+            !worker.streams.contains_key(&child),
+            "a subsurface has no stream of its own"
+        );
+        assert_eq!(worker.streams.len(), 1);
+        let stream = worker.streams[&toplevel].id;
+        for expected in [MediaKind::StreamConfig, MediaKind::Video] {
+            let packet = recv_packet(&client).await;
+            assert_eq!(packet.header.stream_id, stream);
+            assert_eq!(packet.header.kind, expected);
+        }
+
+        let sequence = worker.streams[&toplevel].sequence;
+        handle_scene_events(
+            "s1",
+            &media,
+            &mut worker,
+            vec![SceneEvent::SurfaceCommitted(child)],
+        );
+        assert_eq!(worker.streams[&toplevel].id, stream);
+        assert!(
+            worker.streams[&toplevel].sequence > sequence,
+            "each subsurface commit publishes another frame on the same stream"
+        );
+        assert_eq!(recv_packet(&client).await.header.stream_id, stream);
+    }
+
     #[tokio::test]
     async fn destroy_and_disconnect_end_only_the_affected_stream() {
         if !ffmpeg_available() {
@@ -714,7 +904,10 @@ mod tests {
             "s1",
             &media,
             &mut worker,
-            vec![SceneEvent::SurfaceCommitted(key_a)],
+            vec![
+                SceneEvent::SurfaceCommitted(key_a),
+                SceneEvent::SurfaceCommitted(key_b),
+            ],
         );
         assert_eq!(worker.streams.len(), 2);
         for _ in 0..4 {

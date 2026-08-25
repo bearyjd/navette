@@ -185,6 +185,48 @@ impl Scene {
             .collect()
     }
 
+    /// Resolves `key` to the toplevel whose composited frame it contributes
+    /// to: `key` itself when it is already a toplevel, otherwise its nearest
+    /// toplevel ancestor, since [`Scene::compose_toplevel`] draws subsurface
+    /// and popup children into their toplevel's frame.
+    ///
+    /// Returns `None` when no toplevel reaches the surface -- a cursor
+    /// surface, a surface belonging to no window, or a child that has
+    /// committed before its parent listed it -- and when the hierarchy
+    /// contains a cycle.
+    pub fn toplevel_ancestor(&self, key: SurfaceKey) -> Option<SurfaceKey> {
+        let mut current = key;
+        let mut visited = BTreeSet::new();
+        while visited.insert(current) {
+            let node = self.surfaces.get(&current)?;
+            if matches!(node.role, SurfaceRole::Toplevel { .. }) {
+                return Some(current);
+            }
+            current = self.parent_of(current, node)?;
+        }
+        None
+    }
+
+    /// The surface `key` composites into. A popup names its parent in its own
+    /// role; every other child is found by the parent that lists it, because
+    /// a subsurface's committed state does not survive as a back-pointer.
+    fn parent_of(&self, key: SurfaceKey, node: &SurfaceNode) -> Option<SurfaceKey> {
+        if let SurfaceRole::Popup { parent, .. } = node.role
+            && self.surfaces.contains_key(&parent)
+        {
+            return Some(parent);
+        }
+        self.surfaces
+            .iter()
+            .find_map(|(candidate, candidate_node)| {
+                candidate_node
+                    .children
+                    .iter()
+                    .any(|child| child.key == key)
+                    .then_some(*candidate)
+            })
+    }
+
     pub fn damage(&self, key: SurfaceKey) -> Option<&[Rectangle<i32>]> {
         self.surfaces.get(&key).map(|node| node.damage.as_slice())
     }
@@ -695,6 +737,136 @@ mod tests {
             .unwrap();
         assert_eq!(&frame.pixels[..4], &[10, 10, 10, 255]);
         assert_eq!(&frame.pixels[4..], &[90, 80, 70, 255]);
+    }
+
+    #[test]
+    fn resolves_children_to_their_toplevel_ancestor() {
+        let mut scene = Scene::default();
+        scene
+            .apply(RecvType::RawBuffer(vec![10, 20, 30, 40, 50, 60, 0, 0]))
+            .unwrap();
+        let mut root = state(1, 1, Some(toplevel()));
+        root.buffer = Some(external_buffer(2, 1, BufferFormat::Xrgb8888));
+        root.z_ordered_children.push(SubsurfacePosition {
+            id: WlSurfaceId(2),
+            position: Point { x: 1, y: 0 },
+        });
+        scene.apply(commit(root)).unwrap();
+
+        scene
+            .apply(RecvType::RawBuffer(vec![110, 120, 130, 128]))
+            .unwrap();
+        let mut child = state(
+            1,
+            2,
+            Some(Role::SubSurface(SubSurfaceState {
+                parent: WlSurfaceId(1),
+                location: Point { x: 1, y: 0 },
+                sync: true,
+            })),
+        );
+        child.buffer = Some(external_buffer(1, 1, BufferFormat::Argb8888));
+        scene.apply(commit(child)).unwrap();
+
+        // A nested subsurface: the walk up is transitive, not one hop.
+        let mut nested_parent = state(
+            1,
+            2,
+            Some(Role::SubSurface(SubSurfaceState {
+                parent: WlSurfaceId(1),
+                location: Point { x: 1, y: 0 },
+                sync: true,
+            })),
+        );
+        nested_parent.z_ordered_children.push(SubsurfacePosition {
+            id: WlSurfaceId(3),
+            position: Point { x: 0, y: 0 },
+        });
+        scene.apply(commit(nested_parent)).unwrap();
+        scene
+            .apply(commit(state(
+                1,
+                3,
+                Some(Role::SubSurface(SubSurfaceState {
+                    parent: WlSurfaceId(2),
+                    location: Point { x: 0, y: 0 },
+                    sync: true,
+                })),
+            )))
+            .unwrap();
+
+        let root_key = SurfaceKey {
+            client_id: 1,
+            surface_id: 1,
+        };
+        assert_eq!(scene.toplevel_ancestor(root_key), Some(root_key));
+        for surface_id in [2, 3] {
+            assert_eq!(
+                scene.toplevel_ancestor(SurfaceKey {
+                    client_id: 1,
+                    surface_id
+                }),
+                Some(root_key),
+                "surface {surface_id} composites into the toplevel"
+            );
+        }
+        // An unknown surface, and a committed surface no toplevel reaches,
+        // resolve to nothing rather than to an arbitrary window.
+        assert_eq!(
+            scene.toplevel_ancestor(SurfaceKey {
+                client_id: 1,
+                surface_id: 99
+            }),
+            None
+        );
+        scene.apply(commit(state(1, 4, None))).unwrap();
+        assert_eq!(
+            scene.toplevel_ancestor(SurfaceKey {
+                client_id: 1,
+                surface_id: 4
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn resolves_a_popup_to_the_toplevel_it_hangs_from() {
+        let mut scene = Scene::default();
+        scene.apply(commit(state(1, 1, Some(toplevel())))).unwrap();
+        scene
+            .apply(commit(state(
+                1,
+                2,
+                Some(Role::XdgPopup(XdgPopupState {
+                    id: XdgPopupId(11),
+                    parent_surface_id: WlSurfaceId(1),
+                    positioner: XdgPositioner {
+                        width: 1,
+                        height: 1,
+                        anchor_rect: Rectangle::new(0, 0, 1, 1),
+                        anchor_edges: 0,
+                        gravity: 0,
+                        constraint_adjustment: 0,
+                        offset: Point { x: 0, y: 0 },
+                        reactive: false,
+                        parent_size: None,
+                        parent_configure: None,
+                    },
+                    grab_requested: false,
+                })),
+            )))
+            .unwrap();
+
+        assert_eq!(
+            scene.toplevel_ancestor(SurfaceKey {
+                client_id: 1,
+                surface_id: 2
+            }),
+            Some(SurfaceKey {
+                client_id: 1,
+                surface_id: 1
+            })
+        );
     }
 
     #[test]
