@@ -28,3 +28,29 @@ jobs:
         run: cargo test --workspace
       - name: Build
         run: cargo build --workspace
+
+  viewer-display:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install Wayland and X11 build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libwayland-dev libxkbcommon-dev \
+            libx11-dev libxrandr-dev libxi-dev libxinerama-dev libxcursor-dev \
+            xvfb
+      - name: Install stable Rust
+        run: |
+          rustup update stable
+          rustup default stable
+      - name: Test (real display, via Xvfb)
+        # The rest of navette-viewer is exercised headlessly against
+        # RecordingWindow in the `rust` job above; this job exists solely
+        # for the ignored native.rs smoke test, which needs an actual
+        # display server to construct a real minifb::Window and drive one
+        # present/poll cycle -- the cheapest guardrail against silently
+        # reintroducing the single-update-per-loop bug that commit f5be106
+        # fixed by reading minifb's source alone, with no way to verify it
+        # in the sandbox that wrote the fix.
+        run: "xvfb-run -a cargo test -p navette-viewer -- --ignored native::"
