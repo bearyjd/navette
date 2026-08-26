@@ -109,6 +109,12 @@ struct Child {
 struct SurfaceNode {
     role: SurfaceRole,
     children: Vec<Child>,
+    /// The surface this one currently composites into, denormalized from
+    /// whichever surface's `children` last listed this key -- see
+    /// `Scene::parent_of` for why a subsurface can't just carry this in its
+    /// own committed state and why this needs active maintenance instead of
+    /// being read once.
+    parent: Option<SurfaceKey>,
     image: Option<Image>,
     damage: Vec<Rectangle<i32>>,
 }
@@ -123,6 +129,12 @@ pub struct ToplevelInfo {
 #[derive(Debug, Default)]
 pub struct Scene {
     surfaces: BTreeMap<SurfaceKey, SurfaceNode>,
+    /// Parent assignments a commit named for a child that hadn't committed
+    /// yet -- a parent can legitimately list a child surface before that
+    /// surface's own first commit arrives. Consumed the moment that child
+    /// does commit; see `sync_child_back_pointers` and the `Commit` arm of
+    /// `apply_surface`.
+    pending_parents: BTreeMap<SurfaceKey, SurfaceKey>,
     pending_raw_buffer: Option<Vec<u8>>,
     cursor: Option<CursorImage>,
     capabilities: Option<Capabilities>,
@@ -202,29 +214,27 @@ impl Scene {
             if matches!(node.role, SurfaceRole::Toplevel { .. }) {
                 return Some(current);
             }
-            current = self.parent_of(current, node)?;
+            current = self.parent_of(node)?;
         }
         None
     }
 
     /// The surface `key` composites into. A popup names its parent in its own
-    /// role; every other child is found by the parent that lists it, because
-    /// a subsurface's committed state does not survive as a back-pointer.
-    fn parent_of(&self, key: SurfaceKey, node: &SurfaceNode) -> Option<SurfaceKey> {
+    /// role; every other child relies on `SurfaceNode::parent`, kept current
+    /// by `sync_child_back_pointers` on every commit of a `children` list
+    /// (a subsurface's own committed state does not carry this).
+    fn parent_of(&self, node: &SurfaceNode) -> Option<SurfaceKey> {
         if let SurfaceRole::Popup { parent, .. } = node.role
             && self.surfaces.contains_key(&parent)
         {
             return Some(parent);
         }
-        self.surfaces
-            .iter()
-            .find_map(|(candidate, candidate_node)| {
-                candidate_node
-                    .children
-                    .iter()
-                    .any(|child| child.key == key)
-                    .then_some(*candidate)
-            })
+        // Guards against a dangling pointer into a since-destroyed parent --
+        // `remove_surface` never has to reach into a destroyed node's former
+        // children to clear this, because a stale value simply stops
+        // resolving here.
+        node.parent
+            .filter(|parent| self.surfaces.contains_key(parent))
     }
 
     pub fn damage(&self, key: SurfaceKey) -> Option<&[Rectangle<i32>]> {
@@ -268,6 +278,8 @@ impl Scene {
             Request::Popup(request) => self.apply_popup(request),
             Request::ClientDisconnected(client) => {
                 self.surfaces.retain(|key, _| key.client_id != client.0);
+                self.pending_parents
+                    .retain(|key, _| key.client_id != client.0);
                 Ok(vec![SceneEvent::ClientDisconnected(client.0)])
             }
             Request::CursorImage(cursor) => {
@@ -290,23 +302,39 @@ impl Scene {
                 if key != SurfaceKey::new(state.client, state.id) {
                     return Err(SceneError::IdentityMismatch);
                 }
-                let previous_image = self.surfaces.get(&key).and_then(|node| node.image.clone());
+                let previous = self.surfaces.get(&key);
+                let previous_image = previous.and_then(|node| node.image.clone());
+                let previous_parent = previous.and_then(|node| node.parent);
+                let previous_children: Vec<SurfaceKey> = previous
+                    .map(|node| node.children.iter().map(|child| child.key).collect())
+                    .unwrap_or_default();
                 let image = self.decode_assignment(state.buffer.as_ref(), previous_image)?;
+                let children: Vec<Child> = state
+                    .z_ordered_children
+                    .iter()
+                    .map(|child| Child {
+                        key: SurfaceKey::new(state.client, child.id),
+                        x: child.position.x,
+                        y: child.position.y,
+                    })
+                    .collect();
                 let node = SurfaceNode {
                     role: role_from_state(&state),
-                    children: state
-                        .z_ordered_children
-                        .iter()
-                        .map(|child| Child {
-                            key: SurfaceKey::new(state.client, child.id),
-                            x: child.position.x,
-                            y: child.position.y,
-                        })
-                        .collect(),
+                    // A pending assignment means some parent already listed
+                    // this surface as a child before this, its first commit
+                    // -- that takes priority since `previous_parent` can
+                    // only be `None` in that case. Otherwise this carries
+                    // the parent this surface was last told it has, across
+                    // its own repaints -- nothing here re-derives it, only
+                    // `sync_child_back_pointers` (from the parent's own
+                    // commit) or this pending lookup ever sets it.
+                    parent: self.pending_parents.remove(&key).or(previous_parent),
+                    children: children.clone(),
                     image,
                     damage: state.damage.unwrap_or_default(),
                 };
                 self.surfaces.insert(key, node);
+                self.sync_child_back_pointers(key, &previous_children, &children);
                 Ok(vec![SceneEvent::SurfaceCommitted(key)])
             }
         }
@@ -340,6 +368,10 @@ impl Scene {
             .filter(|ancestor| *ancestor != key);
         self.surfaces.remove(&key);
         self.remove_child_references(key);
+        // A surface can be destroyed before it ever commits, while some
+        // parent's earlier commit still has a pending assignment waiting
+        // for it -- that assignment is now for a key that will never exist.
+        self.pending_parents.remove(&key);
         let mut events = vec![SceneEvent::SurfaceDestroyed(key)];
         if let Some(ancestor) = ancestor {
             events.push(SceneEvent::SurfaceCommitted(ancestor));
@@ -372,6 +404,44 @@ impl Scene {
     fn remove_child_references(&mut self, removed: SurfaceKey) {
         for node in self.surfaces.values_mut() {
             node.children.retain(|child| child.key != removed);
+        }
+    }
+
+    /// Keeps `SurfaceNode::parent` current for the children of `parent`
+    /// after its `children` list changes on commit. `children` is rebuilt
+    /// wholesale on every commit rather than mutated incrementally, so this
+    /// runs on every commit rather than only where a diff is detected --
+    /// cheap, since it's bounded by `parent`'s own child count, not the
+    /// scene's size (the reason this back-pointer exists at all: resolving
+    /// an ancestor no longer means scanning every surface in the scene).
+    fn sync_child_back_pointers(
+        &mut self,
+        parent: SurfaceKey,
+        previous_children: &[SurfaceKey],
+        children: &[Child],
+    ) {
+        let current: BTreeSet<SurfaceKey> = children.iter().map(|child| child.key).collect();
+        for removed in previous_children {
+            if current.contains(removed) {
+                continue;
+            }
+            if let Some(node) = self.surfaces.get_mut(removed)
+                && node.parent == Some(parent)
+            {
+                node.parent = None;
+            }
+            if self.pending_parents.get(removed) == Some(&parent) {
+                self.pending_parents.remove(removed);
+            }
+        }
+        for child in children {
+            if let Some(node) = self.surfaces.get_mut(&child.key) {
+                node.parent = Some(parent);
+            } else {
+                // Not committed yet -- its own first commit will consume
+                // this and stamp `parent` onto the new node then.
+                self.pending_parents.insert(child.key, parent);
+            }
         }
     }
 
@@ -940,6 +1010,152 @@ mod tests {
             }),
             None
         );
+    }
+
+    fn subsurface(parent: u64) -> Role {
+        Role::SubSurface(SubSurfaceState {
+            parent: WlSurfaceId(parent),
+            location: Point { x: 0, y: 0 },
+            sync: true,
+        })
+    }
+
+    /// `SurfaceNode::parent` is written eagerly by whichever surface last
+    /// listed a key as its child, not recomputed on read the way the old
+    /// linear scan was -- so removing a child from its only parent's list
+    /// must clear the back-pointer, not leave it resolving to a parent that
+    /// no longer claims it. (A reparent-and-immediately-relist case would
+    /// self-heal even without this, since the add side always overwrites;
+    /// orphaning with no new owner is the case that actually needs the
+    /// clear.)
+    #[test]
+    fn removing_a_child_from_its_only_parents_list_orphans_it() {
+        let mut scene = Scene::default();
+        let a = SurfaceKey {
+            client_id: 1,
+            surface_id: 1,
+        };
+        let child = SurfaceKey {
+            client_id: 1,
+            surface_id: 2,
+        };
+
+        let mut root_a = state(1, 1, Some(toplevel()));
+        root_a.z_ordered_children.push(SubsurfacePosition {
+            id: WlSurfaceId(2),
+            position: Point { x: 0, y: 0 },
+        });
+        scene.apply(commit(root_a)).unwrap();
+        scene
+            .apply(commit(state(1, 2, Some(subsurface(1)))))
+            .unwrap();
+        assert_eq!(scene.toplevel_ancestor(child), Some(a));
+
+        // A recommits without the child in its list at all.
+        scene.apply(commit(state(1, 1, Some(toplevel())))).unwrap();
+
+        assert_eq!(
+            scene.toplevel_ancestor(child),
+            None,
+            "an unlisted child must not keep resolving to its former parent"
+        );
+    }
+
+    /// The "add" side of `sync_child_back_pointers` overwrites unconditionally,
+    /// so a child moving to a new parent resolves to the new one even with
+    /// stale prior state present.
+    #[test]
+    fn reparenting_a_child_updates_its_toplevel_ancestor() {
+        let mut scene = Scene::default();
+        let b = SurfaceKey {
+            client_id: 1,
+            surface_id: 10,
+        };
+        let child = SurfaceKey {
+            client_id: 1,
+            surface_id: 2,
+        };
+
+        let mut root_a = state(1, 1, Some(toplevel()));
+        root_a.z_ordered_children.push(SubsurfacePosition {
+            id: WlSurfaceId(2),
+            position: Point { x: 0, y: 0 },
+        });
+        scene.apply(commit(root_a)).unwrap();
+        scene
+            .apply(commit(state(1, 2, Some(subsurface(1)))))
+            .unwrap();
+
+        let mut root_b = state(1, 10, Some(toplevel()));
+        root_b.z_ordered_children.push(SubsurfacePosition {
+            id: WlSurfaceId(2),
+            position: Point { x: 0, y: 0 },
+        });
+        scene.apply(commit(root_b)).unwrap();
+
+        assert_eq!(
+            scene.toplevel_ancestor(child),
+            Some(b),
+            "the child must resolve to its new parent"
+        );
+    }
+
+    /// A surface's own repaint doesn't re-list it anywhere -- the parent
+    /// back-pointer has to survive that surface's later commits on its own,
+    /// not just at the moment it was first assigned.
+    #[test]
+    fn a_childs_own_repaint_preserves_its_parent_without_relisting() {
+        let mut scene = Scene::default();
+        let root = SurfaceKey {
+            client_id: 1,
+            surface_id: 1,
+        };
+        let child = SurfaceKey {
+            client_id: 1,
+            surface_id: 2,
+        };
+
+        let mut root_state = state(1, 1, Some(toplevel()));
+        root_state.z_ordered_children.push(SubsurfacePosition {
+            id: WlSurfaceId(2),
+            position: Point { x: 0, y: 0 },
+        });
+        scene.apply(commit(root_state)).unwrap();
+        scene
+            .apply(commit(state(1, 2, Some(subsurface(1)))))
+            .unwrap();
+        assert_eq!(scene.toplevel_ancestor(child), Some(root));
+
+        // The child repaints again; the root never recommits at all.
+        scene
+            .apply(commit(state(1, 2, Some(subsurface(1)))))
+            .unwrap();
+        assert_eq!(scene.toplevel_ancestor(child), Some(root));
+    }
+
+    /// A parent can list a child that then gets destroyed before ever
+    /// committing -- the deferred assignment recorded for it must not
+    /// linger forever once that key can never resolve it.
+    #[test]
+    fn a_child_destroyed_before_its_first_commit_drops_its_pending_assignment() {
+        let mut scene = Scene::default();
+        let mut root = state(1, 1, Some(toplevel()));
+        root.z_ordered_children.push(SubsurfacePosition {
+            id: WlSurfaceId(2),
+            position: Point { x: 0, y: 0 },
+        });
+        scene.apply(commit(root)).unwrap();
+        assert!(!scene.pending_parents.is_empty());
+
+        scene
+            .apply(RecvType::Object(Request::Surface(SurfaceRequest {
+                client: ClientId(1),
+                surface: WlSurfaceId(2),
+                payload: SurfaceRequestPayload::Destroyed,
+            })))
+            .unwrap();
+
+        assert!(scene.pending_parents.is_empty());
     }
 
     #[test]
