@@ -608,9 +608,19 @@ mod tests {
         let dead_socket = dir.path().join("no-such-socket");
         let dead_session = session_fixture("dead", dead_socket.to_string_lossy().into_owned());
         manager.start(&dead_session).unwrap();
-        // `register_session` runs synchronously inside `start`, before the
-        // worker thread spawns, so the session is registered immediately.
-        assert!(media.attach(&dead_session.name).is_ok());
+        // We deliberately don't assert `media.attach` succeeds here.
+        // `register_session` does run synchronously inside `start`, before the
+        // worker thread spawns, so the session *is* registered by the time
+        // `start` returns -- but connecting to a socket nobody is listening on
+        // fails immediately, so the spawned worker can reach its own
+        // `unregister_session` call just as fast, racing this thread's next
+        // statement. That race is real, not hypothetical: it passed
+        // consistently on the developer machine this was written on but
+        // failed on CI's runner. The test's actual claim -- that a dead
+        // worker's session is restartable -- doesn't need this intermediate
+        // assertion; the wait loop and the post-restart assertion below are
+        // enough, and both are synchronized on the same predicate `start`
+        // itself uses.
 
         // Connecting to a socket nobody is listening on fails immediately, so
         // the worker thread exits almost at once. `start()`'s reap decision
