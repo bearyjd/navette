@@ -19,6 +19,7 @@ use navette_protocol::{
 use serde_json::{Value, json};
 
 use crate::app_index::AppIndex;
+use crate::bridge::BridgeManager;
 use crate::media::{MediaHub, MediaHubError};
 use crate::registry::{RegistryError, validate_session_name};
 use crate::supervisor::{ProcessRunner, Supervisor, SupervisorError};
@@ -30,6 +31,7 @@ pub struct ApiState<R: ProcessRunner> {
     pub apps: Arc<AppIndex>,
     pub supervisor: Arc<Supervisor<R>>,
     pub media: MediaHub,
+    pub bridges: BridgeManager,
     clipboard: Arc<Mutex<Option<String>>>,
 }
 
@@ -39,6 +41,7 @@ impl<R: ProcessRunner> Clone for ApiState<R> {
             apps: Arc::clone(&self.apps),
             supervisor: Arc::clone(&self.supervisor),
             media: self.media.clone(),
+            bridges: self.bridges.clone(),
             clipboard: Arc::clone(&self.clipboard),
         }
     }
@@ -46,11 +49,29 @@ impl<R: ProcessRunner> Clone for ApiState<R> {
 
 impl<R: ProcessRunner> ApiState<R> {
     pub fn new(apps: Arc<AppIndex>, supervisor: Arc<Supervisor<R>>) -> Self {
+        let media = MediaHub::default();
         Self {
             apps,
             supervisor,
-            media: MediaHub::default(),
+            bridges: BridgeManager::new(media.clone()),
+            media,
             clipboard: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn start_existing_bridges(&self) {
+        let sessions = self
+            .supervisor
+            .registry()
+            .lock()
+            .map(|registry| registry.list())
+            .unwrap_or_default();
+        for session in sessions {
+            if matches!(session.status, navette_protocol::SessionStatus::Running)
+                && let Err(error) = self.bridges.start(&session)
+            {
+                tracing::error!(session = %session.name, %error, "failed to resume session bridge");
+            }
         }
     }
 }
@@ -198,7 +219,6 @@ fn media_hub_error(error: MediaHubError) -> (&'static str, String) {
         MediaHubError::UnknownSession(_)
         | MediaHubError::InvalidPacket(_)
         | MediaHubError::MissingConfig
-        | MediaHubError::WrongStream { .. }
         | MediaHubError::NonMonotonicSequence
         | MediaHubError::InvalidDimensions
         | MediaHubError::Unavailable => "unavailable",
@@ -287,19 +307,29 @@ pub async fn dispatch<R: ProcessRunner>(state: &ApiState<R>, request: Request) -
                     format!("application not found: {app_id}"),
                 );
             };
+            let result = state.supervisor.start(app, name.as_deref()).await;
+            match result {
+                Ok(session) => match state.bridges.start(&session) {
+                    Ok(()) => Ok(ResponseResult::Session { session }),
+                    Err(error) => {
+                        let _ = state.supervisor.kill(&session.name).await;
+                        Err(ApiFailure::internal(format!(
+                            "failed to start media bridge: {error}"
+                        )))
+                    }
+                },
+                Err(error) => Err(ApiFailure::from(error)),
+            }
+        }
+        RequestCommand::Kill { session } => {
+            state.bridges.stop(&session);
             state
                 .supervisor
-                .start(app, name.as_deref())
+                .kill(&session)
                 .await
-                .map(|session| ResponseResult::Session { session })
+                .map(|_| ResponseResult::Ack)
                 .map_err(ApiFailure::from)
         }
-        RequestCommand::Kill { session } => state
-            .supervisor
-            .kill(&session)
-            .await
-            .map(|_| ResponseResult::Ack)
-            .map_err(ApiFailure::from),
         RequestCommand::Attach { session } => {
             if let Err(error) = validate_session_name(&session) {
                 Err(ApiFailure::from(error))
@@ -706,7 +736,13 @@ mod tests {
             .send(ClientMessage::Text(r#"{"type":"request_keyframe"}"#.into()))
             .await
             .unwrap();
-        assert_eq!(input.recv().await, Some(MediaInput::RequestKeyframe));
+        assert_eq!(
+            input.recv().await,
+            Some(crate::media::MediaCommand::Input {
+                attachment_id: 1,
+                input: MediaInput::RequestKeyframe
+            })
+        );
         server.abort();
     }
 

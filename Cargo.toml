@@ -5,6 +5,7 @@ members = [
     "crates/navette-bridge",
     "crates/navetted",
     "crates/navette-cli",
+    "crates/navette-viewer",
 ]
 
 [workspace.package]

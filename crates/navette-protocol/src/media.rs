@@ -8,6 +8,11 @@ pub const MEDIA_VERSION: u16 = 1;
 pub const MEDIA_HEADER_LEN: usize = 44;
 pub const MAX_MEDIA_PAYLOAD: usize = 16 * 1024 * 1024;
 pub const MAX_INPUT_MESSAGE: usize = 16 * 1024;
+pub const STREAM_CONFIG_VERSION: u8 = 1;
+pub const STREAM_CONFIG_PREFIX_LEN: usize = 21;
+/// Number of keyboard layouts a client may index into, matching the ceiling
+/// common desktop layout switchers impose. Valid indices are `0..MAX_LAYOUTS`.
+pub const MAX_LAYOUTS: u32 = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -118,6 +123,53 @@ pub struct MediaPacket {
     pub payload: Vec<u8>,
 }
 
+/// Bounded codec bootstrap and scene identity carried by `stream_config`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamConfig {
+    pub client_id: u64,
+    pub surface_id: u64,
+    /// Annex-B SPS/PPS bytes for the H.264 stream.
+    pub codec_config: Vec<u8>,
+}
+
+impl StreamConfig {
+    pub fn encode(&self) -> Result<Vec<u8>, MediaDecodeError> {
+        if self.codec_config.len() > MAX_MEDIA_PAYLOAD - STREAM_CONFIG_PREFIX_LEN
+            || self.codec_config.len() > u32::MAX as usize
+        {
+            return Err(MediaDecodeError::PayloadTooLarge(u32::MAX));
+        }
+        let mut output = Vec::with_capacity(STREAM_CONFIG_PREFIX_LEN + self.codec_config.len());
+        output.push(STREAM_CONFIG_VERSION);
+        output.extend_from_slice(&self.client_id.to_be_bytes());
+        output.extend_from_slice(&self.surface_id.to_be_bytes());
+        output.extend_from_slice(&(self.codec_config.len() as u32).to_be_bytes());
+        output.extend_from_slice(&self.codec_config);
+        Ok(output)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, MediaDecodeError> {
+        if bytes.len() < STREAM_CONFIG_PREFIX_LEN {
+            return Err(MediaDecodeError::TruncatedStreamConfig);
+        }
+        if bytes[0] != STREAM_CONFIG_VERSION {
+            return Err(MediaDecodeError::UnsupportedStreamConfigVersion(bytes[0]));
+        }
+        let codec_len = u32::from_be_bytes(bytes[17..21].try_into().expect("fixed slice"));
+        let expected = STREAM_CONFIG_PREFIX_LEN
+            .checked_add(codec_len as usize)
+            .ok_or(MediaDecodeError::LengthMismatch)?;
+        if bytes.len() != expected || expected > MAX_MEDIA_PAYLOAD {
+            return Err(MediaDecodeError::LengthMismatch);
+        }
+        Ok(Self {
+            client_id: u64::from_be_bytes(bytes[1..9].try_into().expect("fixed slice")),
+            surface_id: u64::from_be_bytes(bytes[9..17].try_into().expect("fixed slice")),
+            codec_config: bytes[STREAM_CONFIG_PREFIX_LEN..].to_vec(),
+        })
+    }
+}
+
 impl MediaPacket {
     pub fn new(mut header: MediaHeader, payload: Vec<u8>) -> Result<Self, MediaDecodeError> {
         if payload.len() > MAX_MEDIA_PAYLOAD || payload.len() > u32::MAX as usize {
@@ -173,6 +225,8 @@ pub enum MediaDecodeError {
     UnknownFlags(u8),
     PayloadTooLarge(u32),
     LengthMismatch,
+    TruncatedStreamConfig,
+    UnsupportedStreamConfigVersion(u8),
 }
 
 impl fmt::Display for MediaDecodeError {
@@ -205,14 +259,21 @@ pub enum MediaInput {
         vertical: f64,
     },
     KeyboardKey {
+        client_id: u64,
+        surface_id: u64,
         keycode: u32,
         pressed: bool,
     },
     KeyboardModifiers {
-        depressed: u32,
-        latched: u32,
-        locked: u32,
-        group: u32,
+        client_id: u64,
+        surface_id: u64,
+        ctrl: bool,
+        alt: bool,
+        shift: bool,
+        caps_lock: bool,
+        logo: bool,
+        num_lock: bool,
+        layout_index: u32,
     },
     ViewportResize {
         width: u32,
@@ -240,6 +301,9 @@ impl MediaInput {
             Self::KeyboardKey { keycode, .. } if *keycode > 767 => {
                 Err(InputValidationError::KeyOutOfRange(*keycode))
             }
+            Self::KeyboardModifiers { layout_index, .. } if *layout_index >= MAX_LAYOUTS => {
+                Err(InputValidationError::LayoutOutOfRange(*layout_index))
+            }
             Self::ViewportResize { width, height }
                 if !(320..=3840).contains(width) || !(240..=2160).contains(height) =>
             {
@@ -255,6 +319,7 @@ pub enum InputValidationError {
     NonFiniteCoordinate,
     ButtonOutOfRange(u32),
     KeyOutOfRange(u32),
+    LayoutOutOfRange(u32),
     ViewportOutOfRange,
 }
 
@@ -298,6 +363,23 @@ mod tests {
         assert_eq!(encoded[6], MediaKind::Video as u8);
         assert_eq!(encoded[7], 3);
         assert_eq!(MediaPacket::decode(&encoded).unwrap(), packet);
+    }
+
+    #[test]
+    fn stream_config_round_trips_with_surface_identity() {
+        let config = StreamConfig {
+            client_id: 11,
+            surface_id: 12,
+            codec_config: vec![0, 0, 0, 1, 0x67],
+        };
+        assert_eq!(
+            StreamConfig::decode(&config.encode().unwrap()).unwrap(),
+            config
+        );
+        assert_eq!(
+            StreamConfig::decode(&[]),
+            Err(MediaDecodeError::TruncatedStreamConfig)
+        );
     }
 
     #[test]
@@ -345,6 +427,31 @@ mod tests {
             }
             .validate(),
             Err(InputValidationError::ViewportOutOfRange)
+        );
+    }
+
+    #[test]
+    fn input_validation_bounds_the_keyboard_layout_index() {
+        let modifiers = |layout_index| MediaInput::KeyboardModifiers {
+            client_id: 1,
+            surface_id: 2,
+            ctrl: false,
+            alt: false,
+            shift: false,
+            caps_lock: false,
+            logo: false,
+            num_lock: false,
+            layout_index,
+        };
+        assert_eq!(modifiers(0).validate(), Ok(()));
+        assert_eq!(modifiers(MAX_LAYOUTS - 1).validate(), Ok(()));
+        assert_eq!(
+            modifiers(MAX_LAYOUTS).validate(),
+            Err(InputValidationError::LayoutOutOfRange(MAX_LAYOUTS))
+        );
+        assert_eq!(
+            modifiers(u32::MAX).validate(),
+            Err(InputValidationError::LayoutOutOfRange(u32::MAX))
         );
     }
 }

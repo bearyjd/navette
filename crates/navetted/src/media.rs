@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -23,11 +23,26 @@ struct HubState {
 
 struct SessionMedia {
     clients: HashMap<u64, Arc<ClientQueue>>,
-    input: mpsc::Sender<MediaInput>,
+    input: mpsc::Sender<MediaCommand>,
+    streams: HashMap<u64, StreamBootstrap>,
+}
+
+#[derive(Default)]
+struct StreamBootstrap {
     config: Option<Arc<MediaPacket>>,
     keyframe: Option<Arc<MediaPacket>>,
-    stream_id: Option<u64>,
     last_sequence: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum MediaCommand {
+    Input {
+        attachment_id: u64,
+        input: MediaInput,
+    },
+    Disconnected {
+        attachment_id: u64,
+    },
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -52,7 +67,7 @@ impl MediaHub {
         }
     }
 
-    pub fn register_session(&self, session: impl Into<String>) -> mpsc::Receiver<MediaInput> {
+    pub fn register_session(&self, session: impl Into<String>) -> mpsc::Receiver<MediaCommand> {
         let (input, receiver) = mpsc::channel(INPUT_QUEUE_CAPACITY);
         let mut state = self.inner.lock().expect("media hub lock poisoned");
         if let Some(previous) = state.sessions.insert(
@@ -60,10 +75,7 @@ impl MediaHub {
             SessionMedia {
                 clients: HashMap::new(),
                 input,
-                config: None,
-                keyframe: None,
-                stream_id: None,
-                last_sequence: None,
+                streams: HashMap::new(),
             },
         ) {
             for queue in previous.clients.values() {
@@ -95,11 +107,16 @@ impl MediaHub {
             .sessions
             .get_mut(session)
             .ok_or_else(|| MediaHubError::UnknownSession(session.to_string()))?;
-        if let Some(config) = session_state.config.clone() {
-            queue.push(config);
-        }
-        if let Some(keyframe) = session_state.keyframe.clone() {
-            queue.push(keyframe);
+        let mut stream_ids = session_state.streams.keys().copied().collect::<Vec<_>>();
+        stream_ids.sort_unstable();
+        for stream_id in stream_ids {
+            let stream = &session_state.streams[&stream_id];
+            if let Some(config) = stream.config.clone() {
+                queue.push(config);
+            }
+            if let Some(keyframe) = stream.keyframe.clone() {
+                queue.push(keyframe);
+            }
         }
         session_state.clients.insert(client_id, Arc::clone(&queue));
         Ok(MediaAttachment {
@@ -129,35 +146,27 @@ impl MediaHub {
         {
             return Err(MediaHubError::InvalidDimensions);
         }
-        if packet.header.kind != MediaKind::StreamConfig {
-            let stream_id = session_state
-                .stream_id
-                .ok_or(MediaHubError::MissingConfig)?;
-            if packet.header.stream_id != stream_id {
-                return Err(MediaHubError::WrongStream {
-                    expected: stream_id,
-                    actual: packet.header.stream_id,
-                });
-            }
+        let stream = session_state
+            .streams
+            .entry(packet.header.stream_id)
+            .or_default();
+        if packet.header.kind != MediaKind::StreamConfig && stream.config.is_none() {
+            return Err(MediaHubError::MissingConfig);
         }
-        let starts_new_stream = packet.header.kind == MediaKind::StreamConfig
-            && session_state.stream_id != Some(packet.header.stream_id);
-        if !starts_new_stream
-            && session_state
-                .last_sequence
-                .is_some_and(|sequence| packet.header.sequence <= sequence)
+        if stream
+            .last_sequence
+            .is_some_and(|sequence| packet.header.sequence <= sequence)
         {
             return Err(MediaHubError::NonMonotonicSequence);
         }
-        session_state.stream_id = Some(packet.header.stream_id);
-        session_state.last_sequence = Some(packet.header.sequence);
+        stream.last_sequence = Some(packet.header.sequence);
         match packet.header.kind {
             MediaKind::StreamConfig => {
-                session_state.config = Some(Arc::clone(&packet));
-                session_state.keyframe = None;
+                stream.config = Some(Arc::clone(&packet));
+                stream.keyframe = None;
             }
             MediaKind::Video if packet.header.flags.keyframe() => {
-                session_state.keyframe = Some(Arc::clone(&packet));
+                stream.keyframe = Some(Arc::clone(&packet));
             }
             _ => {}
         }
@@ -172,6 +181,15 @@ impl MediaHub {
                 QueuePush::Dropped { count } => stats.dropped += count,
                 QueuePush::Closed => {}
             }
+        }
+        // An ended stream must stop being bootstrapped: `attach` replays every
+        // entry in `streams`, so keeping a dead one there would hand each new
+        // client a `StreamConfig` for a stream no packet will ever follow --
+        // and the viewer eagerly spawns a decoder per replayed config. The
+        // removal happens only after the fan-out above so currently attached
+        // clients still receive the `StreamEnd` itself and can tear down.
+        if packet.header.kind == MediaKind::StreamEnd {
+            session_state.streams.remove(&packet.header.stream_id);
         }
         Ok(stats)
     }
@@ -205,10 +223,16 @@ impl MediaAttachment {
             .sessions
             .get(&self.session)
             .ok_or_else(|| MediaHubError::UnknownSession(self.session.clone()))?;
-        session.input.try_send(input).map_err(|error| match error {
-            mpsc::error::TrySendError::Full(_) => MediaHubError::InputBackpressure,
-            mpsc::error::TrySendError::Closed(_) => MediaHubError::Unavailable,
-        })
+        session
+            .input
+            .try_send(MediaCommand::Input {
+                attachment_id: self.client_id,
+                input,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => MediaHubError::InputBackpressure,
+                mpsc::error::TrySendError::Closed(_) => MediaHubError::Unavailable,
+            })
     }
 }
 
@@ -223,6 +247,9 @@ impl Drop for MediaAttachment {
         };
         if let Some(session) = state.sessions.get_mut(&self.session) {
             session.clients.remove(&self.client_id);
+            let _ = session.input.try_send(MediaCommand::Disconnected {
+                attachment_id: self.client_id,
+            });
         }
     }
 }
@@ -236,7 +263,7 @@ struct ClientQueue {
 #[derive(Default)]
 struct ClientQueueState {
     packets: VecDeque<Arc<MediaPacket>>,
-    needs_keyframe: bool,
+    needs_keyframe: HashSet<u64>,
     closed: bool,
 }
 
@@ -262,30 +289,37 @@ impl ClientQueue {
         }
         let is_video = packet.header.kind == MediaKind::Video;
         let is_keyframe = is_video && packet.header.flags.keyframe();
-        if is_video && state.needs_keyframe && !is_keyframe {
+        if is_video && state.needs_keyframe.contains(&packet.header.stream_id) && !is_keyframe {
             return QueuePush::Dropped { count: 1 };
         }
         let mut evicted = 0;
         if state.packets.len() >= self.capacity {
             let previous_len = state.packets.len();
-            let config = state
-                .packets
-                .iter()
-                .rev()
-                .find(|item| item.header.kind == MediaKind::StreamConfig)
-                .cloned();
+            let mut configs = HashMap::new();
+            let mut video_streams = HashSet::new();
+            for item in state.packets.iter().rev() {
+                if item.header.kind == MediaKind::StreamConfig {
+                    configs
+                        .entry(item.header.stream_id)
+                        .or_insert_with(|| Arc::clone(item));
+                }
+                if item.header.kind == MediaKind::Video {
+                    video_streams.insert(item.header.stream_id);
+                }
+            }
+            state.needs_keyframe.extend(video_streams);
             state.packets.clear();
-            if let Some(config) = config {
+            for config in configs.into_values().take(self.capacity.saturating_sub(1)) {
                 state.packets.push_back(config);
             }
             evicted = previous_len - state.packets.len();
-            state.needs_keyframe = true;
+            state.needs_keyframe.insert(packet.header.stream_id);
             if is_video && !is_keyframe {
                 return QueuePush::Dropped { count: evicted + 1 };
             }
         }
         if is_keyframe {
-            state.needs_keyframe = false;
+            state.needs_keyframe.remove(&packet.header.stream_id);
         }
         state.packets.push_back(packet);
         drop(state);
@@ -329,8 +363,6 @@ pub enum MediaHubError {
     InputBackpressure,
     #[error("stream configuration has not been published")]
     MissingConfig,
-    #[error("packet stream {actual} does not match active stream {expected}")]
-    WrongStream { expected: u64, actual: u64 },
     #[error("media sequence must increase monotonically")]
     NonMonotonicSequence,
     #[error("coded dimensions are out of range")]
@@ -346,11 +378,20 @@ mod tests {
     use super::*;
 
     fn packet(kind: MediaKind, sequence: u64, keyframe: bool) -> MediaPacket {
+        stream_packet(1, kind, sequence, keyframe)
+    }
+
+    fn stream_packet(
+        stream_id: u64,
+        kind: MediaKind,
+        sequence: u64,
+        keyframe: bool,
+    ) -> MediaPacket {
         MediaPacket::new(
             MediaHeader {
                 kind,
                 flags: MediaFlags::new(keyframe, false),
-                stream_id: 1,
+                stream_id,
                 sequence,
                 timestamp_us: sequence,
                 payload_len: 0,
@@ -437,6 +478,72 @@ mod tests {
         assert_eq!(client.recv().await.unwrap().header.sequence, 5);
     }
 
+    /// A stream that has ended must disappear from the bootstrap replay, or
+    /// every future attachment is handed a `StreamConfig` for a stream no
+    /// packet will ever follow -- which costs the viewer an idle decoder
+    /// subprocess per dead stream. The `StreamEnd` packet itself must still
+    /// reach the clients attached at the time so they can tear down.
+    #[tokio::test]
+    async fn stream_end_stops_the_bootstrap_replay_but_still_reaches_attached_clients() {
+        let hub = MediaHub::default();
+        let _input = hub.register_session("one");
+        let attached = hub.attach("one").unwrap();
+
+        hub.publish("one", stream_packet(1, MediaKind::StreamConfig, 1, false))
+            .unwrap();
+        hub.publish("one", stream_packet(1, MediaKind::Video, 2, true))
+            .unwrap();
+        // A second stream stays live throughout: only the ended stream may
+        // drop out of the replay.
+        hub.publish("one", stream_packet(2, MediaKind::StreamConfig, 1, false))
+            .unwrap();
+        hub.publish("one", stream_packet(2, MediaKind::Video, 2, true))
+            .unwrap();
+        hub.publish("one", stream_packet(1, MediaKind::StreamEnd, 3, false))
+            .unwrap();
+
+        let received = {
+            let mut received = Vec::new();
+            for _ in 0..5 {
+                let packet = attached.recv().await.unwrap();
+                received.push((packet.header.stream_id, packet.header.kind));
+            }
+            received
+        };
+        assert_eq!(
+            received,
+            vec![
+                (1, MediaKind::StreamConfig),
+                (1, MediaKind::Video),
+                (2, MediaKind::StreamConfig),
+                (2, MediaKind::Video),
+                (1, MediaKind::StreamEnd),
+            ],
+            "an already-attached client must still see the stream's end"
+        );
+
+        // A client attaching afterwards is bootstrapped with the live stream
+        // only.
+        let late = hub.attach("one").unwrap();
+        let config = late.recv().await.unwrap();
+        assert_eq!(
+            (config.header.stream_id, config.header.kind),
+            (2, MediaKind::StreamConfig),
+            "the ended stream must not be replayed to a new client"
+        );
+        let keyframe = late.recv().await.unwrap();
+        assert_eq!(
+            (keyframe.header.stream_id, keyframe.header.kind),
+            (2, MediaKind::Video)
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), late.recv())
+                .await
+                .is_err(),
+            "the replay must end with the live stream's keyframe"
+        );
+    }
+
     #[tokio::test]
     async fn input_is_scoped_and_disconnect_removes_client() {
         let hub = MediaHub::default();
@@ -444,10 +551,20 @@ mod tests {
         let mut two = hub.register_session("two");
         let client = hub.attach("one").unwrap();
         client.submit_input(MediaInput::RequestKeyframe).unwrap();
-        assert_eq!(one.recv().await, Some(MediaInput::RequestKeyframe));
+        assert_eq!(
+            one.recv().await,
+            Some(MediaCommand::Input {
+                attachment_id: 1,
+                input: MediaInput::RequestKeyframe
+            })
+        );
         assert!(two.try_recv().is_err());
         assert_eq!(hub.active_clients("one"), 1);
         drop(client);
+        assert_eq!(
+            one.recv().await,
+            Some(MediaCommand::Disconnected { attachment_id: 1 })
+        );
         assert_eq!(hub.active_clients("one"), 0);
         assert!(matches!(
             hub.attach("missing"),

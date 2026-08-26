@@ -185,8 +185,57 @@ impl Scene {
             .collect()
     }
 
+    /// Resolves `key` to the toplevel whose composited frame it contributes
+    /// to: `key` itself when it is already a toplevel, otherwise its nearest
+    /// toplevel ancestor, since [`Scene::compose_toplevel`] draws subsurface
+    /// and popup children into their toplevel's frame.
+    ///
+    /// Returns `None` when no toplevel reaches the surface -- a cursor
+    /// surface, a surface belonging to no window, or a child that has
+    /// committed before its parent listed it -- and when the hierarchy
+    /// contains a cycle.
+    pub fn toplevel_ancestor(&self, key: SurfaceKey) -> Option<SurfaceKey> {
+        let mut current = key;
+        let mut visited = BTreeSet::new();
+        while visited.insert(current) {
+            let node = self.surfaces.get(&current)?;
+            if matches!(node.role, SurfaceRole::Toplevel { .. }) {
+                return Some(current);
+            }
+            current = self.parent_of(current, node)?;
+        }
+        None
+    }
+
+    /// The surface `key` composites into. A popup names its parent in its own
+    /// role; every other child is found by the parent that lists it, because
+    /// a subsurface's committed state does not survive as a back-pointer.
+    fn parent_of(&self, key: SurfaceKey, node: &SurfaceNode) -> Option<SurfaceKey> {
+        if let SurfaceRole::Popup { parent, .. } = node.role
+            && self.surfaces.contains_key(&parent)
+        {
+            return Some(parent);
+        }
+        self.surfaces
+            .iter()
+            .find_map(|(candidate, candidate_node)| {
+                candidate_node
+                    .children
+                    .iter()
+                    .any(|child| child.key == key)
+                    .then_some(*candidate)
+            })
+    }
+
     pub fn damage(&self, key: SurfaceKey) -> Option<&[Rectangle<i32>]> {
         self.surfaces.get(&key).map(|node| node.damage.as_slice())
+    }
+
+    pub fn surface_dimensions(&self, key: SurfaceKey) -> Option<(u32, u32)> {
+        self.surfaces
+            .get(&key)
+            .and_then(|node| node.image.as_ref())
+            .map(|image| (image.width, image.height))
     }
 
     pub fn compose_toplevel(&self, root: SurfaceKey) -> Result<Frame, SceneError> {
@@ -236,11 +285,7 @@ impl Scene {
     fn apply_surface(&mut self, request: SurfaceRequest) -> Result<Vec<SceneEvent>, SceneError> {
         let key = SurfaceKey::new(request.client, request.surface);
         match request.payload {
-            SurfaceRequestPayload::Destroyed => {
-                self.surfaces.remove(&key);
-                self.remove_child_references(key);
-                Ok(vec![SceneEvent::SurfaceDestroyed(key)])
-            }
+            SurfaceRequestPayload::Destroyed => Ok(self.remove_surface(key)),
             SurfaceRequestPayload::Commit(state) => {
                 if key != SurfaceKey::new(state.client, state.id) {
                     return Err(SceneError::IdentityMismatch);
@@ -270,9 +315,7 @@ impl Scene {
     fn apply_toplevel(&mut self, request: ToplevelRequest) -> Result<Vec<SceneEvent>, SceneError> {
         let key = SurfaceKey::new(request.client, request.surface);
         if matches!(request.payload, ToplevelRequestPayload::Destroyed) {
-            self.surfaces.remove(&key);
-            self.remove_child_references(key);
-            return Ok(vec![SceneEvent::SurfaceDestroyed(key)]);
+            return Ok(self.remove_surface(key));
         }
         Ok(Vec::new())
     }
@@ -280,9 +323,28 @@ impl Scene {
     fn apply_popup(&mut self, request: PopupRequest) -> Result<Vec<SceneEvent>, SceneError> {
         let key = SurfaceKey::new(request.client, request.surface);
         let PopupRequestPayload::Destroyed = request.payload;
+        Ok(self.remove_surface(key))
+    }
+
+    /// Removes `key` from the scene and, if it had a toplevel ancestor other
+    /// than itself, asks the caller to recomposite that ancestor. Destroying
+    /// a popup or subsurface must not leave its blended pixels ghosted into
+    /// the toplevel's last-published frame forever -- before this, only an
+    /// unrelated commit from some other window happened to clear it, because
+    /// every commit used to re-encode every toplevel. The ancestor is
+    /// resolved *before* the node and its child references are removed,
+    /// since resolution needs the still-intact hierarchy.
+    fn remove_surface(&mut self, key: SurfaceKey) -> Vec<SceneEvent> {
+        let ancestor = self
+            .toplevel_ancestor(key)
+            .filter(|ancestor| *ancestor != key);
         self.surfaces.remove(&key);
         self.remove_child_references(key);
-        Ok(vec![SceneEvent::SurfaceDestroyed(key)])
+        let mut events = vec![SceneEvent::SurfaceDestroyed(key)];
+        if let Some(ancestor) = ancestor {
+            events.push(SceneEvent::SurfaceCommitted(ancestor));
+        }
+        events
     }
 
     fn decode_assignment(
@@ -688,6 +750,236 @@ mod tests {
             .unwrap();
         assert_eq!(&frame.pixels[..4], &[10, 10, 10, 255]);
         assert_eq!(&frame.pixels[4..], &[90, 80, 70, 255]);
+    }
+
+    #[test]
+    fn destroying_a_popup_asks_its_toplevel_ancestor_to_recomposite() {
+        let mut scene = Scene::default();
+        scene
+            .apply(RecvType::RawBuffer(vec![10, 20, 10, 20, 10, 20, 255, 255]))
+            .unwrap();
+        let mut root = state(1, 1, Some(toplevel()));
+        root.buffer = Some(external_buffer(2, 1, BufferFormat::Xrgb8888));
+        scene.apply(commit(root)).unwrap();
+
+        scene
+            .apply(RecvType::RawBuffer(vec![90, 80, 70, 255]))
+            .unwrap();
+        let mut popup = state(
+            1,
+            2,
+            Some(Role::XdgPopup(XdgPopupState {
+                id: XdgPopupId(11),
+                parent_surface_id: WlSurfaceId(1),
+                positioner: XdgPositioner {
+                    width: 1,
+                    height: 1,
+                    anchor_rect: Rectangle::new(1, 0, 1, 1),
+                    anchor_edges: 0,
+                    gravity: 0,
+                    constraint_adjustment: 0,
+                    offset: Point { x: 0, y: 0 },
+                    reactive: false,
+                    parent_size: None,
+                    parent_configure: None,
+                },
+                grab_requested: false,
+            })),
+        );
+        popup.buffer = Some(external_buffer(1, 1, BufferFormat::Xrgb8888));
+        scene.apply(commit(popup)).unwrap();
+
+        let root_key = SurfaceKey {
+            client_id: 1,
+            surface_id: 1,
+        };
+        let popup_key = SurfaceKey {
+            client_id: 1,
+            surface_id: 2,
+        };
+
+        // The point of this fix: without it, only SurfaceDestroyed(popup) is
+        // emitted, and nothing tells the bridge to re-encode the toplevel
+        // the popup was blended into -- so its pixels linger in the last
+        // published frame until some unrelated commit happens to clear them.
+        let events = scene
+            .apply(RecvType::Object(Request::Popup(PopupRequest {
+                client: ClientId(1),
+                surface: WlSurfaceId(2),
+                payload: PopupRequestPayload::Destroyed,
+            })))
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                SceneEvent::SurfaceDestroyed(popup_key),
+                SceneEvent::SurfaceCommitted(root_key),
+            ]
+        );
+
+        // And the ancestor really does recomposite clean: the popup's pixels
+        // are gone from the toplevel's frame, not just the event emitted.
+        // (The exact background value depends on raw-buffer unfiltering, not
+        // relevant here -- what matters is that it's no longer the popup's.)
+        let frame = scene.compose_toplevel(root_key).unwrap();
+        assert_eq!(&frame.pixels[..4], &[10, 10, 10, 255]);
+        assert_ne!(&frame.pixels[4..], &[90, 80, 70, 255]);
+    }
+
+    #[test]
+    fn destroying_a_toplevel_does_not_ask_it_to_recomposite_itself() {
+        let mut scene = Scene::default();
+        scene
+            .apply(RecvType::RawBuffer(vec![10, 20, 30, 40]))
+            .unwrap();
+        let mut root = state(1, 1, Some(toplevel()));
+        root.buffer = Some(external_buffer(1, 1, BufferFormat::Xrgb8888));
+        scene.apply(commit(root)).unwrap();
+
+        let events = scene
+            .apply(RecvType::Object(Request::Toplevel(ToplevelRequest {
+                client: ClientId(1),
+                surface: WlSurfaceId(1),
+                payload: ToplevelRequestPayload::Destroyed,
+            })))
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![SceneEvent::SurfaceDestroyed(SurfaceKey {
+                client_id: 1,
+                surface_id: 1,
+            })]
+        );
+    }
+
+    #[test]
+    fn resolves_children_to_their_toplevel_ancestor() {
+        let mut scene = Scene::default();
+        scene
+            .apply(RecvType::RawBuffer(vec![10, 20, 30, 40, 50, 60, 0, 0]))
+            .unwrap();
+        let mut root = state(1, 1, Some(toplevel()));
+        root.buffer = Some(external_buffer(2, 1, BufferFormat::Xrgb8888));
+        root.z_ordered_children.push(SubsurfacePosition {
+            id: WlSurfaceId(2),
+            position: Point { x: 1, y: 0 },
+        });
+        scene.apply(commit(root)).unwrap();
+
+        scene
+            .apply(RecvType::RawBuffer(vec![110, 120, 130, 128]))
+            .unwrap();
+        let mut child = state(
+            1,
+            2,
+            Some(Role::SubSurface(SubSurfaceState {
+                parent: WlSurfaceId(1),
+                location: Point { x: 1, y: 0 },
+                sync: true,
+            })),
+        );
+        child.buffer = Some(external_buffer(1, 1, BufferFormat::Argb8888));
+        scene.apply(commit(child)).unwrap();
+
+        // A nested subsurface: the walk up is transitive, not one hop.
+        let mut nested_parent = state(
+            1,
+            2,
+            Some(Role::SubSurface(SubSurfaceState {
+                parent: WlSurfaceId(1),
+                location: Point { x: 1, y: 0 },
+                sync: true,
+            })),
+        );
+        nested_parent.z_ordered_children.push(SubsurfacePosition {
+            id: WlSurfaceId(3),
+            position: Point { x: 0, y: 0 },
+        });
+        scene.apply(commit(nested_parent)).unwrap();
+        scene
+            .apply(commit(state(
+                1,
+                3,
+                Some(Role::SubSurface(SubSurfaceState {
+                    parent: WlSurfaceId(2),
+                    location: Point { x: 0, y: 0 },
+                    sync: true,
+                })),
+            )))
+            .unwrap();
+
+        let root_key = SurfaceKey {
+            client_id: 1,
+            surface_id: 1,
+        };
+        assert_eq!(scene.toplevel_ancestor(root_key), Some(root_key));
+        for surface_id in [2, 3] {
+            assert_eq!(
+                scene.toplevel_ancestor(SurfaceKey {
+                    client_id: 1,
+                    surface_id
+                }),
+                Some(root_key),
+                "surface {surface_id} composites into the toplevel"
+            );
+        }
+        // An unknown surface, and a committed surface no toplevel reaches,
+        // resolve to nothing rather than to an arbitrary window.
+        assert_eq!(
+            scene.toplevel_ancestor(SurfaceKey {
+                client_id: 1,
+                surface_id: 99
+            }),
+            None
+        );
+        scene.apply(commit(state(1, 4, None))).unwrap();
+        assert_eq!(
+            scene.toplevel_ancestor(SurfaceKey {
+                client_id: 1,
+                surface_id: 4
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn resolves_a_popup_to_the_toplevel_it_hangs_from() {
+        let mut scene = Scene::default();
+        scene.apply(commit(state(1, 1, Some(toplevel())))).unwrap();
+        scene
+            .apply(commit(state(
+                1,
+                2,
+                Some(Role::XdgPopup(XdgPopupState {
+                    id: XdgPopupId(11),
+                    parent_surface_id: WlSurfaceId(1),
+                    positioner: XdgPositioner {
+                        width: 1,
+                        height: 1,
+                        anchor_rect: Rectangle::new(0, 0, 1, 1),
+                        anchor_edges: 0,
+                        gravity: 0,
+                        constraint_adjustment: 0,
+                        offset: Point { x: 0, y: 0 },
+                        reactive: false,
+                        parent_size: None,
+                        parent_configure: None,
+                    },
+                    grab_requested: false,
+                })),
+            )))
+            .unwrap();
+
+        assert_eq!(
+            scene.toplevel_ancestor(SurfaceKey {
+                client_id: 1,
+                surface_id: 2
+            }),
+            Some(SurfaceKey {
+                client_id: 1,
+                surface_id: 1
+            })
+        );
     }
 
     #[test]

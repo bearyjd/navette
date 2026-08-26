@@ -71,7 +71,9 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("failed to bind {}", arguments.bind))?;
     tracing::info!(address = %arguments.bind, apps = app_count, "navetted listening");
-    axum::serve(listener, router(ApiState::new(apps, supervisor)))
+    let state = ApiState::new(apps, supervisor);
+    state.start_existing_bridges();
+    axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("control server failed")

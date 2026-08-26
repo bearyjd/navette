@@ -1,0 +1,32 @@
+[package]
+name = "navette-viewer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "navette-viewer"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+minifb = "0.28"
+navette-protocol = { path = "../navette-protocol" }
+nix = { version = "0.30", features = ["signal"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tokio-tungstenite = "0.30"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[dev-dependencies]
+axum = { version = "0.8", features = ["ws"] }
+# The end-to-end test drives a real navetted media endpoint and a real encoder
+# rather than a hand-rolled stand-in; both are test-only collaborators.
+navette-bridge = { path = "../navette-bridge" }
+navetted = { path = "../navetted" }
+tempfile = "3"
