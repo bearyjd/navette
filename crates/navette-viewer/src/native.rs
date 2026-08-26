@@ -115,7 +115,7 @@ impl NativeWindow {
         for (target, source) in self
             .buffer
             .iter_mut()
-            .zip(frame.pixels.chunks_exact(4).take(pixels))
+            .zip(frame.pixels.as_chunks::<4>().0.iter())
         {
             // Decoded frames are tightly packed BGRA; minifb wants 0RGB.
             *target =
