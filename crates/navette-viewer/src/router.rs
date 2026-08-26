@@ -68,6 +68,12 @@ struct StreamDecoder {
     /// submitted — it is whichever access unit is at the front of this
     /// queue.
     pending_timestamps: VecDeque<u64>,
+    /// The most recent timestamp actually assigned to a delivered frame.
+    /// `end()` has no current packet to fall back on the way `decode()`
+    /// does, so it falls back to this instead of a sentinel like `0` — a
+    /// flushed frame's timestamp should read as "the last real one we had,"
+    /// not as a value indistinguishable from legitimate stream-start data.
+    last_timestamp_us: u64,
 }
 
 /// Routes the packets of one media session to a decoder per `stream_id`.
@@ -174,6 +180,7 @@ impl StreamRouter {
                         surface_id: config.surface_id,
                         decoder,
                         pending_timestamps: VecDeque::new(),
+                        last_timestamp_us: 0,
                     },
                 );
             }
@@ -207,6 +214,7 @@ impl StreamRouter {
                         .pending_timestamps
                         .pop_front()
                         .unwrap_or(packet.header.timestamp_us);
+                    stream.last_timestamp_us = timestamp_us;
                     StreamEvent::Frame(StreamFrame {
                         stream_id,
                         client_id: stream.client_id,
@@ -245,7 +253,10 @@ impl StreamRouter {
             .drain()
             .into_iter()
             .map(|frame| {
-                let timestamp_us = stream.pending_timestamps.pop_front().unwrap_or(0);
+                let timestamp_us = stream
+                    .pending_timestamps
+                    .pop_front()
+                    .unwrap_or(stream.last_timestamp_us);
                 StreamEvent::Frame(StreamFrame {
                     stream_id,
                     client_id: stream.client_id,
@@ -498,6 +509,30 @@ mod tests {
             ]
         );
         assert_eq!(router.live_streams(), 0);
+    }
+
+    #[test]
+    fn stream_end_falls_back_to_the_last_real_timestamp_not_a_sentinel_zero() {
+        // `pending_timestamps` cannot actually underflow under any decoder
+        // that respects "at most one frame per access unit" -- this exists
+        // to pin the fallback's *value* for a decoder that doesn't, so a
+        // future violation of that invariant reads as stale-but-plausible
+        // data rather than a timestamp indistinguishable from stream start.
+        let mut router = StreamRouter::new(Box::new(|config: &DecoderConfig| {
+            Ok(Box::new(SurplusDrainDecoder::new(config.clone())?) as Box<dyn Decoder>)
+        }));
+        router.handle(&stream_config(1, 1, 11, 12, &CODEC_CONFIG));
+        // This decode call pairs the frame it returns with timestamp 2000
+        // and pops the queue empty -- `last_timestamp_us` is now 2000.
+        assert_eq!(frame_of(router.handle(&video(1, 2))).timestamp_us, 2000);
+
+        // `drain()` yields one more frame than any submitted access unit
+        // accounts for, so `end()`'s pop finds the queue already empty.
+        let events = router.handle(&packet(MediaKind::StreamEnd, 1, 3, Vec::new()));
+        let StreamEvent::Frame(flushed) = &events[0] else {
+            panic!("expected the surplus frame to be flushed");
+        };
+        assert_eq!(flushed.timestamp_us, 2000);
     }
 
     #[test]
@@ -765,6 +800,63 @@ mod tests {
         fn reconfigure(&mut self, config: DecoderConfig) -> Result<(), DecoderError> {
             self.config = config.validate()?;
             self.buffered = None;
+            Ok(())
+        }
+
+        fn metrics(&self) -> DecoderMetrics {
+            DecoderMetrics::default()
+        }
+    }
+
+    /// `decode` behaves like [`FakeDecoder`] (one frame per access unit,
+    /// paired normally), but `drain` unconditionally yields one additional
+    /// frame no access unit ever accounted for -- a decoder violating the
+    /// "at most one frame per access unit" invariant the router's timestamp
+    /// pairing otherwise relies on. Exists only to exercise `end()`'s
+    /// timestamp fallback in isolation; no real decoder here does this.
+    struct SurplusDrainDecoder {
+        config: DecoderConfig,
+        shade: u8,
+    }
+
+    impl SurplusDrainDecoder {
+        fn new(config: DecoderConfig) -> Result<Self, DecoderError> {
+            Ok(Self {
+                config: config.validate()?,
+                shade: 0,
+            })
+        }
+
+        fn frame(&self) -> DecodedFrame {
+            DecodedFrame {
+                width: self.config.width,
+                height: self.config.height,
+                pixels: vec![self.shade; self.config.frame_len()],
+                decode_time: Duration::ZERO,
+            }
+        }
+    }
+
+    impl Decoder for SurplusDrainDecoder {
+        fn config(&self) -> &DecoderConfig {
+            &self.config
+        }
+
+        fn decode(&mut self, access_unit: &[u8]) -> Result<Vec<DecodedFrame>, DecoderError> {
+            if access_unit.is_empty() {
+                return Err(DecoderError::EmptyAccessUnit);
+            }
+            self.shade = self.shade.wrapping_add(1);
+            Ok(vec![self.frame()])
+        }
+
+        fn drain(&mut self) -> Vec<DecodedFrame> {
+            vec![self.frame()]
+        }
+
+        fn reconfigure(&mut self, config: DecoderConfig) -> Result<(), DecoderError> {
+            self.config = config.validate()?;
+            self.shade = 0;
             Ok(())
         }
 

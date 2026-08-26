@@ -231,6 +231,43 @@ impl InputState {
         }
     }
 
+    /// Clears either focus field if it currently points at `key`. Called
+    /// when the scene reports `key` destroyed -- without this, a focus value
+    /// can outlive the surface it names. `validate_surface` only ever sets
+    /// focus to a surface it can currently see in the scene, so this was
+    /// only reachable if a `(client_id, surface_id)` pair got reused within
+    /// one session; clearing it here removes that dependency entirely rather
+    /// than relying on an id-reuse guarantee this module doesn't own.
+    pub fn surface_destroyed(&mut self, key: SurfaceKey) {
+        if self.pointer_focus == Some(key) {
+            self.pointer_focus = None;
+        }
+        if self.keyboard_focus == Some(key) {
+            self.keyboard_focus = None;
+        }
+    }
+
+    /// Clears either focus field if it points at any surface belonging to
+    /// `client_id`. Used for a whole-client disconnect, where the scene has
+    /// already dropped every surface the client owned in one bulk removal --
+    /// there's no per-key `SurfaceDestroyed` to react to, so this can't be
+    /// built out of repeated `surface_destroyed` calls the way the rest of
+    /// disconnect cleanup is.
+    pub fn client_disconnected(&mut self, client_id: u64) {
+        if self
+            .pointer_focus
+            .is_some_and(|key| key.client_id == client_id)
+        {
+            self.pointer_focus = None;
+        }
+        if self
+            .keyboard_focus
+            .is_some_and(|key| key.client_id == client_id)
+        {
+            self.keyboard_focus = None;
+        }
+    }
+
     fn focus_keyboard(&mut self, key: SurfaceKey, transport: &WprsTransport) {
         if self.keyboard_focus != Some(key) {
             let serial = self.next_serial();
@@ -1048,5 +1085,109 @@ mod tests {
         assert!(!state.pressed_keys.contains_key(&10));
         assert!(state.pressed_buttons[&20].contains(&(key, 0x111)));
         assert!(state.pressed_keys[&20].contains(&31));
+    }
+
+    #[test]
+    fn surface_destroyed_clears_only_focus_pointing_at_that_surface() {
+        let scene = scene_with_toplevels(&[(1, 1, 8, 8), (1, 2, 8, 8)]);
+        let (transport, fake) = FakeWprsd::connect();
+        let mut state = InputState::default();
+        let destroyed = SurfaceKey {
+            client_id: 1,
+            surface_id: 1,
+        };
+        let other = SurfaceKey {
+            client_id: 1,
+            surface_id: 2,
+        };
+
+        state
+            .apply(
+                7,
+                MediaInput::PointerMotion {
+                    client_id: 1,
+                    surface_id: 1,
+                    x: 1.0,
+                    y: 1.0,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+        fake.recv(); // pointer enter + motion
+        state
+            .apply(
+                7,
+                MediaInput::KeyboardKey {
+                    client_id: 1,
+                    surface_id: 2,
+                    keycode: 30,
+                    pressed: true,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+        fake.recv(); // keyboard enter
+        fake.recv(); // key press
+        assert_eq!(state.pointer_focus, Some(destroyed));
+        assert_eq!(state.keyboard_focus, Some(other));
+
+        state.surface_destroyed(destroyed);
+        assert_eq!(state.pointer_focus, None);
+        assert_eq!(state.keyboard_focus, Some(other));
+    }
+
+    #[test]
+    fn client_disconnected_clears_focus_belonging_to_that_client_only() {
+        let scene = scene_with_toplevels(&[(1, 1, 8, 8), (2, 1, 8, 8)]);
+        let (transport, fake) = FakeWprsd::connect();
+        let mut state = InputState::default();
+        let client1 = SurfaceKey {
+            client_id: 1,
+            surface_id: 1,
+        };
+        let client2 = SurfaceKey {
+            client_id: 2,
+            surface_id: 1,
+        };
+
+        state
+            .apply(
+                7,
+                MediaInput::PointerMotion {
+                    client_id: 1,
+                    surface_id: 1,
+                    x: 1.0,
+                    y: 1.0,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+        fake.recv();
+        state
+            .apply(
+                7,
+                MediaInput::KeyboardKey {
+                    client_id: 2,
+                    surface_id: 1,
+                    keycode: 30,
+                    pressed: true,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+        fake.recv();
+        fake.recv();
+        assert_eq!(state.pointer_focus, Some(client1));
+        assert_eq!(state.keyboard_focus, Some(client2));
+
+        // Client 1 disconnects: its pointer focus is cleared, but client 2's
+        // still-live keyboard focus must survive untouched.
+        state.client_disconnected(1);
+        assert_eq!(state.pointer_focus, None);
+        assert_eq!(state.keyboard_focus, Some(client2));
     }
 }

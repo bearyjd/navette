@@ -265,9 +265,11 @@ fn handle_scene_events(
                 }
             }
             SceneEvent::SurfaceDestroyed(key) => {
+                worker.input.surface_destroyed(key);
                 end_stream(session, media, &mut worker.streams, key)
             }
             SceneEvent::ClientDisconnected(client_id) => {
+                worker.input.client_disconnected(client_id);
                 let keys = worker
                     .streams
                     .keys()

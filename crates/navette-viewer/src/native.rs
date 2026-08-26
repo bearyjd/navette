@@ -8,10 +8,18 @@
 //! event-loop ownership model and a separate blitting crate for no gain in a
 //! throwaway validation tool.
 //!
-//! Nothing in this module is exercised by the test suite: it needs a display,
-//! and the viewer's behaviour is tested against
-//! [`RecordingWindow`](crate::window::RecordingWindow) instead. Keep the logic
-//! here to translation only.
+//! Almost nothing in this module is exercised by the default test suite: it
+//! needs a display, and the viewer's behaviour is tested against
+//! [`RecordingWindow`](crate::window::RecordingWindow) instead. Keep the
+//! logic here to translation only. The one exception is an `#[ignore]`d
+//! smoke test at the bottom of this file, runnable under a virtual display
+//! (`xvfb-run -a cargo test -p navette-viewer -- --ignored native::`) --
+//! it exists because the single-update-per-loop split between `present` and
+//! `poll_events` was diagnosed and fixed by reading minifb's source alone,
+//! with no way to run it in this sandbox; the smoke test at least proves a
+//! real `minifb::Window` can be constructed and driven through one full
+//! present/poll cycle without minifb's own "don't call both update
+//! functions" contract being violated.
 
 use std::collections::BTreeSet;
 
@@ -438,4 +446,34 @@ fn evdev_code(key: Key) -> Option<u32> {
         // accepts; dropping them beats guessing a code.
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a display server: xvfb-run -a cargo test -p navette-viewer -- --ignored native::"]
+    fn native_window_opens_and_presents_one_frame_under_a_real_display() {
+        let spec = WindowSpec {
+            stream_id: 1,
+            width: 64,
+            height: 64,
+        };
+        let mut window = NativeWindow::open(&spec).expect("Xvfb should provide a display");
+
+        let frame = DecodedFrame {
+            width: 64,
+            height: 64,
+            pixels: vec![0; 64 * 64 * 4],
+            decode_time: Duration::ZERO,
+        };
+        window.present(&frame, &HudSample::default());
+        // Exercises the exact path the single-update restructure fixed: this
+        // is the only place `pending_present` gets consumed and minifb's
+        // update is actually called.
+        let _ = window.poll_events();
+    }
 }
