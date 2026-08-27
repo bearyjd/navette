@@ -309,9 +309,18 @@ impl Scene {
                     .map(|node| node.children.iter().map(|child| child.key).collect())
                     .unwrap_or_default();
                 let image = self.decode_assignment(state.buffer.as_ref(), previous_image)?;
+                // wprsd always appends the surface's own id to
+                // `z_ordered_children`, marking where its own buffer sits in
+                // the subsurface stacking order (see upstream
+                // `commit_impl` in `server/smithay_handlers.rs`). That
+                // buffer is already drawn by `compose_toplevel`/the parent's
+                // own blend, so treating it as a literal child here would
+                // make every surface its own child and trip
+                // `composite_children`'s cycle guard on every commit.
                 let children: Vec<Child> = state
                     .z_ordered_children
                     .iter()
+                    .filter(|child| child.id != state.id)
                     .map(|child| Child {
                         key: SurfaceKey::new(state.client, child.id),
                         x: child.position.x,
@@ -763,6 +772,64 @@ mod tests {
             })),
         );
         child.buffer = Some(external_buffer(1, 1, BufferFormat::Argb8888));
+        scene.apply(commit(child)).unwrap();
+
+        let frame = scene
+            .compose_toplevel(SurfaceKey {
+                client_id: 1,
+                surface_id: 1,
+            })
+            .unwrap();
+        assert_eq!(&frame.pixels[..4], &[10, 30, 50, 255]);
+        assert_eq!(&frame.pixels[4..], &[65, 80, 95, 255]);
+    }
+
+    #[test]
+    fn a_surfaces_self_entry_in_z_ordered_children_does_not_trip_the_cycle_guard() {
+        // wprsd's own `commit_impl` always appends a surface's own id to its
+        // `z_ordered_children`, marking where its own buffer sits in the
+        // subsurface stacking order (see upstream `server/smithay_handlers.rs`).
+        // Every real commit -- root or child -- carries this self-entry; a
+        // synthetic fixture that omits it (as every other test here does,
+        // including the otherwise-identical
+        // `composites_subsurface_with_alpha_and_clipping` this mirrors)
+        // can't catch a composite_children that treats it as a literal,
+        // cycle-triggering child.
+        let mut scene = Scene::default();
+        scene
+            .apply(RecvType::RawBuffer(vec![10, 20, 30, 40, 50, 60, 0, 0]))
+            .unwrap();
+        let mut root = state(1, 1, Some(toplevel()));
+        root.buffer = Some(external_buffer(2, 1, BufferFormat::Xrgb8888));
+        root.z_ordered_children.push(SubsurfacePosition {
+            id: WlSurfaceId(2),
+            position: Point { x: 1, y: 0 },
+        });
+        // The self-entry wprsd always appends, in addition to the real child.
+        root.z_ordered_children.push(SubsurfacePosition {
+            id: WlSurfaceId(1),
+            position: Point { x: 0, y: 0 },
+        });
+        scene.apply(commit(root)).unwrap();
+
+        scene
+            .apply(RecvType::RawBuffer(vec![110, 120, 130, 128]))
+            .unwrap();
+        let mut child = state(
+            1,
+            2,
+            Some(Role::SubSurface(SubSurfaceState {
+                parent: WlSurfaceId(1),
+                location: Point { x: 1, y: 0 },
+                sync: true,
+            })),
+        );
+        child.buffer = Some(external_buffer(1, 1, BufferFormat::Argb8888));
+        // The child's own commit also carries wprsd's self-entry.
+        child.z_ordered_children.push(SubsurfacePosition {
+            id: WlSurfaceId(2),
+            position: Point { x: 0, y: 0 },
+        });
         scene.apply(commit(child)).unwrap();
 
         let frame = scene
