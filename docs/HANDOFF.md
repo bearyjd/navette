@@ -563,8 +563,16 @@ on its own merits (a 60ms cycle is bad input latency regardless).
   lives and where the fix was measured — but nobody has yet typed into a
   real navette window during a resize and confirmed the symptom is gone.
   **That is the single remaining step to close this out.**
-- Moving decode/convert off the viewer's poll thread (the mitigation for the
-  residual above) is not done.
+- **Moving decode/convert off the viewer's poll thread is not done, and is now
+  known to be required rather than optional** -- see the measured poll-cycle
+  numbers below (real cycles reach 626ms; 14 cycles in one 60s run were long
+  enough to swallow a whole keypress). This is the top open item for M2.
+- minifb binds `wl_keyboard`/`wl_pointer` without checking `wl_seat`
+  capabilities (`wayland.rs:401`) and panics on any non-XKB keymap
+  (`wayland.rs:1225`). Neither affects a normal desktop, but both make it
+  impossible to run the viewer under a headless compositor -- which is exactly
+  what CI would want. Not fixed; a fourth candidate for the fork if headless
+  testing is ever wanted.
 
 ### Verification against the pushed commit
 
@@ -580,32 +588,95 @@ whose phases include rollover across Shift:
   at the cycle length that, before the fix, produced 10 unpaired releases
   and a latched key.
 
-**Honest limitation:** those runs are a thinner sample than the single-key
-test, because the desktop kept taking focus back (the probe window only
-holds it for a few seconds at a time on a machine someone is using). The
-sustained multi-key rollover phase never ran to completion. Per-key
-reasoning says this is covered — `keys`/`keys_prev`/`keys_down_duration`
-are independent arrays indexed by key, so the phase split applies per key
-with no cross-talk — but that is reasoning, not measurement. Anyone
-re-running this should do it on an idle desktop.
+Those first runs were a thin sample, because injecting with `ydotool` on the
+real desktop meant the probe window kept losing focus and the multi-key phases
+never completed. **That is now fixed and the multi-key case is properly
+measured.** The harness runs the probe inside a `sway` nested in the host
+session and injects with `wtype` over `virtual-keyboard-v1`, which targets
+sway's own seat -- so nothing depends on any window holding focus, and the
+host desktop is untouched.
 
-Also observed and worth knowing: at a 60ms cycle with edges injected 2ms
-apart, most taps produced *no events at all* rather than bad ones. That is
-the documented residual behaving exactly as described — both edges inside
-one cycle net out — and it is why those runs have low event counts. It
-drops keys; it does not latch them.
+Three things had to be right for that to work, each worth knowing:
 
-### The one measurement not yet taken
+- **Nested, not headless.** A headless wlroots seat advertises neither
+  keyboard nor pointer capability, and minifb binds both unconditionally
+  (`wayland.rs:401`, `(seat.get_keyboard(), seat.get_pointer())`, no
+  capability check) -- a protocol error that disconnects the probe before it
+  sees a key. That is arguably a fourth minifb bug; it was worked around
+  rather than patched, to keep the code under test unmodified.
+- **One injector process, not one per burst.** A one-shot `wtype` per burst
+  creates and destroys a virtual keyboard each time, and that churn makes sway
+  emit a keymap event minifb panics on outright (`unimplemented!("Only XKB
+  keymaps are supported")`, `wayland.rs:1225`). All 480 edges now come from a
+  single `wtype` invocation.
+- **`Shift_L`, not `shift`.** `shift` is a modifier name for `wtype -M/-m`,
+  not a key name for `-P/-p`. wtype validates every argument before sending
+  anything, so one bad name silently injected *nothing* -- a run that looked
+  like a clean pass but had measured nothing at all.
 
-`main.rs` now logs `poll tick fired late` with `lag_ms`, but **nobody has
-collected the real number**. The 60ms used throughout this investigation
-was chosen, not measured. That number decides whether the residual above
-matters: if a real resize only pushes the viewer's cycle to ~15ms, a whole
-keypress cannot fit inside one and the residual is theoretical, so moving
-decode/convert off the poll thread is a nice-to-have. If it reaches ~80ms,
-the residual is a live defect and that work is required. Reading that
-number off one real resize is the cheapest way to close or size the last
-open item, and the probe for it is already committed.
+The measurement: 480 key edges over four phases -- single keys, rollover
+across Shift, sustained three-key overlap, and deep four-key overlap -- at a
+60ms cycle, run against the pre-fix and post-fix minifb with everything else
+identical.
+
+| key | pre-fix `8f19983` | post-fix `0b54200` |
+|---|---|---|
+| T | **33 press / 84 release** | 84 / 84 |
+| E | **38 / 53** | 58 / 58 |
+| S | **38 / 40** | 40 / 40 |
+| LeftShift | 35 / 35 | 35 / 35 |
+| orphan releases | **68** | **0** |
+| duplicate presses | 0 | 0 |
+
+The fix recovers 51 lost `T` presses and eliminates all 68 unpaired releases.
+`LeftShift` balances in both because it is held across other keys and so always
+spans many cycles -- which is itself a useful control: the bug only touches
+keys whose edges fall close together.
+
+Post-fix, the keys that go missing do so as *complete pairs* (every count
+balances exactly), never as a half-edge. That is the documented residual
+behaving as described: it drops keys, it never latches them.
+
+### The real poll-cycle number (measured 2026-08-28)
+
+Every "60ms" above was *chosen*, not measured. It has now been measured on the
+real stack -- `wprsd` + `navetted` + Firefox + `navette-viewer` -- with the
+viewer in a GPU-backed nested sway, resized by resizing its own toplevel (a
+genuine `xdg_toplevel` configure, confirmed by 7 `decoder reconfigured stream`
+events in the viewer log). Numbers are the committed `poll tick fired late`
+probe, phase-split:
+
+| phase | n | p50 | p90 | p99 | max | cycles >=50ms |
+|---|---|---|---|---|---|---|
+| startup | 13 | 20ms | 240ms | 508ms | 508ms | 2 |
+| baseline | 60 | 18ms | 23ms | 213ms | 533ms | 2 |
+| **resize** | 66 | 15ms | **125ms** | 531ms | **626ms** | **8** |
+| all | 149 | 17ms | 30ms | 626ms | 626ms | 14 |
+
+**The 60ms assumption was conservative by an order of magnitude.** Real cycles
+reach 626ms. Even at rest the loop runs at ~17ms, twice its 8ms target, and a
+resize takes p90 to 125ms.
+
+**This settles the open question: the residual is a live defect, not a
+theoretical one.** 14 cycles over a single 60-second run were long enough
+(>=50ms) to swallow an entire ordinary keypress, 8 of them during resizes. At
+626ms, several complete keystrokes could land inside one cycle and vanish. So
+"move decode/convert off the viewer's poll thread" is **required work, not a
+nice-to-have** -- it is what bounds the one failure mode the minifb fix
+deliberately does not address.
+
+Caveats, so the number is not over-read: the viewer ran in a nested compositor
+rather than a native session (GPU-backed, but still nesting), and Firefox was
+largely idle -- a busier guest would plausibly be worse, not better. Note also
+that the worst baseline cycle (533ms) is nearly the worst resize cycle, so
+resize is where the *density* of slow cycles is, not the only place they occur.
+
+One trap worth recording: the first attempt at this reported "no late ticks"
+while a raw `grep` found 159. `tracing`'s fmt layer colourises field names, so
+`lag_ms`, `=` and the value are separated by ANSI escapes and a naive
+`lag_ms=(\d+)` regex matches nothing. The analyser strips escapes now. A
+parser that silently finds zero of something is indistinguishable from the
+thing not happening -- always cross-check against a raw count.
 
 ### Two notes for whoever reads this next
 
