@@ -65,6 +65,19 @@ pub struct NativeWindow {
     /// next poll to pick up.
     pending_present: Option<(usize, usize)>,
     size: (u32, u32),
+    /// Dimensions of the buffer actually on screen right now (the last one
+    /// handed to `update_with_buffer`), as opposed to `size` (the live OS
+    /// window size). minifb's `ScaleMode::Stretch` displays this buffer
+    /// stretched to fill whatever the window's current size is, and
+    /// `get_mouse_pos` reports positions in that live window-pixel space --
+    /// so a pointer position must be rescaled from window space into this
+    /// buffer's space before it means anything to the server, which clamps
+    /// against its own last-composited frame's dimensions. Left stale
+    /// during the (~100ms debounce, then real app repaint time -- observed
+    /// around 800ms end to end) between a resize and the server's next
+    /// frame at the new size: that gap is exactly why a click made right
+    /// after a drag-resize used to land in the wrong place.
+    content_size: (u32, u32),
     pointer: Option<(f64, f64)>,
     buttons: [bool; TRACKED_BUTTONS.len()],
     /// Keys this window has reported pressed and not yet reported released.
@@ -74,6 +87,24 @@ pub struct NativeWindow {
     held_keys: BTreeSet<Key>,
     modifiers: Modifiers,
     open: bool,
+}
+
+/// Rescales a raw pointer position from live window-pixel space into the
+/// currently-displayed content buffer's own coordinate space -- see the
+/// `content_size` field doc for why the two can disagree. `None` when
+/// either dimension is degenerate (a live window can transiently report
+/// zero size mid-resize on some compositors).
+fn rescale_to_content(
+    raw: (f64, f64),
+    window_size: (u32, u32),
+    content_size: (u32, u32),
+) -> Option<(f64, f64)> {
+    if window_size.0 == 0 || window_size.1 == 0 {
+        return None;
+    }
+    let scale_x = f64::from(content_size.0) / f64::from(window_size.0);
+    let scale_y = f64::from(content_size.1) / f64::from(window_size.1);
+    Some((raw.0 * scale_x, raw.1 * scale_y))
 }
 
 impl NativeWindow {
@@ -94,6 +125,7 @@ impl NativeWindow {
             buffer: Vec::new(),
             pending_present: None,
             size: (spec.width, spec.height),
+            content_size: (spec.width.max(1), spec.height.max(1)),
             pointer: None,
             buttons: [false; TRACKED_BUTTONS.len()],
             held_keys: BTreeSet::new(),
@@ -133,8 +165,18 @@ impl NativeWindow {
     }
 
     fn pointer_motion(&mut self) -> Option<WindowEvent> {
-        let (x, y) = self.window.get_mouse_pos(MouseMode::Clamp)?;
-        let position = (f64::from(x), f64::from(y));
+        // `get_mouse_pos` reports raw window-pixel coordinates, clamped
+        // against minifb's live OS window size -- not the buffer currently
+        // stretched to fill it. Rescale into that buffer's coordinate space
+        // (what the server actually composited and will clamp against)
+        // before reporting a position.
+        let (raw_x, raw_y) = self.window.get_mouse_pos(MouseMode::Clamp)?;
+        let window_size = self.window.get_size();
+        let position = rescale_to_content(
+            (f64::from(raw_x), f64::from(raw_y)),
+            (window_size.0 as u32, window_size.1 as u32),
+            self.content_size,
+        )?;
         if self.pointer == Some(position) {
             return None;
         }
@@ -249,8 +291,14 @@ impl Window for NativeWindow {
         // the same cycle is what used to lose input.
         match self.pending_present.take() {
             Some((width, height)) => {
-                if let Err(error) = self.window.update_with_buffer(&self.buffer, width, height) {
-                    tracing::warn!(%error, "failed to present a frame");
+                match self.window.update_with_buffer(&self.buffer, width, height) {
+                    Ok(()) => {
+                        self.content_size = (
+                            u32::try_from(width).unwrap_or(u32::MAX).max(1),
+                            u32::try_from(height).unwrap_or(u32::MAX).max(1),
+                        );
+                    }
+                    Err(error) => tracing::warn!(%error, "failed to present a frame"),
                 }
             }
             None => self.window.update(),
@@ -267,7 +315,20 @@ impl Window for NativeWindow {
                 vertical: f64::from(vertical),
             });
         }
-        let pressed = self.window.get_keys_pressed(KeyRepeat::Yes);
+        // `KeyRepeat::Yes` would have minifb itself re-report a held key at
+        // its own ~20Hz typematic cadence (250ms delay, then every 50ms --
+        // see minifb's `KeyHandler::is_key_index_pressed`). Each of those
+        // becomes a brand-new `WindowEvent::Key { pressed: true }` below,
+        // which session.rs and the bridge forward as a genuine new
+        // `wl_keyboard.key Pressed` -- but Wayland key repeat is the
+        // receiving app's job, not the transport's: a real client (Firefox)
+        // already runs its own repeat timer off a single press. Injecting
+        // minifb's repeats on top compounds with that and floods the guest
+        // with extra keystrokes (holding a key while typing "test" landing
+        // as "teeeeeeeeeestttttttttttt"). `KeyRepeat::No` reports a key
+        // exactly once per physical press, matching the edge-only handling
+        // `button_changes` already does for pointer buttons a few lines up.
+        let pressed = self.window.get_keys_pressed(KeyRepeat::No);
         self.modifier_changes(&pressed, &mut events);
         for key in pressed {
             if let Some(keycode) = evdev_code(key) {
@@ -475,5 +536,35 @@ mod tests {
         // is the only place `pending_present` gets consumed and minifb's
         // update is actually called.
         let _ = window.poll_events();
+    }
+
+    #[test]
+    fn pointer_position_is_identity_when_window_matches_content() {
+        assert_eq!(
+            rescale_to_content((320.0, 200.0), (640, 480), (640, 480)),
+            Some((320.0, 200.0))
+        );
+    }
+
+    #[test]
+    fn pointer_position_scales_up_when_window_is_smaller_than_content() {
+        // A click at the window's exact center should still land at the
+        // content's exact center, whatever the two sizes are individually --
+        // this is the case a drag-resize passes through continuously while
+        // the server hasn't caught up to the window's new (larger) size yet.
+        let position = rescale_to_content((160.0, 100.0), (320, 200), (1280, 720)).unwrap();
+        assert_eq!(position, (640.0, 360.0));
+    }
+
+    #[test]
+    fn pointer_position_scales_down_when_window_is_larger_than_content() {
+        let position = rescale_to_content((960.0, 540.0), (1280, 720), (640, 360)).unwrap();
+        assert_eq!(position, (480.0, 270.0));
+    }
+
+    #[test]
+    fn pointer_position_is_none_for_a_degenerate_window_size() {
+        assert_eq!(rescale_to_content((1.0, 1.0), (0, 480), (640, 480)), None);
+        assert_eq!(rescale_to_content((1.0, 1.0), (640, 0), (640, 480)), None);
     }
 }

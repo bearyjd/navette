@@ -13,7 +13,13 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
-minifb = "0.28"
+# Pinned to a navette fork (upstream PR pending, tracked in HANDOFF.md) that
+# fixes two real Wayland keyboard bugs found in live testing: shifted-level
+# keysyms (capitals, shifted punctuation) being silently dropped instead of
+# mapped to their physical key, and a failed present skipping the key-repeat
+# timer's advance. See the fork's navette-wayland-key-fixes branch for the
+# exact fixes and rationale.
+minifb = { git = "https://github.com/bearyjd/rust_minifb.git", rev = "0b542006be72498c3af9bccab6d7ff1553764e73" }
 navette-protocol = { path = "../navette-protocol" }
 nix = { version = "0.30", features = ["signal"] }
 serde_json = "1"

@@ -217,6 +217,7 @@ fn run_bridge(
         if let Some((requested, width, height)) = resize
             && requested.elapsed() >= RESIZE_DEBOUNCE
         {
+            tracing::debug!(width, height, "applying debounced viewport resize");
             worker
                 .input
                 .apply(
@@ -230,6 +231,14 @@ fn run_bridge(
             resize = None;
         }
     }
+    // A client that stays connected across a reconnect never sends
+    // `Disconnected`, so whatever it last pressed would otherwise read as
+    // held forever on the guest once this worker exits and a fresh one
+    // starts with empty tracking. Best-effort: if the transport already
+    // failed outright, these sends land nowhere, but that's no worse than
+    // the silent loss this replaces, and a `stop`-triggered exit (the
+    // transport still healthy) recovers cleanly.
+    worker.input.release_all_held(&transport);
     Ok(())
 }
 

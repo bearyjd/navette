@@ -11,6 +11,7 @@ calloop = "0.14"
 nix = { version = "0.30", features = ["poll", "process", "signal"] }
 navette-protocol = { path = "../navette-protocol" }
 thiserror = "2"
+tracing = "0.1"
 wprs = { git = "https://github.com/bearyjd/wprs.git", rev = "5763d7464ac76103fd407921e711b17a2aac35b3" }
 
 [dev-dependencies]

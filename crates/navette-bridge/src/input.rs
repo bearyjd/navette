@@ -136,23 +136,51 @@ impl InputState {
             } => {
                 let key = validate_surface(scene, client_id, surface_id)?;
                 self.focus_keyboard(key, transport);
+                // Wayland's key protocol is edge-based: a client that has
+                // already told the guest a key is down and does so again
+                // without an intervening release is sending a duplicate the
+                // guest never asked for and may not handle cleanly (repeat
+                // is the guest's own responsibility, driven off one press).
+                // Collapsing a redundant press to a no-op is defense in
+                // depth against exactly that upstream client bug, at zero
+                // cost to a well-behaved client, which never produces one.
+                let redundant_press = pressed
+                    && self
+                        .pressed_keys
+                        .get(&attachment_id)
+                        .is_some_and(|keys| keys.contains(&keycode));
                 if pressed {
                     self.pressed_keys
                         .entry(attachment_id)
                         .or_default()
                         .insert(keycode);
                 } else if let Some(keys) = self.pressed_keys.get_mut(&attachment_id) {
-                    keys.remove(&keycode);
+                    let was_tracked = keys.remove(&keycode);
+                    if !was_tracked {
+                        // A release for a keycode this attachment never
+                        // reported pressed (or already released) is a sign
+                        // of reordering or a redelivery landing later than
+                        // expected -- evidence for the still-open
+                        // resize+rapid-typing repeat investigation, see
+                        // docs/HANDOFF.md's "Still open" section.
+                        tracing::debug!(
+                            attachment_id,
+                            keycode,
+                            "keyboard release for a keycode not tracked as pressed"
+                        );
+                    }
                 }
-                transport.send(Event::KeyboardEvent(KeyboardEvent::Key(KeyInner {
-                    serial: self.next_serial(),
-                    raw_code: keycode,
-                    state: if pressed {
-                        KeyState::Pressed
-                    } else {
-                        KeyState::Released
-                    },
-                })));
+                if !redundant_press {
+                    transport.send(Event::KeyboardEvent(KeyboardEvent::Key(KeyInner {
+                        serial: self.next_serial(),
+                        raw_code: keycode,
+                        state: if pressed {
+                            KeyState::Pressed
+                        } else {
+                            KeyState::Released
+                        },
+                    })));
+                }
             }
             MediaInput::KeyboardModifiers {
                 client_id,
@@ -210,24 +238,58 @@ impl InputState {
     /// attached clients are still typing and pointing into.
     pub fn disconnect(&mut self, attachment_id: u64, transport: &WprsTransport) {
         if let Some(buttons) = self.pressed_buttons.remove(&attachment_id) {
-            for (key, button) in buttons {
-                let serial = self.next_serial();
-                transport.send(Event::PointerFrame(vec![pointer_event(
-                    key,
-                    Point { x: 0.0, y: 0.0 },
-                    PointerEventKind::Release { button, serial },
-                )]));
-            }
+            Self::release_buttons(buttons, transport, &mut self.serial);
         }
         if let Some(keys) = self.pressed_keys.remove(&attachment_id) {
-            for raw_code in keys {
-                let serial = self.next_serial();
-                transport.send(Event::KeyboardEvent(KeyboardEvent::Key(KeyInner {
-                    serial,
-                    raw_code,
-                    state: KeyState::Released,
-                })));
-            }
+            Self::release_keys(keys, transport, &mut self.serial);
+        }
+    }
+
+    /// Releases every key and button this worker still believes is held,
+    /// across every attachment. Meant for the moment a bridge worker is
+    /// about to exit (transport lost, session stopping): a client that
+    /// stays connected across a reconnect never sends `disconnect`, so
+    /// without this, whatever it last pressed reads as held forever on the
+    /// guest side after the worker restarts with fresh, empty tracking. A
+    /// best-effort flush through the transport that's on its way out is
+    /// strictly better than the silent loss this replaces, even though a
+    /// transport that has already failed outright cannot be helped by any
+    /// send here.
+    pub fn release_all_held(&mut self, transport: &WprsTransport) {
+        for buttons in std::mem::take(&mut self.pressed_buttons).into_values() {
+            Self::release_buttons(buttons, transport, &mut self.serial);
+        }
+        for keys in std::mem::take(&mut self.pressed_keys).into_values() {
+            Self::release_keys(keys, transport, &mut self.serial);
+        }
+    }
+
+    fn release_buttons(
+        buttons: BTreeSet<(SurfaceKey, u32)>,
+        transport: &WprsTransport,
+        serial: &mut u32,
+    ) {
+        for (key, button) in buttons {
+            *serial = serial.wrapping_add(1).max(1);
+            transport.send(Event::PointerFrame(vec![pointer_event(
+                key,
+                Point { x: 0.0, y: 0.0 },
+                PointerEventKind::Release {
+                    button,
+                    serial: *serial,
+                },
+            )]));
+        }
+    }
+
+    fn release_keys(keys: BTreeSet<u32>, transport: &WprsTransport, serial: &mut u32) {
+        for raw_code in keys {
+            *serial = serial.wrapping_add(1).max(1);
+            transport.send(Event::KeyboardEvent(KeyboardEvent::Key(KeyInner {
+                serial: *serial,
+                raw_code,
+                state: KeyState::Released,
+            })));
         }
     }
 
@@ -489,6 +551,23 @@ mod tests {
                     }
                     Err(TryRecvError::Disconnected) => panic!("fake wprsd channel disconnected"),
                 }
+            }
+        }
+
+        /// Asserts nothing further arrives -- used to prove a would-be
+        /// message was suppressed rather than merely delayed.
+        fn assert_no_further_events(&self) {
+            thread::sleep(Duration::from_millis(20));
+            match self.events.try_recv() {
+                Err(TryRecvError::Empty) => {}
+                Ok(RecvType::Object(Event::WprsClientConnect | Event::Output(_))) => {}
+                Ok(RecvType::Object(event)) => {
+                    panic!("expected no further events, got {event:?}")
+                }
+                Ok(RecvType::RawBuffer(_)) => {
+                    panic!("expected no further events, got a raw buffer")
+                }
+                Err(TryRecvError::Disconnected) => panic!("fake wprsd channel disconnected"),
             }
         }
     }
@@ -1085,6 +1164,106 @@ mod tests {
         assert!(!state.pressed_keys.contains_key(&10));
         assert!(state.pressed_buttons[&20].contains(&(key, 0x111)));
         assert!(state.pressed_keys[&20].contains(&31));
+    }
+
+    #[test]
+    fn a_second_press_for_an_already_held_key_is_not_forwarded() {
+        // Wayland's key protocol is edge-based: the guest owns repeat once
+        // it sees one press. A second press for a key already tracked held
+        // -- an upstream client bug, never something a well-behaved client
+        // sends -- must not reach the wire, since the guest never asked for
+        // a duplicate keydown and may not handle one cleanly.
+        let scene = scene_with_toplevels(&[(1, 1, 8, 8)]);
+        let (transport, fake) = FakeWprsd::connect();
+        let mut state = InputState::default();
+        let press = |pressed| MediaInput::KeyboardKey {
+            client_id: 1,
+            surface_id: 1,
+            keycode: 30,
+            pressed,
+        };
+
+        state.apply(10, press(true), &scene, &transport).unwrap();
+        fake.recv(); // keyboard enter
+        fake.recv(); // key press
+
+        state.apply(10, press(true), &scene, &transport).unwrap();
+        fake.assert_no_further_events();
+        assert!(state.pressed_keys[&10].contains(&30));
+
+        // The release for the same key is unaffected -- it always forwards.
+        state.apply(10, press(false), &scene, &transport).unwrap();
+        match fake.recv() {
+            Event::KeyboardEvent(KeyboardEvent::Key(KeyInner {
+                raw_code: 30,
+                state: KeyState::Released,
+                ..
+            })) => {}
+            other => panic!("expected the release to forward, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn release_all_held_releases_every_attachments_input_and_clears_tracking() {
+        let scene = scene_with_toplevels(&[(1, 1, 8, 8)]);
+        let (transport, fake) = FakeWprsd::connect();
+        let mut state = InputState::default();
+
+        state
+            .apply(
+                10,
+                MediaInput::KeyboardKey {
+                    client_id: 1,
+                    surface_id: 1,
+                    keycode: 30,
+                    pressed: true,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+        fake.recv(); // keyboard enter
+        fake.recv(); // key press
+        state
+            .apply(
+                20,
+                MediaInput::PointerButton {
+                    client_id: 1,
+                    surface_id: 1,
+                    button: 0x110,
+                    pressed: true,
+                },
+                &scene,
+                &transport,
+            )
+            .unwrap();
+        fake.recv(); // button press
+
+        state.release_all_held(&transport);
+
+        let mut saw_key_release = false;
+        let mut saw_button_release = false;
+        for _ in 0..2 {
+            match fake.recv() {
+                Event::KeyboardEvent(KeyboardEvent::Key(KeyInner {
+                    raw_code: 30,
+                    state: KeyState::Released,
+                    ..
+                })) => saw_key_release = true,
+                Event::PointerFrame(events) if events.len() == 1 => {
+                    assert!(matches!(
+                        events[0].kind,
+                        PointerEventKind::Release { button: 0x110, .. }
+                    ));
+                    saw_button_release = true;
+                }
+                other => panic!("expected a key or button release, got {other:?}"),
+            }
+        }
+        assert!(saw_key_release && saw_button_release);
+        fake.assert_no_further_events();
+        assert!(state.pressed_keys.is_empty());
+        assert!(state.pressed_buttons.is_empty());
     }
 
     #[test]
