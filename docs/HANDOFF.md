@@ -566,6 +566,47 @@ on its own merits (a 60ms cycle is bad input latency regardless).
 - Moving decode/convert off the viewer's poll thread (the mitigation for the
   residual above) is not done.
 
+### Verification against the pushed commit
+
+The before/after table above was measured against a locally patched working
+copy. Re-verified afterwards against the **actual pushed** fork commit
+`0b54200` (no local `[patch]`; cargo resolved it from git — confirmed in the
+harness's `Cargo.lock`), at the same 60ms cycle, using the multi-key driver
+whose phases include rollover across Shift:
+
+- Every key observed balanced exactly: `T` 4/4, `LeftShift` 2/2, `E` 1/1,
+  `S` 1/1 across two runs.
+- Zero duplicate presses, zero unpaired releases, nothing latched at exit —
+  at the cycle length that, before the fix, produced 10 unpaired releases
+  and a latched key.
+
+**Honest limitation:** those runs are a thinner sample than the single-key
+test, because the desktop kept taking focus back (the probe window only
+holds it for a few seconds at a time on a machine someone is using). The
+sustained multi-key rollover phase never ran to completion. Per-key
+reasoning says this is covered — `keys`/`keys_prev`/`keys_down_duration`
+are independent arrays indexed by key, so the phase split applies per key
+with no cross-talk — but that is reasoning, not measurement. Anyone
+re-running this should do it on an idle desktop.
+
+Also observed and worth knowing: at a 60ms cycle with edges injected 2ms
+apart, most taps produced *no events at all* rather than bad ones. That is
+the documented residual behaving exactly as described — both edges inside
+one cycle net out — and it is why those runs have low event counts. It
+drops keys; it does not latch them.
+
+### The one measurement not yet taken
+
+`main.rs` now logs `poll tick fired late` with `lag_ms`, but **nobody has
+collected the real number**. The 60ms used throughout this investigation
+was chosen, not measured. That number decides whether the residual above
+matters: if a real resize only pushes the viewer's cycle to ~15ms, a whole
+keypress cannot fit inside one and the residual is theoretical, so moving
+decode/convert off the poll thread is a nice-to-have. If it reaches ~80ms,
+the residual is a live defect and that work is required. Reading that
+number off one real resize is the cheapest way to close or size the last
+open item, and the probe for it is already committed.
+
 ### Two notes for whoever reads this next
 
 - **The previous session's "tick starvation" hypothesis was half right, and
