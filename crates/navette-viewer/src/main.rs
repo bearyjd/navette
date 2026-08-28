@@ -30,7 +30,7 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    init_tracing();
     let cli = Cli::parse();
     let url = media_url(&cli.url, &cli.session);
     let mut client = MediaClient::connect(&url, ffmpeg_decoder_factory(cli.ffmpeg))
@@ -108,6 +108,23 @@ async fn main() -> Result<()> {
             }
         }
     }
+}
+
+/// Installs the log subscriber, defaulting to `info` and letting `RUST_LOG`
+/// override.
+///
+/// `fmt::init()` alone is not equivalent. Without the `env-filter` feature it
+/// ignores `RUST_LOG` entirely and pins the level at `info`, so the `debug!`
+/// diagnostics in the poll loop can never be turned on -- they compile, and
+/// then emit nothing no matter how the binary is run. Enabling the feature
+/// and stopping there is also wrong in the other direction: `from_default_env`
+/// falls back to `error` when `RUST_LOG` is unset, which would silence the
+/// ordinary startup logs the operator guide tells people to look for. So:
+/// `info` unless asked otherwise.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
 /// Whether losing `input` to backpressure would leave the guest desynced

@@ -34,9 +34,25 @@ struct Arguments {
     wprsd: String,
 }
 
+/// Installs the log subscriber, defaulting to `info` and letting `RUST_LOG`
+/// override.
+///
+/// `fmt::init()` alone is not equivalent. Without the `env-filter` feature it
+/// ignores `RUST_LOG` entirely and pins the level at `info`, so any `debug!`
+/// diagnostic compiles and then emits nothing however the binary is run.
+/// Enabling the feature and stopping there is wrong the other way:
+/// `from_default_env` falls back to `error` when `RUST_LOG` is unset, which
+/// would silence the ordinary startup logs the operator guide points people
+/// at. So: `info` unless asked otherwise.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    init_tracing();
     let arguments = Arguments::parse();
     if !arguments.bind.ip().is_loopback() && !arguments.allow_remote {
         bail!(
