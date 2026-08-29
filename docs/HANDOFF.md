@@ -997,6 +997,73 @@ Read the branch as "removes a ~600ms input stall, shrinks the repeat burst by
 worth landing on its own; it is not a fix for the headline symptom, and the
 PR should not claim to be one.
 
+## SOLVED: the residual was wasted composition, not composition (2026-08-29)
+
+Branch `perf/localise-bridge-loop-residual`, off #12. **The headline symptom
+is gone: three consecutive clean e2e runs, 6/6 each, 18 bursts, zero
+corruption** — against 5-of-6 runs corrupted immediately before.
+
+### What the probe showed
+
+`MediaCommand::Input` now carries a `queued_at` stamp from the producer, so
+the drain reports how long a keystroke *actually* waited instead of inferring
+it from iteration duration. That distinction is what found this: it separates
+"the loop was slow" from "the loop was slow while input was waiting".
+
+Four runs, 218-227 records each, parser cross-checked against a raw substring
+count per the ANSI trap recorded earlier. Applying input costs ~4us and
+`dispatch` is a non-factor, so neither the input path nor the 10ms timeout was
+implicated. Composition was, at up to 503ms in one iteration, with keystrokes
+waiting up to **528ms** behind it.
+
+**But the composite counter is what changed the fix.** Composites came out at
+exactly half the message count (20->10, 18->9, 6->3 — two wprs messages per
+commit), all for the *same* toplevel, ~40ms each. The encode queue coalesces
+those to one frame per surface. So nine of every ten composites produced a
+frame nothing ever encoded, while input sat behind all of them.
+
+### The fix, and why the planned one was wrong
+
+The plan said "move composition off the loop". That would have relocated 100%
+of the cost at the price of getting `&scene` to another thread. Instead, stop
+doing the work: a commit records that its toplevel *owes* a composite, and
+`flush_composites` runs once at the end of the batch, compositing each owed
+surface exactly once. Composition stays on the loop; a burst of N commits to
+one window now costs one composite instead of N.
+
+| | pre-fix max | post-fix max |
+|---|---|---|
+| `compose_us` | 503,420 | 100,785 |
+| `worst_input_wait_us` | **528,176** | **64,973** |
+
+**Why that eliminates the symptom rather than shrinking it.** wprsd advertises
+`repeat_delay=200` (`wprsd.rs:281`), so a guest repeats a held key only if its
+release is more than 200ms late. Pre-fix waits of 358-528ms cleared that bar
+and repeated; post-fix the worst wait is ~65ms, comfortably under it, so the
+repeat timer never starts. The margin is ~3x, which is why 6/6 reads as causal
+rather than lucky.
+
+### Ordering hazard, handled
+
+Deferring composition creates a hazard the immediate version could not have: a
+commit and a destroy for the same surface in one batch would composite *after*
+the `EndStream`, and the queue's EndStream handling only drops frames already
+queued — so that late frame would open a fresh stream for a dead window.
+`SurfaceDestroyed` drops the owed composite and `ClientDisconnected` drops the
+client's. A destroyed *subsurface* is deliberately not dropped: the set holds
+toplevels, so its ancestor stays owed and still recomposites. Both guards are
+covered by tests verified to fail when removed — the hazard is real, not
+theoretical.
+
+### Still true after this
+
+The probe is kept rather than removed (same call as the client's committed
+`poll tick fired late`); it is debug-level, so it costs an `Instant::now()`
+per input and nothing else. `apply_us` is still ~10ms p50 and untouched, and
+`compose_us` p50 is still ~21ms — one composite per iteration is bounded, but
+not free. Neither is currently causing a symptom. The harness still aborts
+roughly a third of runs with `no window`.
+
 ## What's next
 
 Items 1-4 of the previous list are done and are kept below only as history.

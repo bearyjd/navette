@@ -40,11 +40,13 @@ pub enum MediaCommand {
     Input {
         attachment_id: u64,
         input: MediaInput,
-        /// TEMP-DIAG: when this command was handed to the queue, so the bridge
-        /// loop can report how long a keystroke actually waited before being
-        /// applied. Deliberately excluded from `PartialEq` -- two commands are
-        /// the same command regardless of when they were queued, and tests
-        /// compare them by value.
+        /// When this command was handed to the queue, so the bridge loop can
+        /// report how long a keystroke actually waited before being applied.
+        /// This is what distinguishes "the loop was slow" from "the loop was
+        /// slow while input was waiting"; it found the composite storm and is
+        /// kept for the next time this area regresses. Deliberately excluded
+        /// from `PartialEq` -- two commands are the same command regardless of
+        /// when they were queued, and tests compare them by value.
         queued_at: Instant,
     },
     Disconnected {
@@ -52,7 +54,7 @@ pub enum MediaCommand {
     },
 }
 
-/// Hand-written so the TEMP-DIAG `queued_at` stamp does not take part in
+/// Hand-written so the `queued_at` stamp does not take part in
 /// equality: two commands carrying the same input are the same command
 /// whatever time they were queued, and tests compare them by value.
 impl PartialEq for MediaCommand {

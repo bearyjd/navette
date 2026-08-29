@@ -20,9 +20,10 @@ use navette_protocol::media::{
 use crate::media::{MediaCommand, MediaHub};
 
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(100);
-/// TEMP-DIAG: report an iteration, or a waiting keystroke, at or above this.
-/// 20ms is above the loop's 10ms dispatch floor but well below the ~45-125ms
-/// of lateness the repeat bursts imply.
+/// Report an iteration, or a waiting keystroke, at or above this. 20ms is
+/// above the loop's 10ms dispatch floor and well below wprsd's 200ms key
+/// repeat delay, which is the threshold that actually matters: a release
+/// later than that makes the guest repeat the key.
 const LOOP_LAG_THRESHOLD_US: u128 = 20_000;
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -206,7 +207,7 @@ fn run_bridge(
     // where flushing achieves nothing.
     let outcome = (|| -> Result<()> {
         while !stop.load(Ordering::Acquire) && transport.is_connected() {
-            // TEMP-DIAG: phase-split iteration timing. Input is drained only
+            // Phase-split iteration timing. Input is drained only
             // after every scene message in this iteration is applied and
             // composited, so a keystroke arriving just after a drain waits a
             // whole iteration. `apply` and `compose` are timed separately
@@ -296,7 +297,7 @@ fn run_bridge(
                 worker.encode.submit(EncodeCommand::ForceKeyframeAll);
                 resize = None;
             }
-            // TEMP-DIAG: report only long iterations, plus every iteration in
+            // Report only long iterations, plus every iteration in
             // which a keystroke actually waited. A slow iteration with no
             // input pending costs nothing, so the two are logged together to
             // tell "the loop was slow" from "the loop was slow while input
