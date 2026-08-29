@@ -227,6 +227,7 @@ fn run_bridge(
             let mut compose_us = 0u128;
             let mut messages = 0u32;
             let mut composites = 0u32;
+            let mut stats = InputStats::default();
             let scene_start = Instant::now();
             for event in pending.drain(..) {
                 if let ChannelEvent::Msg(message) = event {
@@ -239,54 +240,51 @@ fn run_bridge(
                         Err(error) => tracing::warn!(%error, "rejected wprs scene message"),
                     }
                 }
+                // Between messages, not after the batch. `scene.apply` decodes a
+                // whole framebuffer per commit, so a batch is unbounded work and
+                // input queued behind it inherits that bound.
+                pump_input(
+                    &mut commands,
+                    &mut worker.input,
+                    &worker.scene,
+                    &worker.encode,
+                    &transport,
+                    &mut resize,
+                    &mut stats,
+                );
             }
             // One composite per surface for the whole batch, not one per commit.
             let compose_start = Instant::now();
-            composites += flush_composites(&mut worker);
+            let encode = Arc::clone(&worker.encode);
+            composites += flush_composites(&mut worker, |input, scene| {
+                pump_input(
+                    &mut commands,
+                    input,
+                    scene,
+                    &encode,
+                    &transport,
+                    &mut resize,
+                    &mut stats,
+                );
+            });
             compose_us += compose_start.elapsed().as_micros();
             let scene_us = scene_start.elapsed().as_micros();
-            let input_start = Instant::now();
-            let mut inputs = 0u32;
-            let mut worst_input_wait_us = 0u128;
-            while let Ok(command) = commands.try_recv() {
-                if let MediaCommand::Input { queued_at, .. } = &command {
-                    inputs += 1;
-                    worst_input_wait_us = worst_input_wait_us.max(queued_at.elapsed().as_micros());
-                }
-                match command {
-                    MediaCommand::Input {
-                        attachment_id,
-                        input: MediaInput::ViewportResize { width, height },
-                        ..
-                    } => {
-                        let _ = attachment_id;
-                        resize = Some((Instant::now(), width, height));
-                    }
-                    MediaCommand::Input {
-                        attachment_id: _,
-                        input: MediaInput::RequestKeyframe,
-                        ..
-                    } => {
-                        worker.encode.submit(EncodeCommand::ForceKeyframeAll);
-                    }
-                    MediaCommand::Input {
-                        attachment_id,
-                        input,
-                        ..
-                    } => {
-                        if let Err(error) =
-                            worker
-                                .input
-                                .apply(attachment_id, input, &worker.scene, &transport)
-                        {
-                            tracing::warn!(%error, "rejected scoped media input");
-                        }
-                    }
-                    MediaCommand::Disconnected { attachment_id } => {
-                        worker.input.disconnect(attachment_id, &transport)
-                    }
-                }
-            }
+            // A final pump catches anything that arrived after the last unit of
+            // work above.
+            pump_input(
+                &mut commands,
+                &mut worker.input,
+                &worker.scene,
+                &worker.encode,
+                &transport,
+                &mut resize,
+                &mut stats,
+            );
+            let InputStats {
+                inputs,
+                worst_wait_us: worst_input_wait_us,
+                busy_us: input_us,
+            } = stats;
             if let Some((requested, width, height)) = resize
                 && requested.elapsed() >= RESIZE_DEBOUNCE
             {
@@ -308,7 +306,6 @@ fn run_bridge(
             // input pending costs nothing, so the two are logged together to
             // tell "the loop was slow" from "the loop was slow while input
             // was waiting" -- which is the whole question.
-            let input_us = input_start.elapsed().as_micros();
             let total_us = iteration_start.elapsed().as_micros();
             if total_us >= LOOP_LAG_THRESHOLD_US || worst_input_wait_us >= LOOP_LAG_THRESHOLD_US {
                 tracing::debug!(
@@ -400,19 +397,93 @@ fn handle_scene_events(worker: &mut WorkerState, events: Vec<SceneEvent>) {
 /// Composites every toplevel owed one and submits the frames, returning how
 /// many were composited. One composite per surface however many commits it
 /// received, which is the point.
-fn flush_composites(worker: &mut WorkerState) -> u32 {
+///
+/// `between` runs after each composite. With several windows this loop is the
+/// longest uninterrupted stretch in an iteration -- one composite per window,
+/// ~45ms each -- so input has to be served inside it, not only after it.
+fn flush_composites(
+    worker: &mut WorkerState,
+    mut between: impl FnMut(&mut InputState, &Scene),
+) -> u32 {
     let mut composites = 0;
     for toplevel in std::mem::take(&mut worker.pending_composites) {
-        let Ok(frame) = worker.scene.compose_toplevel(toplevel) else {
-            continue;
-        };
-        composites += 1;
-        worker.encode.submit(EncodeCommand::Frame {
-            key: toplevel,
-            frame: normalize_frame(frame),
-        });
+        if let Ok(frame) = worker.scene.compose_toplevel(toplevel) {
+            composites += 1;
+            worker.encode.submit(EncodeCommand::Frame {
+                key: toplevel,
+                frame: normalize_frame(frame),
+            });
+        }
+        between(&mut worker.input, &worker.scene);
     }
     composites
+}
+
+/// What one iteration's input pumping cost and carried.
+#[derive(Default)]
+struct InputStats {
+    inputs: u32,
+    worst_wait_us: u128,
+    busy_us: u128,
+}
+
+/// Applies whatever input is queued right now, and returns immediately when
+/// there is none.
+///
+/// Called between every unit of work in the loop rather than once at the end of
+/// a batch. That is the whole point: applying input costs ~4us, but a keystroke
+/// that has to wait for a batch inherits the batch's cost, which scales with
+/// window count (each commit decodes a full framebuffer, each window owes a
+/// composite). Once that total clears the 200ms key repeat delay wprsd
+/// advertises, the guest starts repeating the held key. Bounding the wait to
+/// one unit of work removes the dependence on how many windows are painting,
+/// instead of just lowering the constant.
+fn pump_input(
+    commands: &mut tokio::sync::mpsc::Receiver<MediaCommand>,
+    input_state: &mut InputState,
+    scene: &Scene,
+    encode: &EncodeQueue,
+    transport: &WprsTransport,
+    resize: &mut Option<(Instant, u32, u32)>,
+    stats: &mut InputStats,
+) {
+    let started = Instant::now();
+    while let Ok(command) = commands.try_recv() {
+        if let MediaCommand::Input { queued_at, .. } = &command {
+            stats.inputs += 1;
+            stats.worst_wait_us = stats.worst_wait_us.max(queued_at.elapsed().as_micros());
+        }
+        match command {
+            MediaCommand::Input {
+                attachment_id,
+                input: MediaInput::ViewportResize { width, height },
+                ..
+            } => {
+                let _ = attachment_id;
+                *resize = Some((Instant::now(), width, height));
+            }
+            MediaCommand::Input {
+                attachment_id: _,
+                input: MediaInput::RequestKeyframe,
+                ..
+            } => {
+                encode.submit(EncodeCommand::ForceKeyframeAll);
+            }
+            MediaCommand::Input {
+                attachment_id,
+                input,
+                ..
+            } => {
+                if let Err(error) = input_state.apply(attachment_id, input, scene, transport) {
+                    tracing::warn!(%error, "rejected scoped media input");
+                }
+            }
+            MediaCommand::Disconnected { attachment_id } => {
+                input_state.disconnect(attachment_id, transport)
+            }
+        }
+    }
+    stats.busy_us += started.elapsed().as_micros();
 }
 
 fn encode_frame(
@@ -903,7 +974,9 @@ mod tests {
     /// they are in production.
     fn apply_scene_batch(worker: &mut WorkerState, events: Vec<SceneEvent>) {
         handle_scene_events(worker, events);
-        flush_composites(worker);
+        // No-op hook: production pumps input between composites, but these
+        // tests assert on what composition produces, not on input timing.
+        flush_composites(worker, |_, _| {});
     }
 
     /// The stream map the encode thread would own, held locally so a test can
@@ -1435,6 +1508,37 @@ mod tests {
         assert!(streams.is_empty());
     }
 
+    /// Input must be served *between* composites, not only after them.
+    ///
+    /// This is the property that bounds input latency. One composite per window
+    /// is already the floor after coalescing, so a batch of them costs
+    /// (windows x ~45ms); a keystroke that waits for the whole batch inherits
+    /// that, and past three windows it clears the 200ms key repeat delay wprsd
+    /// advertises and the guest starts repeating. Serving input between each
+    /// composite caps the wait at one composite regardless of window count.
+    #[test]
+    fn flush_composites_serves_input_between_each_composite() {
+        let mut worker = worker_fixture(scene_with_toplevels(&[(1, 1), (1, 2), (1, 3)]));
+        for surface_id in [1, 2, 3] {
+            handle_scene_events(
+                &mut worker,
+                vec![SceneEvent::SurfaceCommitted(SurfaceKey {
+                    client_id: 1,
+                    surface_id,
+                })],
+            );
+        }
+
+        let mut served = 0;
+        let composites = flush_composites(&mut worker, |_, _| served += 1);
+
+        assert_eq!(composites, 3, "three windows owe three composites");
+        assert_eq!(
+            served, 3,
+            "input must be pumped once per composite, not once for the whole batch"
+        );
+    }
+
     /// The point of the coalescing: many commits to one window in a single
     /// batch cost one composite, not one each.
     #[tokio::test]
@@ -1455,7 +1559,7 @@ mod tests {
             "ten commits to one window owe one composite"
         );
         assert_eq!(
-            flush_composites(&mut worker),
+            flush_composites(&mut worker, |_, _| {}),
             1,
             "and compositing the batch runs exactly once"
         );
