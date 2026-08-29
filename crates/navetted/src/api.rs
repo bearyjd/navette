@@ -740,7 +740,9 @@ mod tests {
             input.recv().await,
             Some(crate::media::MediaCommand::Input {
                 attachment_id: 1,
-                input: MediaInput::RequestKeyframe
+                input: MediaInput::RequestKeyframe,
+                // Ignored by `PartialEq`; any instant will do.
+                queued_at: std::time::Instant::now()
             })
         );
         server.abort();

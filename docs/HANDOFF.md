@@ -997,6 +997,111 @@ Read the branch as "removes a ~600ms input stall, shrinks the repeat burst by
 worth landing on its own; it is not a fix for the headline symptom, and the
 PR should not claim to be one.
 
+## SOLVED: the residual was wasted composition, not composition (2026-08-29)
+
+Branch `perf/localise-bridge-loop-residual`, off #12. **The headline symptom
+is gone: three consecutive clean e2e runs, 6/6 each, 18 bursts, zero
+corruption** — against 5-of-6 runs corrupted immediately before.
+
+### What the probe showed
+
+`MediaCommand::Input` now carries a `queued_at` stamp from the producer, so
+the drain reports how long a keystroke *actually* waited instead of inferring
+it from iteration duration. That distinction is what found this: it separates
+"the loop was slow" from "the loop was slow while input was waiting".
+
+Four runs, 218-227 records each, parser cross-checked against a raw substring
+count per the ANSI trap recorded earlier. Applying input costs ~4us and
+`dispatch` is a non-factor, so neither the input path nor the 10ms timeout was
+implicated. Composition was, at up to 503ms in one iteration, with keystrokes
+waiting up to **528ms** behind it.
+
+**But the composite counter is what changed the fix.** Composites came out at
+exactly half the message count (20->10, 18->9, 6->3 — two wprs messages per
+commit), all for the *same* toplevel, ~40ms each. The encode queue coalesces
+those to one frame per surface. So nine of every ten composites produced a
+frame nothing ever encoded, while input sat behind all of them.
+
+### The fix, and why the planned one was wrong
+
+The plan said "move composition off the loop". That would have relocated 100%
+of the cost at the price of getting `&scene` to another thread. Instead, stop
+doing the work: a commit records that its toplevel *owes* a composite, and
+`flush_composites` runs once at the end of the batch, compositing each owed
+surface exactly once. Composition stays on the loop; a burst of N commits to
+one window now costs one composite instead of N.
+
+| | pre-fix max | post-fix max |
+|---|---|---|
+| `compose_us` | 503,420 | 100,785 |
+| `worst_input_wait_us` | **528,176** | **64,973** |
+
+**Why that eliminates the symptom rather than shrinking it.** wprsd advertises
+`repeat_delay=200` (`wprsd.rs:281`), so a guest repeats a held key only if its
+release is more than 200ms late. Pre-fix waits of 358-528ms cleared that bar
+and repeated; post-fix the worst wait is ~65ms, comfortably under it, so the
+repeat timer never starts. The margin is ~3x, which is why 6/6 reads as causal
+rather than lucky.
+
+### Ordering hazard, handled
+
+Deferring composition creates a hazard the immediate version could not have: a
+commit and a destroy for the same surface in one batch would composite *after*
+the `EndStream`, and the queue's EndStream handling only drops frames already
+queued — so that late frame would open a fresh stream for a dead window.
+`SurfaceDestroyed` drops the owed composite and `ClientDisconnected` drops the
+client's. A destroyed *subsurface* is deliberately not dropped: the set holds
+toplevels, so its ancestor stays owed and still recomposites. Both guards are
+covered by tests verified to fail when removed — the hazard is real, not
+theoretical.
+
+### Still true after this
+
+The probe is kept rather than removed (same call as the client's committed
+`poll tick fired late`); it is debug-level, so it costs an `Instant::now()`
+per input and nothing else. The harness still aborts roughly a third of runs
+with `no window`.
+
+### The fix holds for ONE window. It does not hold for three.
+
+Measured, not assumed, and it is the honest limit of everything above. A
+three-window guest (`multiguest.sh` — all three painting continuously at
+10Hz, *all three recording*, since only the focused viewer window receives
+keys and which one sway focuses is not controllable) brings the defect back:
+
+| windows | fox score | `apply_us` max | `compose_us` max | `worst_input_wait_us` max |
+|---|---|---|---|---|
+| 1 | 6/6, 6/6, 6/6 | 41,314 | 100,785 | **64,973** |
+| 3 | 6/6, **3/6**, **3/6** | 239,288 | 168,001 | **339,490** |
+
+Bursts up to 39 characters at three windows. The 200ms `repeat_delay` is the
+line: single-window waits (~65ms) sit a comfortable 3x under it, three-window
+waits (277-339ms) clear it, and the guest repeats.
+
+**Coalescing behaves exactly as designed — that is the problem.** It bounds
+composition to one composite *per window* per batch, so `compose_us` in a bad
+iteration is ~135ms, almost exactly 3 x the ~45ms single-window figure. It
+scales linearly with the number of painting windows, and nothing bounds it
+below the repeat threshold.
+
+**And `scene.apply` is now the larger half** (126-239ms against compose's
+88-140ms). That was invisible at one window, where apply peaked at 41ms. It
+is untouched by any work so far and is not a composition problem, so the
+per-batch coalescing idea does not extend to it.
+
+**The likely general fix, not attempted:** drain `MediaCommand::Input`
+*between* messages rather than after the whole batch. That bounds input
+latency to one message's apply+compose (~10-45ms) regardless of batch size or
+window count, instead of to the batch total. It is a smaller change than
+moving composition off the loop and it removes the scaling dependence rather
+than lowering its constant. Check what applying input against a
+mid-batch scene does to `input.apply`'s surface lookups first — that is a
+correctness question, not a latency one.
+
+So: land the coalescing (it is a strict improvement and removes ~90% of a
+real waste), but **M2's gate should not be called closed on single-window
+evidence.** The symptom is gone for one window and returns at three.
+
 ## What's next
 
 Items 1-4 of the previous list are done and are kept below only as history.
