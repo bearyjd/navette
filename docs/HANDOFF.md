@@ -726,6 +726,49 @@ scratch `XDG_DATA_HOME`) instead. Also check for leftover `wprsd` processes
 from earlier runs: one holding an X display makes new sessions die with
 "failed to start xwayland: Could not find a free socket".
 
+### Open review findings, accepted but not fixed
+
+Recorded here because the review artifacts they came from
+(`.claude/PRPs/reviews/`) are deliberately git-ignored and exist only on the
+machine that produced them. Labels are the review's own; note they collide
+with the M2 *milestone* name and are unrelated to it.
+
+From the PR #7 review (input path):
+
+- **Press can overtake a queued release of the same key.** The viewer runs a
+  multi-threaded runtime and the connection task drains input on another
+  worker, so a permit can free between two sends inside one tick. A release
+  that failed and was re-queued can therefore be overtaken by a later press
+  of the same key, which the bridge's dedup then drops as redundant — turning
+  what used to be a harmless duplicate keydown into a silently lost
+  keystroke.
+- **The dedup enforces a per-attachment invariant on a global seat.**
+  `pressed_keys` is keyed by attachment, but the wire carries no attachment
+  identity, so two attachments pressing the same keycode both forward and the
+  guest sees two keydowns with no release between — exactly what the dedup
+  exists to prevent. Multi-attachment is supported and tested elsewhere.
+- **`KeyRepeat::No` removed an accidental recovery.** Under `KeyRepeat::Yes` a
+  press lost to backpressure was re-reported by minifb's own typematic
+  repeat, so a held key healed itself. It no longer does, and a dropped press
+  is not retried. The change is still correct; the point is that
+  `must_redeliver`'s "a dropped press is only a missed input" was reasoned
+  against behaviour the same change removed. Same failure surface as the
+  press-and-release-inside-one-cycle gap above.
+- **The bridge flush desyncs bridge from viewer.** `release_all_held` releases
+  keys the physical keyboard may still hold and clears tracking, while a
+  still-running viewer keeps its own `held_keys`. Its next real release then
+  arrives for a keycode the bridge no longer tracks and lands on the
+  untracked-release debug path — expected there, not an anomaly, and worth a
+  note beside that log so it is not chased as a bug.
+
+From the PR #10 review (decode path):
+
+- **Input delivery latency is bounded by the packet queue.** Once
+  `PACKET_QUEUE_CAPACITY` (or the byte budget) is exhausted the connection
+  task parks handing over a packet and stops draining input again — the same
+  stall, deferred. Closing it entirely means the router owning its own task
+  and the socket read never waiting on it.
+
 ### Two notes for whoever reads this next
 
 - **The previous session's "tick starvation" hypothesis was half right, and

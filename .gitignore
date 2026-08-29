@@ -1,3 +1,7 @@
 /target
 /.omc
 /.superpowers
+
+# Agent working state: review artifacts, plans and scheduler locks.
+# Kept local on purpose; anything from them worth keeping goes in docs/.
+/.claude
