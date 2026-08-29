@@ -213,13 +213,14 @@ fn run_bridge(
     // where flushing achieves nothing.
     let outcome = (|| -> Result<()> {
         while !stop.load(Ordering::Acquire) && transport.is_connected() {
-            // Phase-split iteration timing. Input is drained only
-            // after every scene message in this iteration is applied and
-            // composited, so a keystroke arriving just after a drain waits a
-            // whole iteration. `apply` and `compose` are timed separately
-            // because they are different suspects with different fixes: if the
-            // time is in `apply` (incoming buffers), moving composition off
-            // the loop would fix nothing.
+            // Phase-split iteration timing. `apply` and `compose` are timed
+            // separately because they are different costs with different
+            // fixes, and `worst_input_wait_us` is tracked separately from both
+            // because it is the one that decides whether the guest repeats a
+            // key: an iteration may legitimately run long, so long as nothing
+            // was waiting on it. Input is pumped between every unit of work
+            // below, so the wait is bounded by one message or one composite
+            // rather than by the batch.
             let iteration_start = Instant::now();
             event_loop.dispatch(Some(Duration::from_millis(10)), &mut pending)?;
             let dispatch_us = iteration_start.elapsed().as_micros();
@@ -229,33 +230,25 @@ fn run_bridge(
             let mut composites = 0u32;
             let mut stats = InputStats::default();
             let scene_start = Instant::now();
-            for event in pending.drain(..) {
-                if let ChannelEvent::Msg(message) = event {
-                    messages += 1;
-                    let apply_start = Instant::now();
-                    let applied = worker.scene.apply(message);
-                    apply_us += apply_start.elapsed().as_micros();
-                    match applied {
-                        Ok(events) => handle_scene_events(&mut worker, events),
-                        Err(error) => tracing::warn!(%error, "rejected wprs scene message"),
-                    }
-                }
-                // Between messages, not after the batch. `scene.apply` decodes a
-                // whole framebuffer per commit, so a batch is unbounded work and
-                // input queued behind it inherits that bound.
+            let batch = pending.drain(..).filter_map(|event| match event {
+                ChannelEvent::Msg(message) => Some(message),
+                _ => None,
+            });
+            let applied = apply_scene_messages(&mut worker, batch, |input, scene| {
                 pump_input(
                     &mut commands,
-                    &mut worker.input,
-                    &worker.scene,
-                    &worker.encode,
+                    input,
+                    scene,
+                    &encode,
                     &transport,
                     &mut resize,
                     &mut stats,
                 );
-            }
+            });
+            messages += applied.0;
+            apply_us += applied.1;
             // One composite per surface for the whole batch, not one per commit.
             let compose_start = Instant::now();
-            let encode = Arc::clone(&worker.encode);
             composites += flush_composites(&mut worker, |input, scene| {
                 pump_input(
                     &mut commands,
@@ -392,6 +385,34 @@ fn handle_scene_events(worker: &mut WorkerState, events: Vec<SceneEvent>) {
             SceneEvent::CursorChanged | SceneEvent::CapabilitiesChanged => {}
         }
     }
+}
+
+/// Applies one batch of wprs messages, running `between` after each -- so input
+/// is served between messages, not after the batch. Returns how many messages
+/// were applied and how long `Scene::apply` took in total.
+///
+/// `between` runs after a rejected message too: a malformed message still
+/// consumed time, and input queued behind it should not wait for the rest of
+/// the batch because of it.
+fn apply_scene_messages(
+    worker: &mut WorkerState,
+    messages: impl IntoIterator<Item = wprs::serialization::RecvType<wprs::serialization::Request>>,
+    mut between: impl FnMut(&mut InputState, &Scene),
+) -> (u32, u128) {
+    let mut count = 0;
+    let mut apply_us = 0;
+    for message in messages {
+        count += 1;
+        let started = Instant::now();
+        let applied = worker.scene.apply(message);
+        apply_us += started.elapsed().as_micros();
+        match applied {
+            Ok(events) => handle_scene_events(worker, events),
+            Err(error) => tracing::warn!(%error, "rejected wprs scene message"),
+        }
+        between(&mut worker.input, &worker.scene);
+    }
+    (count, apply_us)
 }
 
 /// Composites every toplevel owed one and submits the frames, returning how
@@ -1506,6 +1527,33 @@ mod tests {
             "a surface destroyed in the same batch as its commit must publish nothing"
         );
         assert!(streams.is_empty());
+    }
+
+    /// The other half of the latency bound: input must be served between
+    /// *messages* too, and even after a message that was rejected.
+    ///
+    /// `Scene::apply` decodes a whole framebuffer per commit, so a batch is
+    /// unbounded work; a keystroke that waits for the batch inherits that
+    /// bound. The middle message here is a second consecutive raw buffer,
+    /// which the scene rejects as unpaired -- a rejected message still cost
+    /// time, so input behind it must not wait for the rest of the batch.
+    #[test]
+    fn applying_a_message_batch_serves_input_between_each_message() {
+        let mut worker = worker_fixture(Scene::default());
+        let batch = vec![
+            RecvType::RawBuffer(vec![0; 8]),
+            RecvType::RawBuffer(vec![0; 8]),
+            RecvType::RawBuffer(vec![0; 8]),
+        ];
+
+        let mut served = 0;
+        let (count, _) = apply_scene_messages(&mut worker, batch, |_, _| served += 1);
+
+        assert_eq!(count, 3);
+        assert_eq!(
+            served, 3,
+            "input must be pumped once per message, including after a rejected one"
+        );
     }
 
     /// Input must be served *between* composites, not only after them.
