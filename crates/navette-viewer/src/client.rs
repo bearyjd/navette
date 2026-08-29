@@ -1,8 +1,7 @@
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use navette_protocol::media::{
-    InputValidationError, MEDIA_HEADER_LEN, MEDIA_WEBSOCKET_SUBPROTOCOL, MediaInput, MediaKind,
-    MediaPacket,
+    InputValidationError, MEDIA_HEADER_LEN, MEDIA_WEBSOCKET_SUBPROTOCOL, MediaInput, MediaPacket,
 };
 use thiserror::Error;
 use tokio::net::TcpStream;
@@ -24,6 +23,19 @@ const EVENT_QUEUE_CAPACITY: usize = 32;
 /// while a frame is being decoded, and shallow enough that a queue this long
 /// means something is genuinely wrong.
 pub const INPUT_QUEUE_CAPACITY: usize = 64;
+
+/// Packets that may be waiting on the decode thread before the socket is
+/// slowed down.
+///
+/// This is the headroom that keeps input flowing while the decoder is busy:
+/// once it is exhausted the connection task parks handing over a packet and
+/// stops draining input again, which is the stall this split exists to
+/// remove. Sized against the worst real case measured -- a stream
+/// reconfigure spawning a fresh FFmpeg process, ~600ms, against a stream
+/// running at tens of packets a second -- with room to spare, since the cost
+/// of being generous is only buffered packets and the cost of being tight is
+/// the bug coming back.
+const PACKET_QUEUE_CAPACITY: usize = 128;
 const SUBPROTOCOL_HEADER: &str = "Sec-WebSocket-Protocol";
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -69,8 +81,17 @@ impl MediaClient {
         send_input(&mut sink, MediaInput::RequestKeyframe).await?;
         let (sender, events) = mpsc::channel(EVENT_QUEUE_CAPACITY);
         let (inputs, input_queue) = mpsc::channel(INPUT_QUEUE_CAPACITY);
+        let (packets, packet_queue) = mpsc::channel(PACKET_QUEUE_CAPACITY);
         let router = StreamRouter::new(factory);
-        let connection = tokio::spawn(run(stream, sink, router, sender, input_queue));
+        // The decode thread holds a sender for `inputs` so it can ask for a
+        // keyframe after a decode failure; that clone also means `inputs`
+        // outlives this constructor's local.
+        let keyframes = inputs.clone();
+        std::thread::Builder::new()
+            .name("navette-decode".to_owned())
+            .spawn(move || decode(router, packet_queue, sender, keyframes))
+            .map_err(ClientError::DecodeThread)?;
+        let connection = tokio::spawn(run(stream, sink, packets, input_queue));
         Ok(Self {
             events,
             inputs,
@@ -110,23 +131,36 @@ impl MediaClient {
 }
 
 impl Drop for MediaClient {
+    /// Aborting the connection task drops its packet sender, which closes the
+    /// decode thread's channel and lets that thread fall out of its loop on
+    /// its own. It is deliberately not joined: the thread may be inside a
+    /// blocking FFmpeg read, and blocking `drop` on it could stall the caller
+    /// for as long as a reconfigure takes.
     fn drop(&mut self) {
         self.connection.abort();
     }
 }
 
+/// Reads the socket and writes input to it, and does nothing that blocks.
+///
+/// Decoding used to happen inline here, which meant that while a packet was
+/// being decoded the `select!` had already committed to this branch and was
+/// no longer polling `inputs.recv()`. A stream reconfigure spawns a fresh
+/// FFmpeg process and waits ~600ms for it to prime, so every keystroke and
+/// pointer movement queued during that window sat undelivered until it
+/// finished. Decoding now happens on its own thread; this task only hands
+/// packets over, so input keeps flowing while the decoder works.
 async fn run(
     mut stream: SplitStream<Socket>,
     mut sink: Sink,
-    mut router: StreamRouter,
-    sender: mpsc::Sender<StreamEvent>,
+    packets: mpsc::Sender<MediaPacket>,
     mut inputs: mpsc::Receiver<MediaInput>,
 ) {
     loop {
         tokio::select! {
             message = stream.next() => {
                 let Some(message) = message else { break };
-                if !receive(message, &mut sink, &mut router, &sender).await {
+                if !receive(message, &packets).await {
                     break;
                 }
             }
@@ -143,34 +177,66 @@ async fn run(
     tracing::debug!("media connection closed");
 }
 
-/// Runs blocking work without stalling the rest of the runtime.
+/// Owns the decode pipeline, on a thread of its own.
 ///
-/// `block_in_place` is only legal on the multi-threaded runtime and panics
-/// elsewhere, so the flavour is checked rather than assumed: a caller driving
-/// this client from a current-thread runtime (the integration tests do) gets
-/// the work run inline instead.
+/// A real thread rather than a task because this work is *inherently*
+/// blocking -- it writes to FFmpeg's stdin, reads frames back, and on a
+/// reconfigure spawns a new process and waits for it to prime. Blocking
+/// inside an async task is what previously stalled every timer in the
+/// process: exactly one runtime worker at a time holds tokio's I/O+time
+/// driver, and when that worker's task blocks nothing re-enters the driver,
+/// so `tokio::time` stops firing entirely. Giving the pipeline its own thread
+/// removes that failure mode rather than mitigating it.
 ///
-/// That fallback degrades silently, and deliberately: the closure runs either
-/// way, so behaviour is identical and only the runtime's responsiveness
-/// differs. It cannot promise anything about the caller, though -- a
-/// current-thread runtime with other timers on it would see those stall for
-/// the duration, exactly as this function exists to prevent elsewhere.
-fn without_starving_the_runtime<T>(work: impl FnOnce() -> T) -> T {
-    use tokio::runtime::{Handle, RuntimeFlavor};
-
-    match Handle::try_current().map(|handle| handle.runtime_flavor()) {
-        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
-        _ => work(),
+/// Exits when `packets` closes, which happens once the connection task is
+/// gone and its sender drops.
+fn decode(
+    mut router: StreamRouter,
+    mut packets: mpsc::Receiver<MediaPacket>,
+    events: mpsc::Sender<StreamEvent>,
+    inputs: mpsc::Sender<MediaInput>,
+) {
+    while let Some(packet) = packets.blocking_recv() {
+        let decoded = router.handle(&packet);
+        // Accounting first, and from this same thread, so a packet's wire
+        // cost is always reported before whatever it decoded into.
+        // `observe` reads the router's metrics *after* `handle` updated them.
+        let observation = observe(&packet, &router);
+        if events
+            .blocking_send(StreamEvent::Packet(observation))
+            .is_err()
+        {
+            break;
+        }
+        for event in decoded {
+            if let StreamEvent::DecodeFailed { stream_id } = event {
+                tracing::info!(stream_id, "requesting a keyframe after a decode failure");
+                // `try_send`, never a blocking send: `inputs` is drained only
+                // by the connection task, which may itself be parked handing
+                // this thread a packet. Blocking here would close that loop
+                // into a deadlock. Dropping the request is self-healing --
+                // the decoder is still broken, so the next packet raises
+                // `DecodeFailed` again and asks anew.
+                if inputs.try_send(MediaInput::RequestKeyframe).is_err() {
+                    tracing::warn!(
+                        stream_id,
+                        "input queue full; deferring the keyframe request to the next failure"
+                    );
+                }
+            }
+            if events.blocking_send(event).is_err() {
+                return;
+            }
+        }
     }
+    tracing::debug!("decode pipeline stopped");
 }
 
-/// Routes one received WebSocket message. Returns `false` when the connection
-/// must be torn down.
+/// Hands one received WebSocket message to the decode thread. Returns `false`
+/// when the connection must be torn down.
 async fn receive(
     message: Result<Message, tokio_tungstenite::tungstenite::Error>,
-    sink: &mut Sink,
-    router: &mut StreamRouter,
-    sender: &mpsc::Sender<StreamEvent>,
+    packets: &mpsc::Sender<MediaPacket>,
 ) -> bool {
     let message = match message {
         Ok(message) => message,
@@ -180,75 +246,18 @@ async fn receive(
         }
     };
     match message {
-        Message::Binary(bytes) => {
-            let packet = match MediaPacket::decode(&bytes) {
-                Ok(packet) => packet,
-                Err(error) => {
-                    tracing::warn!(%error, "discarding malformed media packet");
-                    return true;
-                }
-            };
-            // One packet can drain several buffered frames at once (the
-            // decode pipeline runs a few access units behind), so every
-            // event it produces is forwarded in order rather than at
-            // most one.
-            // `router.handle` is synchronous and genuinely blocking: it
-            // writes to FFmpeg's stdin, reads decoded frames back, and on a
-            // stream reconfigure spawns a whole new FFmpeg process and waits
-            // for it to prime -- measured at ~600ms against a real session.
-            //
-            // Running that on a worker does not "starve the runtime" in the
-            // obvious sense; this machine has 22 workers and one spawned
-            // task. The damage is narrower. Exactly one worker at a time
-            // holds tokio's I/O+time driver (it sits behind a `try_lock`,
-            // and the others park on a condvar). When the worker holding it
-            // stops parking because its task went blocking, nothing re-enters
-            // the driver: tokio's eager driver-handoff path is compiled out
-            // unless `tokio_unstable` is set, which this workspace does not
-            // set. The *time* driver therefore stops being polled and every
-            // timer in the process stops firing -- including the `interval`
-            // driving the viewer's input poll, and `tokio::signal::ctrl_c`.
-            //
-            // `block_in_place` hands this worker's core to a fresh thread,
-            // which finds no work, parks, and takes the driver -- repairing
-            // exactly what broke. It is used rather than `spawn_blocking`
-            // because the closure borrows `router` and `packet`, so moving it
-            // to another thread is a `'static` problem requiring the router
-            // to be owned elsewhere; `Send` is not the obstacle (`Decoder` is
-            // already `Send`). That distinction matters: a router-owning task
-            // fed by a channel is the shape that would also fix the gap
-            // below, and it is available.
-            //
-            // SCOPE: this restores the *cadence* of input sampling, not the
-            // *latency* of input delivery. While this branch is blocked the
-            // select's sibling `inputs.recv()` branch is not polled either,
-            // so queued input still waits for `router.handle` to return.
-            // Closing that needs the router moved off this task entirely.
-            //
-            // Metrics packets are a no-op in `router.handle`, so they skip
-            // the core handoff rather than paying one ~50 times a second.
-            let events = if matches!(packet.header.kind, MediaKind::Metrics) {
-                router.handle(&packet)
-            } else {
-                without_starving_the_runtime(|| router.handle(&packet))
-            };
-            let observation = observe(&packet, router);
-            if sender.send(StreamEvent::Packet(observation)).await.is_err() {
-                return false;
+        // Awaiting here is deliberate backpressure: a decoder that cannot
+        // keep up slows the socket rather than growing an unbounded backlog,
+        // which is the same contract this client has always had. It does mean
+        // input delivery stalls again once `PACKET_QUEUE_CAPACITY` is
+        // exhausted, so that capacity is sized against a real reconfigure.
+        Message::Binary(bytes) => match MediaPacket::decode(&bytes) {
+            Ok(packet) => packets.send(packet).await.is_ok(),
+            Err(error) => {
+                tracing::warn!(%error, "discarding malformed media packet");
+                true
             }
-            for event in events {
-                if let StreamEvent::DecodeFailed { stream_id } = event {
-                    tracing::info!(stream_id, "requesting a keyframe after a decode failure");
-                    if send_input(sink, MediaInput::RequestKeyframe).await.is_err() {
-                        return false;
-                    }
-                }
-                if sender.send(event).await.is_err() {
-                    return false;
-                }
-            }
-            true
-        }
+        },
         // The server reports protocol problems as JSON text; they are
         // informational and must not take the connection down.
         Message::Text(text) => {
@@ -260,9 +269,6 @@ async fn receive(
     }
 }
 
-/// Snapshots what a packet cost on the wire, plus its stream's decoder
-/// counters as they stand *after* it was routed, so a HUD sees this packet's
-/// own decode timing.
 fn observe(packet: &MediaPacket, router: &StreamRouter) -> StreamPacket {
     StreamPacket {
         stream_id: packet.header.stream_id,
@@ -293,6 +299,8 @@ pub enum ClientError {
     Send(Box<tokio_tungstenite::tungstenite::Error>),
     #[error("refusing to send out-of-range input: {0}")]
     InvalidInput(InputValidationError),
+    #[error("failed to start the decode thread: {0}")]
+    DecodeThread(std::io::Error),
     #[error("input queue is full; the connection is not keeping up")]
     InputBackpressure,
     #[error("the media connection has closed")]

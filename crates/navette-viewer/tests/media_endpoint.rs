@@ -12,8 +12,8 @@ use navette_protocol::media::{
 use navette_protocol::{App, Session, SessionStatus};
 use navette_viewer::client::INPUT_QUEUE_CAPACITY;
 use navette_viewer::{
-    ClientError, Decoder, DecoderConfig, FakeDecoder, MediaClient, StreamEvent, StreamFrame,
-    media_url,
+    ClientError, DecodedFrame, Decoder, DecoderConfig, DecoderError, DecoderMetrics, FakeDecoder,
+    MediaClient, StreamEvent, StreamFrame, media_url,
 };
 use navetted::api::{ApiState, router};
 use navetted::app_index::AppIndex;
@@ -136,16 +136,131 @@ async fn next_frame(client: &mut MediaClient) -> StreamFrame {
     }
 }
 
-/// The same flow on a multi-threaded runtime, which is the flavour the
-/// binary actually uses (`#[tokio::main]` defaults to it).
+/// A decoder that parks in `decode` until released, so a test can hold the
+/// decode pipeline mid-packet and observe what the rest of the client does
+/// while it is stuck.
+struct BlockingDecoder {
+    config: DecoderConfig,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl Decoder for BlockingDecoder {
+    fn config(&self) -> &DecoderConfig {
+        &self.config
+    }
+
+    fn decode(&mut self, _access_unit: &[u8]) -> Result<Vec<DecodedFrame>, DecoderError> {
+        // Stands in for the real cost: a stream reconfigure spawning a fresh
+        // FFmpeg process, measured at ~600ms.
+        let _ = self.release.recv();
+        Ok(Vec::new())
+    }
+
+    fn drain(&mut self) -> Vec<DecodedFrame> {
+        Vec::new()
+    }
+
+    fn reconfigure(&mut self, config: DecoderConfig) -> Result<(), DecoderError> {
+        self.config = config;
+        Ok(())
+    }
+
+    fn metrics(&self) -> DecoderMetrics {
+        DecoderMetrics::default()
+    }
+}
+
+/// Input reaches the session while the decode pipeline is blocked.
 ///
-/// Worth its own test because the decode path takes a *different branch*
-/// there: `without_starving_the_runtime` calls `block_in_place` on
-/// multi-thread and runs inline everywhere else. Every other test drives this
-/// client from a current-thread runtime, so without this the production
-/// branch is exercised nowhere -- and `block_in_place` panics outright if it
-/// is ever reached on the wrong flavour, which would surface only in the
-/// released binary.
+/// This is the regression net for the defect that shipped in #8: decoding ran
+/// inline on the connection task, so while a packet was being decoded the
+/// `select!` had already committed to that branch and stopped polling
+/// `inputs.recv()`. Every keystroke queued during a ~600ms stream reconfigure
+/// sat undelivered until it finished. Decoding now owns a thread, so this
+/// asserts the property directly: hold the decoder mid-packet, send input,
+/// and require it on the wire *before* the decoder is released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn input_is_delivered_while_the_decoder_is_blocked() {
+    let temp = TempDir::new().unwrap();
+    let state = test_state(&temp);
+    add_running_session(&state, "work");
+    let mut input = state.media.register_session("work");
+    state
+        .media
+        .publish("work", stream_config_packet(1, 1))
+        .unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let hub = state.media.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router(state)).await.unwrap();
+    });
+
+    let (release, blocked) = std::sync::mpsc::channel();
+    let blocked = std::sync::Mutex::new(Some(blocked));
+    let url = media_url(&format!("ws://{address}"), "work");
+    let client = MediaClient::connect(
+        &url,
+        Box::new(move |config: &DecoderConfig| {
+            Ok(Box::new(BlockingDecoder {
+                config: config.clone(),
+                release: blocked.lock().unwrap().take().expect("one decoder"),
+            }) as Box<dyn Decoder>)
+        }),
+    )
+    .await
+    .unwrap();
+
+    // The connect-time keyframe request, sent before any of this.
+    assert_eq!(
+        input.recv().await,
+        Some(MediaCommand::Input {
+            attachment_id: 1,
+            input: navette_protocol::media::MediaInput::RequestKeyframe,
+        })
+    );
+
+    // Wedge the decode pipeline inside this packet.
+    hub.publish("work", video_packet(1, 2)).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // The decoder is still parked. Input queued now must not wait for it.
+    client
+        .send_input(navette_protocol::media::MediaInput::ViewportResize {
+            width: 800,
+            height: 600,
+        })
+        .unwrap();
+
+    let delivered = tokio::time::timeout(std::time::Duration::from_secs(2), input.recv())
+        .await
+        .expect("input must reach the session while the decoder is blocked");
+    assert_eq!(
+        delivered,
+        Some(MediaCommand::Input {
+            attachment_id: 1,
+            input: navette_protocol::media::MediaInput::ViewportResize {
+                width: 800,
+                height: 600,
+            },
+        })
+    );
+
+    // Only now let the decoder go, proving it really was parked throughout.
+    drop(release);
+    server.abort();
+}
+
+/// The same flow on a multi-threaded runtime, which is the flavour the binary
+/// actually uses (`#[tokio::main]` defaults to it).
+///
+/// It used to guard a runtime-flavour branch in the decode path; that branch
+/// is gone now that decoding owns a thread instead of borrowing a runtime
+/// worker. It is kept because it is still the only coverage of this client
+/// under the flavour production runs on, and the decode split it now exercises
+/// -- a real thread handing frames back over a channel -- has more moving
+/// parts across threads than the version it replaced, not fewer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_decodes_on_a_multi_thread_runtime() {
     let temp = TempDir::new().unwrap();
