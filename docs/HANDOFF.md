@@ -792,28 +792,35 @@ From the PR #10 review (decode path):
 
 ## What's next
 
-1. **Unblock the environment**: `sudo dnf install -y libxkbcommon-devel`,
-   then `cargo build --workspace` to confirm everything (today's
-   instrumentation included) compiles clean. Then build `wprsd`/`wprsc`
-   fresh from `bearyjd/wprs` (not vendored in this repo), and set up
-   `ydotoold` + `/dev/uinput` access (or fall back to a human-at-keyboard
-   run).
-2. **Finish root-causing "rapid typing + resize still repeats"** using the
-   instrumentation above once the environment is unblocked — script a
-   rollover-during-resize burst and watch for `"poll tick fired late"`,
-   `"delivered a retried release"`, and `"keyboard release for a keycode
-   not tracked as pressed"` in the logs.
-3. **Decide what to do with the uncommitted working-tree diff** (7 files
-   now: `native.rs`, `main.rs`, `bridge.rs` ×2, `input.rs`,
-   `Cargo.toml`/`Cargo.lock` — the minifb pin plus the new `tracing` dep
-   in `navette-bridge`). All of it is real, tested, verified fixes plus
-   diagnostics, except the resize+rapid-typing symptom isn't fully closed
-   — commit now and keep iterating on a follow-up, or hold off. Either
-   way don't lose it.
-4. **Track [emoon/rust_minifb#429](https://github.com/emoon/rust_minifb/pull/429)**
-   until it merges, then drop the fork.
-5. PR6's gate report: endurance run, LAN/tailnet numbers, write-up (the
-   data already collected earlier in this doc covers most of it).
-6. After M2's gate closes: M3 (Android client) is the next milestone, and
+Items 1-4 of the previous list are done and are kept below only as history.
+As of 2026-08-29 the remaining work is:
+
+1. **PR6's gate report.** The endurance and LAN/tailnet data exist, but were
+   taken on 2026-08-26 against code that has since changed materially (PRs
+   #7-#10 altered the scene graph, the input path, minifb, and moved decoding
+   onto its own thread). Re-run the endurance gate against master before
+   citing it. See `docs/superpowers/reports/`.
+2. **A human at a keyboard, once.** Every key-edge result is from the minifb
+   layer or a scripted harness. Nobody has typed into a real navette window
+   during a resize since the fixes landed. The harness makes this cheap now.
+3. **The open review findings** recorded above -- none blocking, all with a
+   concrete failure scenario written down.
+4. **Repin minifb to a crates.io version** once upstream ships a release
+   containing #429. Blocked on emoon, not on us; 0.28.0 predates the merge.
+5. **M3, the Android client** -- the milestone the roadmap treats as the real
+   product moment. Everything so far has been proving the plumbing works.
+
+### Done (2026-08-29), kept for context
+
+- Environment unblocked: `libxkbcommon-devel` was already present, `/dev/uinput`
+  turned out writable via the `nobody` group, and the pinned wprs rev was
+  already in cargo's git cache.
+- "Rapid typing + resize repeats" root-caused, fixed upstream, and merged --
+  it was minifb, not navette. See the section above.
+- The uncommitted working-tree diff landed as PR #7.
+- emoon/rust_minifb#429 merged upstream, so the fork is gone (PR #9).
+- The 622ms poll-cycle stall root-caused and fixed (PRs #8 and #10), verified
+  against a real stack.
+
    the one the roadmap treats as the real product moment — everything
    before it is proving the plumbing works.
