@@ -170,67 +170,90 @@ fn run_bridge(
     };
     let mut resize: Option<(Instant, u32, u32)> = None;
 
-    while !stop.load(Ordering::Acquire) && transport.is_connected() {
-        event_loop.dispatch(Some(Duration::from_millis(10)), &mut pending)?;
-        for event in pending.drain(..) {
-            if let ChannelEvent::Msg(message) = event {
-                match worker.scene.apply(message) {
-                    Ok(events) => handle_scene_events(session, &media, &mut worker, events),
-                    Err(error) => tracing::warn!(%error, "rejected wprs scene message"),
-                }
-            }
-        }
-        while let Ok(command) = commands.try_recv() {
-            match command {
-                MediaCommand::Input {
-                    attachment_id,
-                    input: MediaInput::ViewportResize { width, height },
-                } => {
-                    let _ = attachment_id;
-                    resize = Some((Instant::now(), width, height));
-                }
-                MediaCommand::Input {
-                    attachment_id: _,
-                    input: MediaInput::RequestKeyframe,
-                } => {
-                    for stream in worker.streams.values_mut() {
-                        stream.force_keyframe = true;
+    // The loop is wrapped so the flush below runs on *every* exit. The
+    // `?` on `dispatch` used to return straight out of this function, and
+    // that -- a worker dying while navetted survives, so a later `start`
+    // can bring a fresh one up against a live wprsd -- is precisely the
+    // case the flush exists for. It was reachable only on the two paths
+    // where flushing achieves nothing.
+    let outcome = (|| -> Result<()> {
+        while !stop.load(Ordering::Acquire) && transport.is_connected() {
+            event_loop.dispatch(Some(Duration::from_millis(10)), &mut pending)?;
+            for event in pending.drain(..) {
+                if let ChannelEvent::Msg(message) = event {
+                    match worker.scene.apply(message) {
+                        Ok(events) => handle_scene_events(session, &media, &mut worker, events),
+                        Err(error) => tracing::warn!(%error, "rejected wprs scene message"),
                     }
                 }
-                MediaCommand::Input {
-                    attachment_id,
-                    input,
-                } => {
-                    if let Err(error) =
-                        worker
-                            .input
-                            .apply(attachment_id, input, &worker.scene, &transport)
-                    {
-                        tracing::warn!(%error, "rejected scoped media input");
+            }
+            while let Ok(command) = commands.try_recv() {
+                match command {
+                    MediaCommand::Input {
+                        attachment_id,
+                        input: MediaInput::ViewportResize { width, height },
+                    } => {
+                        let _ = attachment_id;
+                        resize = Some((Instant::now(), width, height));
+                    }
+                    MediaCommand::Input {
+                        attachment_id: _,
+                        input: MediaInput::RequestKeyframe,
+                    } => {
+                        for stream in worker.streams.values_mut() {
+                            stream.force_keyframe = true;
+                        }
+                    }
+                    MediaCommand::Input {
+                        attachment_id,
+                        input,
+                    } => {
+                        if let Err(error) =
+                            worker
+                                .input
+                                .apply(attachment_id, input, &worker.scene, &transport)
+                        {
+                            tracing::warn!(%error, "rejected scoped media input");
+                        }
+                    }
+                    MediaCommand::Disconnected { attachment_id } => {
+                        worker.input.disconnect(attachment_id, &transport)
                     }
                 }
-                MediaCommand::Disconnected { attachment_id } => {
-                    worker.input.disconnect(attachment_id, &transport)
-                }
+            }
+            if let Some((requested, width, height)) = resize
+                && requested.elapsed() >= RESIZE_DEBOUNCE
+            {
+                tracing::debug!(width, height, "applying debounced viewport resize");
+                worker
+                    .input
+                    .apply(
+                        0,
+                        MediaInput::ViewportResize { width, height },
+                        &worker.scene,
+                        &transport,
+                    )
+                    .ok();
+                force_keyframe_on_all_streams(&mut worker.streams);
+                resize = None;
             }
         }
-        if let Some((requested, width, height)) = resize
-            && requested.elapsed() >= RESIZE_DEBOUNCE
-        {
-            worker
-                .input
-                .apply(
-                    0,
-                    MediaInput::ViewportResize { width, height },
-                    &worker.scene,
-                    &transport,
-                )
-                .ok();
-            force_keyframe_on_all_streams(&mut worker.streams);
-            resize = None;
-        }
-    }
-    Ok(())
+        Ok(())
+    })();
+    // A client that stays connected across a reconnect never sends
+    // `Disconnected`, so whatever it last pressed would otherwise read as
+    // held forever on the guest once this worker exits and a fresh one
+    // starts with empty tracking. Best-effort: if the transport already
+    // failed outright, these sends land nowhere, but that's no worse than
+    // the silent loss this replaces, and both a `stop`-triggered exit and a
+    // dispatch error (the transport possibly still healthy) recover cleanly.
+    //
+    // Note this deliberately desyncs the bridge from a viewer that is still
+    // running: the viewer keeps its own `held_keys`, so its next real release
+    // arrives for a keycode this side no longer tracks and shows up on the
+    // untracked-release path. That is expected here, not an anomaly.
+    worker.input.release_all_held(&transport);
+    outcome
 }
 
 fn handle_scene_events(

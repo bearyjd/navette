@@ -13,7 +13,19 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
-minifb = "0.28"
+# Pinned to a navette fork (upstream PR emoon/rust_minifb#429 pending, tracked
+# in HANDOFF.md) that fixes three real Wayland keyboard bugs found in live
+# testing:
+#   1. shifted-level keysyms (capitals, shifted punctuation) silently dropped
+#      instead of mapped to their physical key;
+#   2. a failed present skipping the key-repeat timer's advance;
+#   3. `key_handler.update()` running before the keyboard events it must
+#      account for, so under a slow poll cycle a press is lost, an unpaired
+#      release is reported, and the key stays latched down -- the root cause
+#      of the resize + rapid-typing repeat.
+# See the fork's navette-wayland-key-fixes branch, and
+# docs/patches/minifb-two-phase-keyhandler.patch for (3) specifically.
+minifb = { git = "https://github.com/bearyjd/rust_minifb.git", rev = "0b542006be72498c3af9bccab6d7ff1553764e73" }
 navette-protocol = { path = "../navette-protocol" }
 nix = { version = "0.30", features = ["signal"] }
 serde_json = "1"
@@ -21,7 +33,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 tokio-tungstenite = "0.30"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 axum = { version = "0.8", features = ["ws"] }
