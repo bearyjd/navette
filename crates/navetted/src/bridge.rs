@@ -159,6 +159,12 @@ struct WorkerState {
     /// batch, so a keystroke waits behind every one of them (measured: up to
     /// 528ms). Collecting here and compositing once per surface at the end of
     /// the batch removes the discarded work rather than relocating it.
+    ///
+    /// Note the flush order is by `SurfaceKey`, not by arrival: coalescing
+    /// means a surface has no single arrival time anyway. Nothing depends on
+    /// the order today -- each surface owns a separate stream, so frames for
+    /// different surfaces are independent -- but a future requirement to
+    /// composite in arrival order needs a different container, not a tweak.
     pending_composites: std::collections::BTreeSet<SurfaceKey>,
 }
 
