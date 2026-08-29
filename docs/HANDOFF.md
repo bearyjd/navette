@@ -1102,6 +1102,58 @@ So: land the coalescing (it is a strict improvement and removes ~90% of a
 real waste), but **M2's gate should not be called closed on single-window
 evidence.** The symptom is gone for one window and returns at three.
 
+## FIXED at three windows too: bound the wait, don't shrink the work (2026-08-29)
+
+Branch `perf/bound-input-latency`. Three-window guest: **4/4 runs at 6/6**,
+against 6/6, 3/6, 3/6 before.
+
+**The framing "fix the scene.apply bottleneck" was wrong, and optimising apply
+would not have fixed this.** Input latency was unbounded *by construction*:
+`run_bridge` drained `MediaCommand::Input` only after every message in a batch
+and then every owed composite, so a keystroke inherited the whole batch's
+cost. That cost scales with window count -- each commit decodes a full
+framebuffer, each painting window owes a composite -- and once it clears
+wprsd's 200ms repeat delay the guest repeats. Coalescing lowered the constant.
+It never bounded the wait. That is why the symptom returned at three windows
+even with composition already doing the minimum work possible.
+
+`pump_input` now runs between messages *and* between composites.
+
+| 3 windows | before | after |
+|---|---|---|
+| `worst_input_wait_us` max | 339,490 | **46,803 / 29,490** |
+| `total_us` max | 375,819 | 355,980 / 392,356 |
+| `apply_us` max | 239,288 | 186,316 / 202,674 |
+| `compose_us` max | 168,001 | 171,472 / 189,480 |
+
+**Read the second row before the first.** Total iteration time is *unchanged*
+and composition is *unchanged* -- the batch is exactly as expensive as it was.
+Input wait still fell 7-11x, to a ~4x margin under the 200ms line. That is the
+signature of the right fix: latency decoupled from batch duration rather than
+the batch made faster. It removes the dependence on window count instead of
+lowering its constant, so a fourth and fifth window do not re-break it.
+
+**Safety of draining mid-batch:** `InputState::apply` only does read-only point
+lookups (`validate_surface`, `surface_dimensions`), and each message's scene
+update completes atomically, so the scene is always internally consistent. For
+pointer input it is arguably *more* correct -- coordinates are clamped against
+the dimensions the client actually saw, not a frame composited later in the
+same batch.
+
+**Also fixed, separately:** `apply_surface` cloned the previous surface image
+on every commit, but `decode_assignment` carries it forward only when the
+commit brings no buffer of its own. Every ordinary repaint deep-copied a whole
+framebuffer and dropped it. Guarding on `state.buffer.is_none()` accounts for
+the ~20% fall in `apply_us` above. Real waste on the hottest path, but not the
+root cause -- worth separating, because fixing only this would have left the
+defect in place.
+
+**Still true:** iterations still run 350-390ms at three windows, and `apply`
+(~186ms) plus `compose` (~171ms) are what fill them. Nothing there is a symptom
+any more, but a guest with many more windows would push frame *throughput*
+down even though input stays responsive. That is a different problem from this
+one and should not be conflated with it again.
+
 ## What's next
 
 Items 1-4 of the previous list are done and are kept below only as history.
