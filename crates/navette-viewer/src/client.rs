@@ -60,9 +60,10 @@ type Sink = SplitSink<Socket, Message>;
 /// The client owns the socket and a [`StreamRouter`]; decoded frames and
 /// stream lifecycle events are handed to the caller through a bounded channel,
 /// so a consumer that falls behind exerts backpressure on the socket instead
-/// of growing an unbounded backlog. Decoding runs on the connection task and
-/// briefly blocks it while FFmpeg works — acceptable for a validation client,
-/// which decodes a handful of small streams.
+/// of growing an unbounded backlog. Decoding runs on a thread of its own
+/// rather than on the connection task: it blocks for as long as FFmpeg takes,
+/// which on a stream reconfigure is a process spawn, and doing that on the
+/// connection task stalled input delivery and every timer in the process.
 pub struct MediaClient {
     events: mpsc::Receiver<StreamEvent>,
     inputs: mpsc::Sender<MediaInput>,
@@ -98,15 +99,24 @@ impl MediaClient {
         let (packets, packet_queue) = mpsc::channel(PACKET_QUEUE_CAPACITY);
         let budget = Arc::new(Semaphore::new(PACKET_QUEUE_KIB as usize));
         let router = StreamRouter::new(factory);
-        // The decode thread holds a sender for `inputs` so it can ask for a
-        // keyframe after a decode failure; that clone also means `inputs`
-        // outlives this constructor's local.
-        let keyframes = inputs.clone();
+        // A dedicated one-slot channel for keyframe requests rather than a
+        // clone of `inputs`. Capacity one makes `Full` mean "a request is
+        // already pending", which is exactly right for an idempotent
+        // `RequestKeyframe`, and the connection task drains it from its own
+        // `select!` arm so the decode thread never has to block to be heard.
+        let (keyframes, keyframe_queue) = mpsc::channel(1);
         std::thread::Builder::new()
             .name("navette-decode".to_owned())
             .spawn(move || decode(router, packet_queue, sender, keyframes))
             .map_err(ClientError::DecodeThread)?;
-        let connection = tokio::spawn(run(stream, sink, packets, input_queue, budget));
+        let connection = tokio::spawn(run(
+            stream,
+            sink,
+            packets,
+            input_queue,
+            keyframe_queue,
+            budget,
+        ));
         Ok(Self {
             events,
             inputs,
@@ -175,6 +185,7 @@ async fn run(
     mut sink: Sink,
     packets: mpsc::Sender<QueuedPacket>,
     mut inputs: mpsc::Receiver<MediaInput>,
+    mut keyframes: mpsc::Receiver<()>,
     budget: Arc<Semaphore>,
 ) {
     loop {
@@ -182,6 +193,15 @@ async fn run(
             message = stream.next() => {
                 let Some(message) = message else { break };
                 if !receive(message, &packets, &budget).await {
+                    break;
+                }
+            }
+            // Recovery from a decode failure depends on this reaching the
+            // bridge: the router discards the decoder for a failed stream, so
+            // nothing rebuilds it until a fresh `stream_config` arrives, and
+            // nothing produces one until this request does.
+            Some(()) = keyframes.recv() => {
+                if send_input(&mut sink, MediaInput::RequestKeyframe).await.is_err() {
                     break;
                 }
             }
@@ -215,7 +235,7 @@ fn decode(
     mut router: StreamRouter,
     mut packets: mpsc::Receiver<QueuedPacket>,
     events: mpsc::Sender<StreamEvent>,
-    inputs: mpsc::Sender<MediaInput>,
+    keyframes: mpsc::Sender<()>,
 ) {
     // `permit` is held for the whole iteration and released with it, so the
     // budget reflects packets still owned by this thread, not merely queued.
@@ -234,17 +254,18 @@ fn decode(
         for event in decoded {
             if let StreamEvent::DecodeFailed { stream_id } = event {
                 tracing::info!(stream_id, "requesting a keyframe after a decode failure");
-                // `try_send`, never a blocking send: `inputs` is drained only
-                // by the connection task, which may itself be parked handing
-                // this thread a packet. Blocking here would close that loop
-                // into a deadlock. Dropping the request is self-healing --
-                // the decoder is still broken, so the next packet raises
-                // `DecodeFailed` again and asks anew.
-                if inputs.try_send(MediaInput::RequestKeyframe).is_err() {
-                    tracing::warn!(
-                        stream_id,
-                        "input queue full; deferring the keyframe request to the next failure"
-                    );
+                // Never a blocking send: the connection task drains this and
+                // may itself be parked handing this thread a packet, which
+                // would close into a deadlock. `Full` here is not a loss --
+                // the channel holds one slot and `RequestKeyframe` carries no
+                // stream identity, so a request is already queued and will be
+                // sent. This must not simply be dropped: the router discards
+                // a failed stream's decoder (`router.rs`), so `DecodeFailed`
+                // fires exactly once per decoder and nothing else asks again.
+                // Losing it leaves that surface black until the user resizes
+                // or reattaches.
+                if let Err(mpsc::error::TrySendError::Closed(())) = keyframes.try_send(()) {
+                    tracing::debug!(stream_id, "connection gone; cannot request a keyframe");
                 }
             }
             if events.blocking_send(event).is_err() {
@@ -387,23 +408,25 @@ mod tests {
         assert!(packet_queue.try_recv().is_ok(), "packet should be queued");
     }
 
-    /// A saturated input queue must not wedge the decode pipeline.
+    /// A keyframe request survives a busy connection instead of being lost.
     ///
-    /// The keyframe request after a decode failure travels up the same
-    /// `inputs` channel the viewer's own input uses, and that channel is
-    /// drained only by the connection task -- which may itself be parked
-    /// handing this thread a packet. A blocking send here closes that into a
-    /// deadlock, so the request is `try_send` and a full queue drops it.
+    /// This asserts the opposite of what it did when first written. The
+    /// original justified dropping the request as self-healing, on the theory
+    /// that the next packet would raise `DecodeFailed` again. It does not:
+    /// the router *removes* a failed stream's decoder, so every later video
+    /// packet for it is discarded as unconfigured and `DecodeFailed` fires
+    /// exactly once per decoder lifetime (`router.rs` has a test asserting
+    /// precisely that). Nothing rebuilds the decoder until a fresh
+    /// `stream_config` arrives, and nothing produces one until this request
+    /// reaches the bridge -- so losing it leaves that surface black until the
+    /// user resizes or reattaches.
     ///
-    /// This test holds `inputs` full for the whole run and requires the
-    /// decode loop to finish anyway.
+    /// The request therefore goes to a dedicated one-slot channel rather than
+    /// the shared input queue: it can never be crowded out by input, and
+    /// `Full` means "already pending" rather than "dropped".
     #[test]
-    fn a_full_input_queue_does_not_wedge_the_decode_thread() {
-        // Capacity one, pre-filled, receiver kept alive so `try_send` reports
-        // `Full` rather than `Closed`.
-        let (inputs, _input_rx) = mpsc::channel(1);
-        inputs.try_send(MediaInput::RequestKeyframe).unwrap();
-
+    fn a_decode_failure_always_produces_a_keyframe_request() {
+        let (keyframes, mut keyframe_queue) = mpsc::channel(1);
         let (packets, packet_queue) = mpsc::channel(4);
         let (events, mut event_rx) = mpsc::channel(16);
 
@@ -418,8 +441,6 @@ mod tests {
         }
         .encode()
         .unwrap();
-        // Packets travel with a budget permit; the values do not matter here,
-        // only that each carries one.
         let budget = Arc::new(Semaphore::new(8));
         let permit = |n| Arc::clone(&budget).try_acquire_many_owned(n).unwrap();
         packets
@@ -438,7 +459,7 @@ mod tests {
 
         let (done, finished) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            decode(router, packet_queue, events, inputs);
+            decode(router, packet_queue, events, keyframes);
             let _ = done.send(());
         });
 
@@ -446,10 +467,13 @@ mod tests {
             finished
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .is_ok(),
-            "decode loop wedged on a full input queue instead of dropping the keyframe request"
+            "decode loop wedged instead of completing"
+        );
+        assert!(
+            keyframe_queue.try_recv().is_ok(),
+            "a decode failure must always leave a keyframe request queued"
         );
 
-        // It also has to have done its job, not just exited.
         let mut saw_failure = false;
         while let Ok(event) = event_rx.try_recv() {
             if matches!(event, StreamEvent::DecodeFailed { .. }) {
