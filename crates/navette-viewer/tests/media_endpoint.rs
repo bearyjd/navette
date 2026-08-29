@@ -136,6 +136,94 @@ async fn next_frame(client: &mut MediaClient) -> StreamFrame {
     }
 }
 
+/// Signals on drop, so a test can observe the decode thread actually
+/// finishing rather than assuming it did.
+struct DropSignallingDecoder {
+    config: DecoderConfig,
+    _alive: std::sync::mpsc::Sender<()>,
+}
+
+impl Decoder for DropSignallingDecoder {
+    fn config(&self) -> &DecoderConfig {
+        &self.config
+    }
+    fn decode(&mut self, _access_unit: &[u8]) -> Result<Vec<DecodedFrame>, DecoderError> {
+        Ok(Vec::new())
+    }
+    fn drain(&mut self) -> Vec<DecodedFrame> {
+        Vec::new()
+    }
+    fn reconfigure(&mut self, config: DecoderConfig) -> Result<(), DecoderError> {
+        self.config = config;
+        Ok(())
+    }
+    fn metrics(&self) -> DecoderMetrics {
+        DecoderMetrics::default()
+    }
+}
+
+/// Dropping the client must stop the decode thread.
+///
+/// The thread cannot be aborted the way the old inline task could, so its
+/// shutdown is entirely by channel closure: dropping the client aborts the
+/// connection task, which drops the packet sender, which ends the thread's
+/// `blocking_recv`. If that reasoning were wrong every client would leak a
+/// thread parked in a blocking FFmpeg read, and nothing else in the suite
+/// would notice -- so this observes the decoder being dropped rather than
+/// trusting the argument.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_the_client_stops_the_decode_thread() {
+    let temp = TempDir::new().unwrap();
+    let state = test_state(&temp);
+    add_running_session(&state, "work");
+    let _input = state.media.register_session("work");
+    state
+        .media
+        .publish("work", stream_config_packet(1, 1))
+        .unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router(state)).await.unwrap();
+    });
+
+    // Held by the decoder; disconnects once the decoder is dropped, which
+    // only happens when the decode thread drops the router and exits.
+    let (alive, exited) = std::sync::mpsc::channel();
+    let alive = std::sync::Mutex::new(Some(alive));
+
+    let url = media_url(&format!("ws://{address}"), "work");
+    let client = MediaClient::connect(
+        &url,
+        Box::new(move |config: &DecoderConfig| {
+            Ok(Box::new(DropSignallingDecoder {
+                config: config.clone(),
+                _alive: alive.lock().unwrap().take().expect("one decoder"),
+            }) as Box<dyn Decoder>)
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Let the decoder actually get built before tearing down.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        exited.try_recv().is_err(),
+        "decoder should still be alive while the client is"
+    );
+
+    drop(client);
+
+    // `Disconnected` means the decoder was dropped: the thread left its loop.
+    match exited.recv_timeout(std::time::Duration::from_secs(5)) {
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+        other => panic!("decode thread did not exit after the client dropped: {other:?}"),
+    }
+
+    server.abort();
+}
+
 /// A decoder that parks in `decode` until released, so a test can hold the
 /// decode pipeline mid-packet and observe what the rest of the client does
 /// while it is stuck.

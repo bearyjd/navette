@@ -1,11 +1,13 @@
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
+use std::sync::Arc;
+
 use navette_protocol::media::{
     InputValidationError, MEDIA_HEADER_LEN, MEDIA_WEBSOCKET_SUBPROTOCOL, MediaInput, MediaPacket,
 };
 use thiserror::Error;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -36,6 +38,18 @@ pub const INPUT_QUEUE_CAPACITY: usize = 64;
 /// of being generous is only buffered packets and the cost of being tight is
 /// the bug coming back.
 const PACKET_QUEUE_CAPACITY: usize = 128;
+
+/// Payload bytes allowed to sit queued for the decode thread, in KiB.
+///
+/// A count alone is not a memory bound: the protocol permits payloads up to
+/// `MAX_MEDIA_PAYLOAD` (16 MiB), so 128 queued packets is 2 GiB in the worst
+/// case a peer can construct, where before this queue existed only one packet
+/// was ever in flight. Real traffic is nothing like that -- measured against a
+/// live session, frames run a median of 1.6 KiB and a maximum of 18 KiB -- so
+/// this budget still buys hundreds of ordinary packets of headroom, far more
+/// than the ~32 needed to cover a reconfigure, while capping what a
+/// misbehaving or hostile server can make this client allocate.
+const PACKET_QUEUE_KIB: u32 = 8 * 1024;
 const SUBPROTOCOL_HEADER: &str = "Sec-WebSocket-Protocol";
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -82,6 +96,7 @@ impl MediaClient {
         let (sender, events) = mpsc::channel(EVENT_QUEUE_CAPACITY);
         let (inputs, input_queue) = mpsc::channel(INPUT_QUEUE_CAPACITY);
         let (packets, packet_queue) = mpsc::channel(PACKET_QUEUE_CAPACITY);
+        let budget = Arc::new(Semaphore::new(PACKET_QUEUE_KIB as usize));
         let router = StreamRouter::new(factory);
         // The decode thread holds a sender for `inputs` so it can ask for a
         // keyframe after a decode failure; that clone also means `inputs`
@@ -91,7 +106,7 @@ impl MediaClient {
             .name("navette-decode".to_owned())
             .spawn(move || decode(router, packet_queue, sender, keyframes))
             .map_err(ClientError::DecodeThread)?;
-        let connection = tokio::spawn(run(stream, sink, packets, input_queue));
+        let connection = tokio::spawn(run(stream, sink, packets, input_queue, budget));
         Ok(Self {
             events,
             inputs,
@@ -141,6 +156,11 @@ impl Drop for MediaClient {
     }
 }
 
+/// A packet plus the slice of the queue's byte budget it occupies. Dropping
+/// the permit returns that budget, so it is deliberately carried all the way
+/// to the end of the decode thread's work rather than released on receipt.
+type QueuedPacket = (MediaPacket, OwnedSemaphorePermit);
+
 /// Reads the socket and writes input to it, and does nothing that blocks.
 ///
 /// Decoding used to happen inline here, which meant that while a packet was
@@ -153,14 +173,15 @@ impl Drop for MediaClient {
 async fn run(
     mut stream: SplitStream<Socket>,
     mut sink: Sink,
-    packets: mpsc::Sender<MediaPacket>,
+    packets: mpsc::Sender<QueuedPacket>,
     mut inputs: mpsc::Receiver<MediaInput>,
+    budget: Arc<Semaphore>,
 ) {
     loop {
         tokio::select! {
             message = stream.next() => {
                 let Some(message) = message else { break };
-                if !receive(message, &packets).await {
+                if !receive(message, &packets, &budget).await {
                     break;
                 }
             }
@@ -192,11 +213,13 @@ async fn run(
 /// gone and its sender drops.
 fn decode(
     mut router: StreamRouter,
-    mut packets: mpsc::Receiver<MediaPacket>,
+    mut packets: mpsc::Receiver<QueuedPacket>,
     events: mpsc::Sender<StreamEvent>,
     inputs: mpsc::Sender<MediaInput>,
 ) {
-    while let Some(packet) = packets.blocking_recv() {
+    // `permit` is held for the whole iteration and released with it, so the
+    // budget reflects packets still owned by this thread, not merely queued.
+    while let Some((packet, _permit)) = packets.blocking_recv() {
         let decoded = router.handle(&packet);
         // Accounting first, and from this same thread, so a packet's wire
         // cost is always reported before whatever it decoded into.
@@ -236,7 +259,8 @@ fn decode(
 /// when the connection must be torn down.
 async fn receive(
     message: Result<Message, tokio_tungstenite::tungstenite::Error>,
-    packets: &mpsc::Sender<MediaPacket>,
+    packets: &mpsc::Sender<QueuedPacket>,
+    budget: &Arc<Semaphore>,
 ) -> bool {
     let message = match message {
         Ok(message) => message,
@@ -252,7 +276,17 @@ async fn receive(
         // input delivery stalls again once `PACKET_QUEUE_CAPACITY` is
         // exhausted, so that capacity is sized against a real reconfigure.
         Message::Binary(bytes) => match MediaPacket::decode(&bytes) {
-            Ok(packet) => packets.send(packet).await.is_ok(),
+            Ok(packet) => {
+                // Charged in KiB, always at least one, so a flood of empty
+                // packets is still bounded by the queue's own capacity.
+                let kib = u32::try_from(packet.payload.len().div_ceil(1024))
+                    .unwrap_or(u32::MAX)
+                    .clamp(1, PACKET_QUEUE_KIB);
+                let Ok(permit) = Arc::clone(budget).acquire_many_owned(kib).await else {
+                    return false;
+                };
+                packets.send((packet, permit)).await.is_ok()
+            }
             Err(error) => {
                 tracing::warn!(%error, "discarding malformed media packet");
                 true
@@ -326,6 +360,33 @@ mod tests {
         }
     }
 
+    /// A packet larger than the whole byte budget must still get through.
+    ///
+    /// Payloads are charged against a fixed budget, and the protocol allows a
+    /// single payload (up to `MAX_MEDIA_PAYLOAD`, 16 MiB) to exceed that
+    /// budget outright. Without the clamp, acquiring that many permits could
+    /// never succeed and the connection task would park forever on a packet
+    /// it is holding the only copy of -- a hang, not a slow path.
+    #[tokio::test]
+    async fn a_packet_larger_than_the_budget_is_still_queued() {
+        let (packets, mut packet_queue) = mpsc::channel(4);
+        let budget = Arc::new(Semaphore::new(PACKET_QUEUE_KIB as usize));
+
+        // One KiB past the entire budget.
+        let oversized = vec![0u8; (PACKET_QUEUE_KIB as usize + 1) * 1024];
+        let packet = MediaPacket::new(header(MediaKind::Video, 1), oversized).unwrap();
+        let encoded = packet.encode().unwrap();
+
+        let queued = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            receive(Ok(Message::Binary(encoded.into())), &packets, &budget),
+        )
+        .await
+        .expect("receive must not park forever on a packet bigger than the budget");
+        assert!(queued, "an oversized packet should still be handed on");
+        assert!(packet_queue.try_recv().is_ok(), "packet should be queued");
+    }
+
     /// A saturated input queue must not wedge the decode pipeline.
     ///
     /// The keyframe request after a decode failure travels up the same
@@ -357,13 +418,21 @@ mod tests {
         }
         .encode()
         .unwrap();
+        // Packets travel with a budget permit; the values do not matter here,
+        // only that each carries one.
+        let budget = Arc::new(Semaphore::new(8));
+        let permit = |n| Arc::clone(&budget).try_acquire_many_owned(n).unwrap();
         packets
-            .try_send(MediaPacket::new(header(MediaKind::StreamConfig, 1), config).unwrap())
+            .try_send((
+                MediaPacket::new(header(MediaKind::StreamConfig, 1), config).unwrap(),
+                permit(1),
+            ))
             .unwrap();
         packets
-            .try_send(
+            .try_send((
                 MediaPacket::new(header(MediaKind::Video, 2), vec![0, 0, 0, 1, 0x65, 9]).unwrap(),
-            )
+                permit(1),
+            ))
             .unwrap();
         drop(packets);
 
