@@ -790,6 +790,115 @@ From the PR #10 review (decode path):
   Left alone rather than churning unverified code on top of a confirmed
   finding.
 
+## Pick up here (written 2026-08-29, end of session)
+
+### The one open defect, fully localised
+
+**Typing during a resize still repeats characters**, about one burst in six.
+This is the milestone's headline symptom. It is *not* where it used to be.
+
+Ruled out, with evidence, not reasoning:
+
+- **minifb is clean.** Instrumenting `native.rs` at the `get_keys_pressed` /
+  `get_keys_released` boundary during a live run showed six matched
+  press/release pairs for the repeating key, one per burst. The upstream
+  two-phase fix works.
+- **The client is clean.** Same run: max poll cycle **7 ms**, zero dropped
+  inputs, zero retried releases, zero bridge-side releases for untracked
+  keycodes, no panic.
+- **The repeat is bounded** (~95 characters, then it stops). `wprsd`
+  advertises `repeat_delay=200 repeat_rate=200`, so a guest repeats a held key
+  *itself* until the release arrives. A lost release repeats forever; a late
+  one repeats and stops. So the release is **late by roughly half a second**,
+  not lost.
+
+**Where it is.** `run_bridge` (`crates/navetted/src/bridge.rs`) runs one loop
+that does all of: dispatch wprs events, apply scene events — which
+`compose_toplevel` *and* `encode_frame` — then drain `MediaCommand::Input`,
+then the debounced resize. `encode_frame` calls `EncoderProcess::spawn` when a
+stream is created **or reconfigured**, and a resize reconfigures. That is an
+FFmpeg process spawn, ~600 ms, sitting on the loop that also delivers input.
+Input queued behind it waits exactly as long.
+
+This is the same defect fixed on the *client* in PRs #8 and #10 — input
+delivery serialised behind expensive work on a shared loop — at the other end
+of the pipe.
+
+### The fix, as far as it was designed
+
+Move encoding to a worker thread; keep composition on the loop, because it
+needs `&scene`. `MediaHub` is `Clone`, so publishing from the thread is fine.
+The loop sends commands; the thread owns `streams` and every `FfmpegEncoder`.
+
+Four things that a naive version gets wrong:
+
+1. **Ordering against stream teardown.** `SurfaceDestroyed` currently ends a
+   stream synchronously in the same iteration. Once frames are queued, an
+   `EndStream` can arrive behind frames composited before the destroy, and the
+   thread would publish video for an already-destroyed surface. The viewer has
+   an `ignored` set (`session.rs:52`) that looks like it drops late packets,
+   so this is probably benign-but-noisy — **verify that before relying on
+   it**. Cheapest fix: drop queued frames for a key when `EndStream` is seen.
+2. **Drop the *oldest* frame per key, not the newest.** A stale frame that
+   will be superseded is worth less than the current one, and per-key
+   coalescing stops a busy window starving a quiet one. Dropping frames is
+   *correct* here — unlike the client side, where dropping input is not.
+3. **A dropped frame must set `discontinuity` on the next one encoded.**
+   Nothing sets it today because nothing is ever dropped. Miss this and the
+   viewer's HUD `DISC` counter silently lies.
+4. **`encode()` does `write_all` of ~3.7 MB into a pipe** and can block if
+   FFmpeg is slow. Moving it to the thread is right, but then the thread
+   blocks and the queue backs up — which is what (2) exists for. Confirm the
+   encoder's existing reader thread cannot deadlock against a blocked writer.
+
+A sketched shape: a single ordered `VecDeque<EncodeCommand>` behind a mutex
+plus a condvar, where submitting a `Frame` for a key already queued *replaces
+it in place* — newest wins, queue position preserved, so ordering against
+control messages survives coalescing.
+
+**Verification is already built.** `e2e-keys.sh` types six `fox` bursts during
+a live resize and currently scores 5/6. After the fix it should be 6/6. Run it
+several times: at one-in-six, a single clean run proves nothing. Also worth a
+unit test at the thread boundary — send `Frame`, `EndStream`, `Frame` for the
+same key and assert nothing publishes after the end.
+
+### A separate and arguably worse defect
+
+**`navette-viewer` aborts on a non-XKB keymap event.** minifb answers anything
+that is not `XKB_V1` with `unimplemented!()` (`wayland.rs:1238`), which takes
+the whole process down. Observed for real: a second virtual keyboard appearing
+and going away mid-session killed the viewer outright. Any keyboard hotplug
+plausibly does the same. This is a crash, not a latency problem, and it is not
+folded into the work above.
+
+Upstream fix would be to ignore unknown keymap formats rather than panic.
+Locally, nothing guards it.
+
+### Reproducing any of this
+
+The harness needs two things that cost a session each to learn:
+
+- **The guest must repaint continuously.** Firefox throttles paint when idle,
+  so the decoder receives one access unit, never primes, and the viewer never
+  opens a window — a run that measures nothing while looking like a product
+  bug. Use a guest that paints on a timer. For keyboard work it must *also*
+  record what it receives, and set `stty -icanon min 1`, or the TTY line
+  discipline holds characters and a late Return looks like lost input.
+- **Leftover `wprsd` processes hold X displays.** One surviving from an earlier
+  run makes every new session die with `failed to start xwayland: Could not
+  find a free socket`. Check `ps` and `/tmp/.X11-unix` before blaming the code.
+
+Scripts live in the session scratchpad, not the repo: `e2e-keys.sh`
+(end-to-end keyboard), `rollover.sh` (480-edge minifb key test),
+`polllag.sh` + `analyse-lag.py` (poll-cycle measurement), `endurance.sh` +
+`analyse-endurance.py` (the 30-minute gate). They are worth rebuilding from
+these notes if lost; the notes are the expensive part.
+
+### In flight
+
+PR #11 (`docs/preserve-open-findings`) carries the M2 gate report, this
+handoff, and the `.claude/` ignore. Open and mergeable at time of writing.
+
 ## What's next
 
 Items 1-4 of the previous list are done and are kept below only as history.
