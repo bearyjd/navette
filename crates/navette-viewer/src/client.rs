@@ -1,7 +1,8 @@
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use navette_protocol::media::{
-    InputValidationError, MEDIA_HEADER_LEN, MEDIA_WEBSOCKET_SUBPROTOCOL, MediaInput, MediaPacket,
+    InputValidationError, MEDIA_HEADER_LEN, MEDIA_WEBSOCKET_SUBPROTOCOL, MediaInput, MediaKind,
+    MediaPacket,
 };
 use thiserror::Error;
 use tokio::net::TcpStream;
@@ -142,6 +143,27 @@ async fn run(
     tracing::debug!("media connection closed");
 }
 
+/// Runs blocking work without stalling the rest of the runtime.
+///
+/// `block_in_place` is only legal on the multi-threaded runtime and panics
+/// elsewhere, so the flavour is checked rather than assumed: a caller driving
+/// this client from a current-thread runtime (the integration tests do) gets
+/// the work run inline instead.
+///
+/// That fallback degrades silently, and deliberately: the closure runs either
+/// way, so behaviour is identical and only the runtime's responsiveness
+/// differs. It cannot promise anything about the caller, though -- a
+/// current-thread runtime with other timers on it would see those stall for
+/// the duration, exactly as this function exists to prevent elsewhere.
+fn without_starving_the_runtime<T>(work: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+
+    match Handle::try_current().map(|handle| handle.runtime_flavor()) {
+        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
+        _ => work(),
+    }
+}
+
 /// Routes one received WebSocket message. Returns `false` when the connection
 /// must be torn down.
 async fn receive(
@@ -170,7 +192,46 @@ async fn receive(
             // decode pipeline runs a few access units behind), so every
             // event it produces is forwarded in order rather than at
             // most one.
-            let events = router.handle(&packet);
+            // `router.handle` is synchronous and genuinely blocking: it
+            // writes to FFmpeg's stdin, reads decoded frames back, and on a
+            // stream reconfigure spawns a whole new FFmpeg process and waits
+            // for it to prime -- measured at ~600ms against a real session.
+            //
+            // Running that on a worker does not "starve the runtime" in the
+            // obvious sense; this machine has 22 workers and one spawned
+            // task. The damage is narrower. Exactly one worker at a time
+            // holds tokio's I/O+time driver (it sits behind a `try_lock`,
+            // and the others park on a condvar). When the worker holding it
+            // stops parking because its task went blocking, nothing re-enters
+            // the driver: tokio's eager driver-handoff path is compiled out
+            // unless `tokio_unstable` is set, which this workspace does not
+            // set. The *time* driver therefore stops being polled and every
+            // timer in the process stops firing -- including the `interval`
+            // driving the viewer's input poll, and `tokio::signal::ctrl_c`.
+            //
+            // `block_in_place` hands this worker's core to a fresh thread,
+            // which finds no work, parks, and takes the driver -- repairing
+            // exactly what broke. It is used rather than `spawn_blocking`
+            // because the closure borrows `router` and `packet`, so moving it
+            // to another thread is a `'static` problem requiring the router
+            // to be owned elsewhere; `Send` is not the obstacle (`Decoder` is
+            // already `Send`). That distinction matters: a router-owning task
+            // fed by a channel is the shape that would also fix the gap
+            // below, and it is available.
+            //
+            // SCOPE: this restores the *cadence* of input sampling, not the
+            // *latency* of input delivery. While this branch is blocked the
+            // select's sibling `inputs.recv()` branch is not polled either,
+            // so queued input still waits for `router.handle` to return.
+            // Closing that needs the router moved off this task entirely.
+            //
+            // Metrics packets are a no-op in `router.handle`, so they skip
+            // the core handoff rather than paying one ~50 times a second.
+            let events = if matches!(packet.header.kind, MediaKind::Metrics) {
+                router.handle(&packet)
+            } else {
+                without_starving_the_runtime(|| router.handle(&packet))
+            };
             let observation = observe(&packet, router);
             if sender.send(StreamEvent::Packet(observation)).await.is_err() {
                 return false;
