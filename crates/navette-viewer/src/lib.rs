@@ -12,6 +12,7 @@ pub mod decoder;
 pub mod hud;
 pub mod native;
 pub mod overlay;
+pub mod relay;
 pub mod router;
 pub mod session;
 pub mod window;
@@ -22,6 +23,7 @@ pub use decoder::{
 };
 pub use hud::{HudSample, StreamHud};
 pub use native::{NativeWindow, native_window_factory};
+pub use relay::{InputRelay, RelayReport};
 pub use router::{DecoderFactory, StreamEvent, StreamFrame, StreamPacket, StreamRouter};
 pub use session::ViewerSession;
 pub use window::{
