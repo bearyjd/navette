@@ -1,7 +1,8 @@
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use navette_protocol::media::{
-    InputValidationError, MEDIA_HEADER_LEN, MEDIA_WEBSOCKET_SUBPROTOCOL, MediaInput, MediaPacket,
+    InputValidationError, MEDIA_HEADER_LEN, MEDIA_WEBSOCKET_SUBPROTOCOL, MediaInput, MediaKind,
+    MediaPacket,
 };
 use thiserror::Error;
 use tokio::net::TcpStream;
@@ -189,20 +190,43 @@ async fn receive(
             // `router.handle` is synchronous and genuinely blocking: it
             // writes to FFmpeg's stdin, reads decoded frames back, and on a
             // stream reconfigure spawns a whole new FFmpeg process and waits
-            // for it to prime. Measured against a real session that costs
-            // ~600ms, and running it directly on a runtime worker starves the
-            // whole runtime for that long -- including the timer the viewer's
-            // input poll interval depends on, which is how a resize turned
-            // into a 622ms input stall with no slow phase anywhere in the
-            // poll loop itself (docs/HANDOFF.md).
+            // for it to prime -- measured at ~600ms against a real session.
             //
-            // `block_in_place` hands this worker's other work to a sibling
-            // worker for the duration, so the runtime keeps running while
-            // FFmpeg does. It is used rather than `spawn_blocking` because the
-            // router owns `Box<dyn Decoder>` and borrows it mutably here;
-            // moving it to another thread would require it to be `Send` and
-            // would restructure ownership for no benefit.
-            let events = without_starving_the_runtime(|| router.handle(&packet));
+            // Running that on a worker does not "starve the runtime" in the
+            // obvious sense; this machine has 22 workers and one spawned
+            // task. The damage is narrower. Exactly one worker at a time
+            // holds tokio's I/O+time driver (it sits behind a `try_lock`,
+            // and the others park on a condvar). When the worker holding it
+            // stops parking because its task went blocking, nothing re-enters
+            // the driver: tokio's eager driver-handoff path is compiled out
+            // unless `tokio_unstable` is set, which this workspace does not
+            // set. The *time* driver therefore stops being polled and every
+            // timer in the process stops firing -- including the `interval`
+            // driving the viewer's input poll, and `tokio::signal::ctrl_c`.
+            //
+            // `block_in_place` hands this worker's core to a fresh thread,
+            // which finds no work, parks, and takes the driver -- repairing
+            // exactly what broke. It is used rather than `spawn_blocking`
+            // because the closure borrows `router` and `packet`, so moving it
+            // to another thread is a `'static` problem requiring the router
+            // to be owned elsewhere; `Send` is not the obstacle (`Decoder` is
+            // already `Send`). That distinction matters: a router-owning task
+            // fed by a channel is the shape that would also fix the gap
+            // below, and it is available.
+            //
+            // SCOPE: this restores the *cadence* of input sampling, not the
+            // *latency* of input delivery. While this branch is blocked the
+            // select's sibling `inputs.recv()` branch is not polled either,
+            // so queued input still waits for `router.handle` to return.
+            // Closing that needs the router moved off this task entirely.
+            //
+            // Metrics packets are a no-op in `router.handle`, so they skip
+            // the core handoff rather than paying one ~50 times a second.
+            let events = if matches!(packet.header.kind, MediaKind::Metrics) {
+                router.handle(&packet)
+            } else {
+                without_starving_the_runtime(|| router.handle(&packet))
+            };
             let observation = observe(&packet, router);
             if sender.send(StreamEvent::Packet(observation)).await.is_err() {
                 return false;

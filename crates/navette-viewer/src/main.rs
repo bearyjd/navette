@@ -57,7 +57,10 @@ async fn main() -> Result<()> {
     // to catch up, so a lag here is direct evidence of the poll loop being
     // kept busy by something else (frame conversion/present, HUD work)
     // rather than idling on `select!`. Measured against a real session this
-    // reaches hundreds of milliseconds during a resize -- see docs/HANDOFF.md.
+    // reaches hundreds of milliseconds during a resize (docs/HANDOFF.md).
+    // Note the per-phase attribution below ships alongside this probe, so
+    // "no phase in this loop accounts for that" is an inference from the
+    // phase maxima, not yet a separately confirmed measurement.
     let mut last_tick = Instant::now();
     // Events handled since the last tick. If a burst of frames can starve the
     // input tick, this is what proves it: the tick's lateness should track the
