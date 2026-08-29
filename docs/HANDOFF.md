@@ -726,6 +726,49 @@ scratch `XDG_DATA_HOME`) instead. Also check for leftover `wprsd` processes
 from earlier runs: one holding an X display makes new sessions die with
 "failed to start xwayland: Could not find a free socket".
 
+### Open review findings, accepted but not fixed
+
+Recorded here because the review artifacts they came from
+(`.claude/PRPs/reviews/`) are deliberately git-ignored and exist only on the
+machine that produced them. Labels are the review's own; note they collide
+with the M2 *milestone* name and are unrelated to it.
+
+From the PR #7 review (input path):
+
+- **Press can overtake a queued release of the same key.** The viewer runs a
+  multi-threaded runtime and the connection task drains input on another
+  worker, so a permit can free between two sends inside one tick. A release
+  that failed and was re-queued can therefore be overtaken by a later press
+  of the same key, which the bridge's dedup then drops as redundant — turning
+  what used to be a harmless duplicate keydown into a silently lost
+  keystroke.
+- **The dedup enforces a per-attachment invariant on a global seat.**
+  `pressed_keys` is keyed by attachment, but the wire carries no attachment
+  identity, so two attachments pressing the same keycode both forward and the
+  guest sees two keydowns with no release between — exactly what the dedup
+  exists to prevent. Multi-attachment is supported and tested elsewhere.
+- **`KeyRepeat::No` removed an accidental recovery.** Under `KeyRepeat::Yes` a
+  press lost to backpressure was re-reported by minifb's own typematic
+  repeat, so a held key healed itself. It no longer does, and a dropped press
+  is not retried. The change is still correct; the point is that
+  `must_redeliver`'s "a dropped press is only a missed input" was reasoned
+  against behaviour the same change removed. Same failure surface as the
+  press-and-release-inside-one-cycle gap above.
+- **The bridge flush desyncs bridge from viewer.** `release_all_held` releases
+  keys the physical keyboard may still hold and clears tracking, while a
+  still-running viewer keeps its own `held_keys`. Its next real release then
+  arrives for a keycode the bridge no longer tracks and lands on the
+  untracked-release debug path — expected there, not an anomaly, and worth a
+  note beside that log so it is not chased as a bug.
+
+From the PR #10 review (decode path):
+
+- **Input delivery latency is bounded by the packet queue.** Once
+  `PACKET_QUEUE_CAPACITY` (or the byte budget) is exhausted the connection
+  task parks handing over a packet and stops draining input again — the same
+  stall, deferred. Closing it entirely means the router owning its own task
+  and the socket read never waiting on it.
+
 ### Two notes for whoever reads this next
 
 - **The previous session's "tick starvation" hypothesis was half right, and
@@ -747,30 +790,146 @@ from earlier runs: one holding an X display makes new sessions die with
   Left alone rather than churning unverified code on top of a confirmed
   finding.
 
+## Pick up here (written 2026-08-29, end of session)
+
+### The one open defect, fully localised
+
+**Typing during a resize still repeats characters**, about one burst in six.
+This is the milestone's headline symptom. It is *not* where it used to be.
+
+Ruled out, with evidence, not reasoning:
+
+- **minifb is clean.** Instrumenting `native.rs` at the `get_keys_pressed` /
+  `get_keys_released` boundary during a live run showed six matched
+  press/release pairs for the repeating key, one per burst. The upstream
+  two-phase fix works.
+- **The client is clean.** Same run: max poll cycle **7 ms**, zero dropped
+  inputs, zero retried releases, zero bridge-side releases for untracked
+  keycodes, no panic.
+- **The repeat is bounded** (~95 characters, then it stops). `wprsd`
+  advertises `repeat_delay=200 repeat_rate=200`, so a guest repeats a held key
+  *itself* until the release arrives. A lost release repeats forever; a late
+  one repeats and stops. So the release is **late by roughly half a second**,
+  not lost.
+
+**Where it is.** `run_bridge` (`crates/navetted/src/bridge.rs`) runs one loop
+that does all of: dispatch wprs events, apply scene events — which
+`compose_toplevel` *and* `encode_frame` — then drain `MediaCommand::Input`,
+then the debounced resize. `encode_frame` calls `EncoderProcess::spawn` when a
+stream is created **or reconfigured**, and a resize reconfigures. That is an
+FFmpeg process spawn, ~600 ms, sitting on the loop that also delivers input.
+Input queued behind it waits exactly as long.
+
+This is the same defect fixed on the *client* in PRs #8 and #10 — input
+delivery serialised behind expensive work on a shared loop — at the other end
+of the pipe.
+
+### The fix, as far as it was designed
+
+Move encoding to a worker thread; keep composition on the loop, because it
+needs `&scene`. `MediaHub` is `Clone`, so publishing from the thread is fine.
+The loop sends commands; the thread owns `streams` and every `FfmpegEncoder`.
+
+Four things that a naive version gets wrong:
+
+1. **Ordering against stream teardown.** `SurfaceDestroyed` currently ends a
+   stream synchronously in the same iteration. Once frames are queued, an
+   `EndStream` can arrive behind frames composited before the destroy, and the
+   thread would publish video for an already-destroyed surface. The viewer has
+   an `ignored` set (`session.rs:52`) that looks like it drops late packets,
+   so this is probably benign-but-noisy — **verify that before relying on
+   it**. Cheapest fix: drop queued frames for a key when `EndStream` is seen.
+2. **Drop the *oldest* frame per key, not the newest.** A stale frame that
+   will be superseded is worth less than the current one, and per-key
+   coalescing stops a busy window starving a quiet one. Dropping frames is
+   *correct* here — unlike the client side, where dropping input is not.
+3. **A dropped frame must set `discontinuity` on the next one encoded.**
+   Nothing sets it today because nothing is ever dropped. Miss this and the
+   viewer's HUD `DISC` counter silently lies.
+4. **`encode()` does `write_all` of ~3.7 MB into a pipe** and can block if
+   FFmpeg is slow. Moving it to the thread is right, but then the thread
+   blocks and the queue backs up — which is what (2) exists for. Confirm the
+   encoder's existing reader thread cannot deadlock against a blocked writer.
+
+A sketched shape: a single ordered `VecDeque<EncodeCommand>` behind a mutex
+plus a condvar, where submitting a `Frame` for a key already queued *replaces
+it in place* — newest wins, queue position preserved, so ordering against
+control messages survives coalescing.
+
+**Verification is already built.** `e2e-keys.sh` types six `fox` bursts during
+a live resize and currently scores 5/6. After the fix it should be 6/6. Run it
+several times: at one-in-six, a single clean run proves nothing. Also worth a
+unit test at the thread boundary — send `Frame`, `EndStream`, `Frame` for the
+same key and assert nothing publishes after the end.
+
+### A separate and arguably worse defect
+
+**`navette-viewer` aborts on a non-XKB keymap event.** minifb answers anything
+that is not `XKB_V1` with `unimplemented!()` (`wayland.rs:1238`), which takes
+the whole process down. Observed for real: a second virtual keyboard appearing
+and going away mid-session killed the viewer outright. Any keyboard hotplug
+plausibly does the same. This is a crash, not a latency problem, and it is not
+folded into the work above.
+
+Upstream fix would be to ignore unknown keymap formats rather than panic.
+Locally, nothing guards it.
+
+### Reproducing any of this
+
+The harness needs two things that cost a session each to learn:
+
+- **The guest must repaint continuously.** Firefox throttles paint when idle,
+  so the decoder receives one access unit, never primes, and the viewer never
+  opens a window — a run that measures nothing while looking like a product
+  bug. Use a guest that paints on a timer. For keyboard work it must *also*
+  record what it receives, and set `stty -icanon min 1`, or the TTY line
+  discipline holds characters and a late Return looks like lost input.
+- **Leftover `wprsd` processes hold X displays.** One surviving from an earlier
+  run makes every new session die with `failed to start xwayland: Could not
+  find a free socket`. Check `ps` and `/tmp/.X11-unix` before blaming the code.
+
+Scripts live in the session scratchpad, not the repo: `e2e-keys.sh`
+(end-to-end keyboard), `rollover.sh` (480-edge minifb key test),
+`polllag.sh` + `analyse-lag.py` (poll-cycle measurement), `endurance.sh` +
+`analyse-endurance.py` (the 30-minute gate). They are worth rebuilding from
+these notes if lost; the notes are the expensive part.
+
+### In flight
+
+PR #11 (`docs/preserve-open-findings`) carries the M2 gate report, this
+handoff, and the `.claude/` ignore. Open and mergeable at time of writing.
+
 ## What's next
 
-1. **Unblock the environment**: `sudo dnf install -y libxkbcommon-devel`,
-   then `cargo build --workspace` to confirm everything (today's
-   instrumentation included) compiles clean. Then build `wprsd`/`wprsc`
-   fresh from `bearyjd/wprs` (not vendored in this repo), and set up
-   `ydotoold` + `/dev/uinput` access (or fall back to a human-at-keyboard
-   run).
-2. **Finish root-causing "rapid typing + resize still repeats"** using the
-   instrumentation above once the environment is unblocked — script a
-   rollover-during-resize burst and watch for `"poll tick fired late"`,
-   `"delivered a retried release"`, and `"keyboard release for a keycode
-   not tracked as pressed"` in the logs.
-3. **Decide what to do with the uncommitted working-tree diff** (7 files
-   now: `native.rs`, `main.rs`, `bridge.rs` ×2, `input.rs`,
-   `Cargo.toml`/`Cargo.lock` — the minifb pin plus the new `tracing` dep
-   in `navette-bridge`). All of it is real, tested, verified fixes plus
-   diagnostics, except the resize+rapid-typing symptom isn't fully closed
-   — commit now and keep iterating on a follow-up, or hold off. Either
-   way don't lose it.
-4. **Track [emoon/rust_minifb#429](https://github.com/emoon/rust_minifb/pull/429)**
-   until it merges, then drop the fork.
-5. PR6's gate report: endurance run, LAN/tailnet numbers, write-up (the
-   data already collected earlier in this doc covers most of it).
-6. After M2's gate closes: M3 (Android client) is the next milestone, and
+Items 1-4 of the previous list are done and are kept below only as history.
+As of 2026-08-29 the remaining work is:
+
+1. **PR6's gate report.** The endurance and LAN/tailnet data exist, but were
+   taken on 2026-08-26 against code that has since changed materially (PRs
+   #7-#10 altered the scene graph, the input path, minifb, and moved decoding
+   onto its own thread). Re-run the endurance gate against master before
+   citing it. See `docs/superpowers/reports/`.
+2. **A human at a keyboard, once.** Every key-edge result is from the minifb
+   layer or a scripted harness. Nobody has typed into a real navette window
+   during a resize since the fixes landed. The harness makes this cheap now.
+3. **The open review findings** recorded above -- none blocking, all with a
+   concrete failure scenario written down.
+4. **Repin minifb to a crates.io version** once upstream ships a release
+   containing #429. Blocked on emoon, not on us; 0.28.0 predates the merge.
+5. **M3, the Android client** -- the milestone the roadmap treats as the real
+   product moment. Everything so far has been proving the plumbing works.
+
+### Done (2026-08-29), kept for context
+
+- Environment unblocked: `libxkbcommon-devel` was already present, `/dev/uinput`
+  turned out writable via the `nobody` group, and the pinned wprs rev was
+  already in cargo's git cache.
+- "Rapid typing + resize repeats" root-caused, fixed upstream, and merged --
+  it was minifb, not navette. See the section above.
+- The uncommitted working-tree diff landed as PR #7.
+- emoon/rust_minifb#429 merged upstream, so the fork is gone (PR #9).
+- The 622ms poll-cycle stall root-caused and fixed (PRs #8 and #10), verified
+  against a real stack.
+
    the one the roadmap treats as the real product moment — everything
    before it is proving the plumbing works.
