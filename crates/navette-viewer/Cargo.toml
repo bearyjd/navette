@@ -13,19 +13,22 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
-# Pinned to a navette fork (upstream PR emoon/rust_minifb#429 pending, tracked
-# in HANDOFF.md) that fixes three real Wayland keyboard bugs found in live
-# testing:
-#   1. shifted-level keysyms (capitals, shifted punctuation) silently dropped
-#      instead of mapped to their physical key;
-#   2. a failed present skipping the key-repeat timer's advance;
-#   3. `key_handler.update()` running before the keyboard events it must
-#      account for, so under a slow poll cycle a press is lost, an unpaired
-#      release is reported, and the key stays latched down -- the root cause
-#      of the resize + rapid-typing repeat.
-# See the fork's navette-wayland-key-fixes branch, and
-# docs/patches/minifb-two-phase-keyhandler.patch for (3) specifically.
-minifb = { git = "https://github.com/bearyjd/rust_minifb.git", rev = "0b542006be72498c3af9bccab6d7ff1553764e73" }
+# Upstream, not a fork: emoon/rust_minifb#429 merged on 2026-08-29 and carries
+# all three Wayland keyboard fixes found during navette's live testing --
+# shifted-level keysyms being dropped, a failed present skipping the key-repeat
+# timer, and `key_handler.update()` running before the keyboard events it must
+# account for (the root cause of the resize + rapid-typing repeat).
+#
+# Still a git pin rather than a version pin because the newest crates.io
+# release, 0.28.0, predates the merge by seven months. Move to a plain version
+# as soon as one ships that includes it.
+#
+# This SHA is two commits past ours (#430 reworked keysym derivation, #431 gave
+# `Key` an explicit `#[repr(u8)]`, formalising what our evdev mapping already
+# relied on). Both touch key handling, so this pin was verified against the
+# 480-edge rollover harness before landing: zero duplicate presses, zero
+# unpaired releases, nothing latched, every key balanced.
+minifb = { git = "https://github.com/emoon/rust_minifb.git", rev = "3a711add95bc6b9ffd4db09c93c3550178359905" }
 navette-protocol = { path = "../navette-protocol" }
 nix = { version = "0.30", features = ["signal"] }
 serde_json = "1"

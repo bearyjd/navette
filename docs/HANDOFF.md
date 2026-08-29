@@ -551,10 +551,20 @@ on its own merits (a 60ms cycle is bad input latency regardless).
 
 ### Not yet done
 
-- **Done since:** the fix is committed to the fork as `0b54200` on
-  `navette-wayland-key-fixes` and pushed, so upstream PR
-  [#429](https://github.com/emoon/rust_minifb/pull/429) now carries all
-  three Wayland fixes. `crates/navette-viewer/Cargo.toml` is repinned to
+- **UPSTREAM MERGED (2026-08-29).**
+  [emoon/rust_minifb#429](https://github.com/emoon/rust_minifb/pull/429)
+  landed as `7724f43`, carrying all three Wayland fixes. The fork is gone:
+  `navette-viewer` now pins `emoon/rust_minifb` directly at
+  `3a711add95bc6b9ffd4db09c93c3550178359905`. Still a git pin rather than a
+  version pin, because the newest crates.io release (0.28.0, 2025-01-20)
+  predates the merge — switch to a plain version as soon as one ships with
+  it. That SHA is two commits past ours (#430 reworked keysym derivation,
+  #431 gave `Key` an explicit `#[repr(u8)]`, formalising what navette's
+  evdev mapping already relied on); since both touch key handling, the pin
+  was verified against the 480-edge rollover harness first — zero duplicate
+  presses, zero unpaired releases, nothing latched, every key balanced
+  (T 84/84, E 50/50, S 40/40, LeftShift 35/35).
+- **Superseded:** the fix was previously carried on the fork as `0b54200`. `crates/navette-viewer/Cargo.toml` is repinned to
   `0b542006be72498c3af9bccab6d7ff1553764e73`; workspace is green against it
   (151 passed, 1 ignored, clippy and fmt clean). A persistent clone of the
   fork now lives at `../rust_minifb` next to this repo.
