@@ -941,6 +941,62 @@ these notes if lost; the notes are the expensive part.
 PR #11 (`docs/preserve-open-findings`) carries the M2 gate report, this
 handoff, and the `.claude/` ignore. Open and mergeable at time of writing.
 
+## Measured: the encode split helps a lot and does not fix it (2026-08-29, later)
+
+`perf/encode-off-the-bridge-loop` is finished and green — the test module
+compiles, and the encode thread, its condvar handshake, and the
+`stop()`/`join()` teardown now have coverage that did not exist when the
+library half landed. `cargo test --workspace`: 169 passed, 1 ignored; clippy
+`-D warnings` and fmt clean.
+
+**The section above predicted `e2e-keys.sh` would go 5/6 → 6/6 after the fix.
+That prediction is wrong, and the run says so.** The defect still reproduces
+on the branch. What changed is its *magnitude*, and by a lot.
+
+Both sides measured the same day, same harness, same machine, rebuilding
+`navetted` between switches and verifying the binary's mtime actually moved
+(a stale `target/debug/navetted` is exactly what would fake a null result).
+The metric is the length of a repeat burst — how many extra characters the
+guest printed before the release finally landed — because it is continuous,
+where a 6-point pass count is not:
+
+| | usable runs | corrupted bursts | extra chars per burst | median | max |
+|---|---|---|---|---|---|
+| master | 4 | 5 | 93, 104, 123, 214, 362 | 123 | 362 |
+| branch | 2 | 4 | 9, 10, 22, 25 | 22 | 25 |
+
+**The ranges do not overlap.** The branch's *worst* burst is 3.7x shorter
+than master's *best*. `wprsd` hardcodes its advertised repeat at
+`add_keyboard(Default::default(), 200, 200)` (`wprs/src/bin/wprsd.rs:281`) —
+200ms delay, 200 chars/sec — so these convert to roughly 465-1810ms of
+lateness on master against 45-125ms on the branch. That the master numbers
+bracket the ~600ms FFmpeg spawn is a good sign the diagnosis was right.
+
+Two things this does **not** show, stated plainly so nobody over-reads it:
+
+- **Frequency is not measurably changed** (master 5 bursts across 24 typed
+  `fox` bursts, branch 4 across 12 — 21% against 33%, which is one burst
+  either way at this n). Only severity moved.
+- **n is small and the harness is flaky.** Three of nine runs aborted with
+  `ABORT: no window` — the decoder never primes and the viewer never opens.
+  `runs.sh` now reaps leftover `wprsd` *before* each run as well as after,
+  and prints a reason instead of a blank line, because a silent run is
+  indistinguishable from a clean one.
+
+**So there is a second, smaller source of input lateness still on the bridge
+loop, worth ~50-125ms.** The obvious candidate, not yet probed: composition
+stayed on the loop (it needs `&scene`), and a resize burst means many commits,
+each compositing a ~3MB frame before `MediaCommand::Input` is drained. The
+cheap next step is the probe pattern this project already uses — time each
+`run_bridge` iteration, log over a threshold, phase-tag it the way
+`polllag.sh`/`analyse-lag.py` did for the client — and cross-check the parser
+against a raw `grep -c`, per the ANSI-escape trap recorded earlier.
+
+Read the branch as "removes a ~600ms input stall, shrinks the repeat burst by
+5-14x, does not eliminate the defect". That is a real improvement and it is
+worth landing on its own; it is not a fix for the headline symptom, and the
+PR should not claim to be one.
+
 ## What's next
 
 Items 1-4 of the previous list are done and are kept below only as history.
