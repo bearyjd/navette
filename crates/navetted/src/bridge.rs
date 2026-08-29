@@ -148,6 +148,17 @@ struct WorkerState {
     /// Composited frames go here rather than being encoded inline. See
     /// `EncodeQueue` for why.
     encode: Arc<EncodeQueue>,
+    /// Toplevels that need recompositing before this iteration ends.
+    ///
+    /// A commit does not composite immediately. wprsd delivers a burst of
+    /// commits per iteration during a resize -- measured at 10 for one window,
+    /// each composite ~40ms -- and the encode queue then coalesces them to a
+    /// single frame per surface, so all but the last composite is work whose
+    /// result is discarded. Meanwhile the loop drains input only after the
+    /// batch, so a keystroke waits behind every one of them (measured: up to
+    /// 528ms). Collecting here and compositing once per surface at the end of
+    /// the batch removes the discarded work rather than relocating it.
+    pending_composites: std::collections::BTreeSet<SurfaceKey>,
 }
 
 fn run_bridge(
@@ -183,6 +194,7 @@ fn run_bridge(
         scene: Scene::default(),
         input: InputState::default(),
         encode: Arc::clone(&encode),
+        pending_composites: std::collections::BTreeSet::new(),
     };
     let mut resize: Option<(Instant, u32, u32)> = None;
 
@@ -216,15 +228,15 @@ fn run_bridge(
                     let applied = worker.scene.apply(message);
                     apply_us += apply_start.elapsed().as_micros();
                     match applied {
-                        Ok(events) => {
-                            let compose_start = Instant::now();
-                            composites += handle_scene_events(&mut worker, events);
-                            compose_us += compose_start.elapsed().as_micros();
-                        }
+                        Ok(events) => handle_scene_events(&mut worker, events),
                         Err(error) => tracing::warn!(%error, "rejected wprs scene message"),
                     }
                 }
             }
+            // One composite per surface for the whole batch, not one per commit.
+            let compose_start = Instant::now();
+            composites += flush_composites(&mut worker);
+            compose_us += compose_start.elapsed().as_micros();
             let scene_us = scene_start.elapsed().as_micros();
             let input_start = Instant::now();
             let mut inputs = 0u32;
@@ -333,9 +345,9 @@ fn run_bridge(
     outcome
 }
 
-fn handle_scene_events(worker: &mut WorkerState, events: Vec<SceneEvent>) -> u32 {
-    // TEMP-DIAG: how many composites this batch performed.
-    let mut composites = 0u32;
+/// Applies one batch of scene events, recording which toplevels need
+/// recompositing. Call `flush_composites` once the batch is complete.
+fn handle_scene_events(worker: &mut WorkerState, events: Vec<SceneEvent>) {
     for event in events {
         match event {
             SceneEvent::SurfaceCommitted(key) => {
@@ -348,23 +360,25 @@ fn handle_scene_events(worker: &mut WorkerState, events: Vec<SceneEvent>) -> u32
                     tracing::trace!(?key, "commit belongs to no toplevel; nothing to encode");
                     continue;
                 };
-                let Ok(frame) = worker.scene.compose_toplevel(toplevel) else {
-                    continue;
-                };
-                // Composition stays here because it needs `&scene`; only the
-                // blocking part is handed off.
-                composites += 1;
-                worker.encode.submit(EncodeCommand::Frame {
-                    key: toplevel,
-                    frame: normalize_frame(frame),
-                });
+                // Deferred to `flush_composites`, so repeated commits to one
+                // window in a single batch composite once, not once each.
+                worker.pending_composites.insert(toplevel);
             }
             SceneEvent::SurfaceDestroyed(key) => {
                 worker.input.surface_destroyed(key);
+                // Drop any composite still owed to this surface: submitting it
+                // after the `EndStream` below would open a fresh stream for a
+                // window that is gone. A destroyed *subsurface* is not in this
+                // set (it holds toplevels), so its ancestor stays pending and
+                // still recomposites, which is what should happen.
+                worker.pending_composites.remove(&key);
                 worker.encode.submit(EncodeCommand::EndStream { key });
             }
             SceneEvent::ClientDisconnected(client_id) => {
                 worker.input.client_disconnected(client_id);
+                worker
+                    .pending_composites
+                    .retain(|key| key.client_id != client_id);
                 // The encode thread owns the stream map, so it decides which
                 // of its streams belonged to this client.
                 worker
@@ -373,6 +387,23 @@ fn handle_scene_events(worker: &mut WorkerState, events: Vec<SceneEvent>) -> u32
             }
             SceneEvent::CursorChanged | SceneEvent::CapabilitiesChanged => {}
         }
+    }
+}
+
+/// Composites every toplevel owed one and submits the frames, returning how
+/// many were composited. One composite per surface however many commits it
+/// received, which is the point.
+fn flush_composites(worker: &mut WorkerState) -> u32 {
+    let mut composites = 0;
+    for toplevel in std::mem::take(&mut worker.pending_composites) {
+        let Ok(frame) = worker.scene.compose_toplevel(toplevel) else {
+            continue;
+        };
+        composites += 1;
+        worker.encode.submit(EncodeCommand::Frame {
+            key: toplevel,
+            frame: normalize_frame(frame),
+        });
     }
     composites
 }
@@ -854,7 +885,18 @@ mod tests {
             scene,
             input: InputState::default(),
             encode: Arc::new(EncodeQueue::new()),
+            pending_composites: std::collections::BTreeSet::new(),
         }
+    }
+
+    /// One bridge-loop iteration's worth of scene work: apply the batch, then
+    /// composite once per surface -- the same order `run_bridge` uses. Tests go
+    /// through this rather than calling the two halves separately, so that a
+    /// commit and a destroy landing in one batch are ordered here exactly as
+    /// they are in production.
+    fn apply_scene_batch(worker: &mut WorkerState, events: Vec<SceneEvent>) {
+        handle_scene_events(worker, events);
+        flush_composites(worker);
     }
 
     /// The stream map the encode thread would own, held locally so a test can
@@ -990,7 +1032,7 @@ mod tests {
 
         // Each toplevel is encoded off its own commit, so both must commit
         // for both streams to exist.
-        handle_scene_events(
+        apply_scene_batch(
             &mut worker,
             vec![
                 SceneEvent::SurfaceCommitted(key1),
@@ -1072,7 +1114,7 @@ mod tests {
             surface_id: 2,
         };
 
-        handle_scene_events(&mut worker, vec![SceneEvent::SurfaceCommitted(key1)]);
+        apply_scene_batch(&mut worker, vec![SceneEvent::SurfaceCommitted(key1)]);
         drain_encode_queue("s1", &media, &worker.encode, &mut streams);
 
         assert_eq!(
@@ -1098,7 +1140,7 @@ mod tests {
         // drained before the next is submitted: two queued frames for one
         // surface would coalesce, which is right in production but would make
         // this test measure one frame where it means to measure two.
-        handle_scene_events(&mut worker, vec![SceneEvent::SurfaceCommitted(key2)]);
+        apply_scene_batch(&mut worker, vec![SceneEvent::SurfaceCommitted(key2)]);
         drain_encode_queue("s1", &media, &worker.encode, &mut streams);
         assert_eq!(streams.len(), 2);
         let sequence1 = streams[&key1].sequence;
@@ -1108,7 +1150,7 @@ mod tests {
             assert_eq!(packet.header.kind, expected);
         }
 
-        handle_scene_events(&mut worker, vec![SceneEvent::SurfaceCommitted(key2)]);
+        apply_scene_batch(&mut worker, vec![SceneEvent::SurfaceCommitted(key2)]);
         drain_encode_queue("s1", &media, &worker.encode, &mut streams);
         assert_eq!(
             streams[&key1].sequence, sequence1,
@@ -1142,7 +1184,7 @@ mod tests {
             surface_id: 2,
         };
 
-        handle_scene_events(&mut worker, vec![SceneEvent::SurfaceCommitted(child)]);
+        apply_scene_batch(&mut worker, vec![SceneEvent::SurfaceCommitted(child)]);
         drain_encode_queue("s1", &media, &worker.encode, &mut streams);
 
         assert!(
@@ -1162,7 +1204,7 @@ mod tests {
         }
 
         let sequence = streams[&toplevel].sequence;
-        handle_scene_events(&mut worker, vec![SceneEvent::SurfaceCommitted(child)]);
+        apply_scene_batch(&mut worker, vec![SceneEvent::SurfaceCommitted(child)]);
         drain_encode_queue("s1", &media, &worker.encode, &mut streams);
         assert_eq!(streams[&toplevel].id, stream);
         assert!(
@@ -1195,7 +1237,7 @@ mod tests {
             surface_id: 1,
         };
 
-        handle_scene_events(
+        apply_scene_batch(
             &mut worker,
             vec![
                 SceneEvent::SurfaceCommitted(key_a),
@@ -1208,7 +1250,7 @@ mod tests {
             recv_packet(&client).await; // drain the initial config+video pairs
         }
 
-        handle_scene_events(&mut worker, vec![SceneEvent::ClientDisconnected(1)]);
+        apply_scene_batch(&mut worker, vec![SceneEvent::ClientDisconnected(1)]);
         drain_encode_queue("s1", &media, &worker.encode, &mut streams);
         assert!(!streams.contains_key(&key_a));
         assert!(streams.contains_key(&key_b));
@@ -1219,7 +1261,7 @@ mod tests {
         let end_a = recv_packet(&client).await;
         assert_eq!(end_a.header.kind, MediaKind::StreamEnd);
 
-        handle_scene_events(&mut worker, vec![SceneEvent::SurfaceDestroyed(key_b)]);
+        apply_scene_batch(&mut worker, vec![SceneEvent::SurfaceDestroyed(key_b)]);
         drain_encode_queue("s1", &media, &worker.encode, &mut streams);
         assert!(streams.is_empty());
         let end_b = recv_packet(&client).await;
@@ -1262,7 +1304,7 @@ mod tests {
 
         // Establish the stream first: a brand-new stream's first frame is
         // always a discontinuity, which would mask the flag under test.
-        handle_scene_events(&mut worker, vec![SceneEvent::SurfaceCommitted(key)]);
+        apply_scene_batch(&mut worker, vec![SceneEvent::SurfaceCommitted(key)]);
         drain_encode_queue("s1", &media, &worker.encode, &mut streams);
         drain_packets(&client).await;
         assert!(
@@ -1272,8 +1314,8 @@ mod tests {
 
         // Two commits, no drain between them, so the second frame replaces the
         // first while it is still queued.
-        handle_scene_events(&mut worker, vec![SceneEvent::SurfaceCommitted(key)]);
-        handle_scene_events(&mut worker, vec![SceneEvent::SurfaceCommitted(key)]);
+        apply_scene_batch(&mut worker, vec![SceneEvent::SurfaceCommitted(key)]);
+        apply_scene_batch(&mut worker, vec![SceneEvent::SurfaceCommitted(key)]);
         drain_encode_queue("s1", &media, &worker.encode, &mut streams);
 
         let published = drain_packets(&client).await;
@@ -1312,13 +1354,13 @@ mod tests {
             surface_id: 1,
         };
 
-        handle_scene_events(&mut worker, vec![SceneEvent::SurfaceCommitted(key)]);
+        apply_scene_batch(&mut worker, vec![SceneEvent::SurfaceCommitted(key)]);
         drain_encode_queue("s1", &media, &worker.encode, &mut streams);
         drain_packets(&client).await;
 
         // Commit then destroy in one batch: the frame is queued behind nothing
         // and the destroy lands while it is still waiting.
-        handle_scene_events(
+        apply_scene_batch(
             &mut worker,
             vec![
                 SceneEvent::SurfaceCommitted(key),
@@ -1341,6 +1383,76 @@ mod tests {
             "the stream still has to end exactly once"
         );
         assert!(streams.is_empty());
+    }
+
+    /// Deferring composition to the end of a batch creates an ordering hazard
+    /// the immediate version could not have: a commit and a destroy for the
+    /// same surface in one batch would composite *after* the `EndStream`, and
+    /// since the queue's `EndStream` handling only drops frames already queued,
+    /// that late frame would open a fresh stream for a window that is gone.
+    #[tokio::test]
+    async fn a_commit_and_destroy_in_one_batch_never_composites_the_destroyed_surface() {
+        if !ffmpeg_available() {
+            return;
+        }
+        let media = MediaHub::default();
+        let _input = media.register_session("s1");
+        let client = media.attach("s1").unwrap();
+
+        let mut worker = worker_fixture(scene_with_toplevels(&[(1, 1)]));
+        let mut streams = streams_fixture();
+        let key = SurfaceKey {
+            client_id: 1,
+            surface_id: 1,
+        };
+
+        // Never streamed before, so anything published here can only come from
+        // the commit that shares a batch with the destroy.
+        apply_scene_batch(
+            &mut worker,
+            vec![
+                SceneEvent::SurfaceCommitted(key),
+                SceneEvent::SurfaceDestroyed(key),
+            ],
+        );
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
+
+        assert!(
+            worker.pending_composites.is_empty(),
+            "a destroyed surface must not stay owed a composite"
+        );
+        assert!(
+            drain_packets(&client).await.is_empty(),
+            "a surface destroyed in the same batch as its commit must publish nothing"
+        );
+        assert!(streams.is_empty());
+    }
+
+    /// The point of the coalescing: many commits to one window in a single
+    /// batch cost one composite, not one each.
+    #[tokio::test]
+    async fn repeated_commits_in_one_batch_composite_once() {
+        let mut worker = worker_fixture(scene_with_toplevels(&[(1, 1)]));
+        let key = SurfaceKey {
+            client_id: 1,
+            surface_id: 1,
+        };
+
+        handle_scene_events(
+            &mut worker,
+            (0..10).map(|_| SceneEvent::SurfaceCommitted(key)).collect(),
+        );
+        assert_eq!(
+            worker.pending_composites.len(),
+            1,
+            "ten commits to one window owe one composite"
+        );
+        assert_eq!(
+            flush_composites(&mut worker),
+            1,
+            "and compositing the batch runs exactly once"
+        );
+        assert!(worker.pending_composites.is_empty());
     }
 
     /// The real thread, not the synchronous drain every other test uses: it
