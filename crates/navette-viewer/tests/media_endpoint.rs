@@ -140,6 +140,8 @@ async fn next_frame(client: &mut MediaClient) -> StreamFrame {
 /// finishing rather than assuming it did.
 struct DropSignallingDecoder {
     config: DecoderConfig,
+    /// Dropped with the decoder; its receiver disconnects when the decode
+    /// thread lets the router go.
     _alive: std::sync::mpsc::Sender<()>,
 }
 
@@ -192,11 +194,15 @@ async fn dropping_the_client_stops_the_decode_thread() {
     // only happens when the decode thread drops the router and exits.
     let (alive, exited) = std::sync::mpsc::channel();
     let alive = std::sync::Mutex::new(Some(alive));
+    let (built, ready) = std::sync::mpsc::channel();
 
     let url = media_url(&format!("ws://{address}"), "work");
     let client = MediaClient::connect(
         &url,
         Box::new(move |config: &DecoderConfig| {
+            // Announce construction, so the test waits for the decoder to
+            // exist instead of sleeping and hoping.
+            let _ = built.send(());
             Ok(Box::new(DropSignallingDecoder {
                 config: config.clone(),
                 _alive: alive.lock().unwrap().take().expect("one decoder"),
@@ -206,8 +212,12 @@ async fn dropping_the_client_stops_the_decode_thread() {
     .await
     .unwrap();
 
-    // Let the decoder actually get built before tearing down.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Wait for the decoder to exist rather than sleeping: if it were never
+    // built, `exited` would report disconnected immediately and this would
+    // "pass" without ever exercising the thread's shutdown.
+    ready
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the decoder must be built before the client is dropped");
     assert!(
         exited.try_recv().is_err(),
         "decoder should still be alive while the client is"
@@ -229,6 +239,9 @@ async fn dropping_the_client_stops_the_decode_thread() {
 /// while it is stuck.
 struct BlockingDecoder {
     config: DecoderConfig,
+    /// Signalled on entry to `decode`, so a test can wait for the pipeline to
+    /// actually be parked rather than sleeping and hoping.
+    entered: std::sync::mpsc::Sender<()>,
     release: std::sync::mpsc::Receiver<()>,
 }
 
@@ -240,6 +253,7 @@ impl Decoder for BlockingDecoder {
     fn decode(&mut self, _access_unit: &[u8]) -> Result<Vec<DecodedFrame>, DecoderError> {
         // Stands in for the real cost: a stream reconfigure spawning a fresh
         // FFmpeg process, measured at ~600ms.
+        let _ = self.entered.send(());
         let _ = self.release.recv();
         Ok(Vec::new())
     }
@@ -287,12 +301,14 @@ async fn input_is_delivered_while_the_decoder_is_blocked() {
 
     let (release, blocked) = std::sync::mpsc::channel();
     let blocked = std::sync::Mutex::new(Some(blocked));
+    let (entered, decoding) = std::sync::mpsc::channel();
     let url = media_url(&format!("ws://{address}"), "work");
     let client = MediaClient::connect(
         &url,
         Box::new(move |config: &DecoderConfig| {
             Ok(Box::new(BlockingDecoder {
                 config: config.clone(),
+                entered: entered.clone(),
                 release: blocked.lock().unwrap().take().expect("one decoder"),
             }) as Box<dyn Decoder>)
         }),
@@ -309,11 +325,17 @@ async fn input_is_delivered_while_the_decoder_is_blocked() {
         })
     );
 
-    // Wedge the decode pipeline inside this packet.
+    // Wedge the decode pipeline inside this packet, and *wait for it to
+    // actually be wedged*. Sleeping here instead would let the test pass
+    // vacuously on a slow machine: if the packet had not yet reached the
+    // decode thread, nothing would be blocking and the input would sail
+    // through for reasons unrelated to what this test checks.
     hub.publish("work", video_packet(1, 2)).unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    decoding
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the decoder must be reached and parked before input is sent");
 
-    // The decoder is still parked. Input queued now must not wait for it.
+    // The decoder is now parked. Input queued here must not wait for it.
     client
         .send_input(navette_protocol::media::MediaInput::ViewportResize {
             width: 800,

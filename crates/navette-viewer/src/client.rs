@@ -15,9 +15,11 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use crate::router::{DecoderFactory, StreamEvent, StreamPacket, StreamRouter};
 
-/// Every packet now yields an accounting event as well as its frames, so this
-/// carries roughly twice the traffic it used to; too shallow a queue would
-/// leave the connection task parked mid-packet and slow to service input.
+/// Every packet yields an accounting event as well as its frames, so this
+/// carries roughly twice the traffic a frame count suggests. Too shallow a
+/// queue parks the *decode thread* on `blocking_send`, which backs packets up
+/// behind it and eventually reaches the connection task -- the same stall this
+/// split removes, one step removed.
 const EVENT_QUEUE_CAPACITY: usize = 32;
 
 /// Input is queued rather than written inline so a window loop never blocks on
@@ -34,9 +36,8 @@ pub const INPUT_QUEUE_CAPACITY: usize = 64;
 /// stops draining input again, which is the stall this split exists to
 /// remove. Sized against the worst real case measured -- a stream
 /// reconfigure spawning a fresh FFmpeg process, ~600ms, against a stream
-/// running at tens of packets a second -- with room to spare, since the cost
-/// of being generous is only buffered packets and the cost of being tight is
-/// the bug coming back.
+/// running at tens of packets a second. Bytes are bounded separately by
+/// `PACKET_QUEUE_KIB`, since a count on its own is not a memory bound.
 const PACKET_QUEUE_CAPACITY: usize = 128;
 
 /// Payload bytes allowed to sit queued for the decode thread, in KiB.
@@ -171,7 +172,11 @@ impl Drop for MediaClient {
 /// to the end of the decode thread's work rather than released on receipt.
 type QueuedPacket = (MediaPacket, OwnedSemaphorePermit);
 
-/// Reads the socket and writes input to it, and does nothing that blocks.
+/// Reads the socket and writes input to it, and never runs the decoder.
+///
+/// It can still park -- handing a packet to a full queue, or waiting on the
+/// byte budget -- but only for as long as the decode thread takes to catch
+/// up, never for the duration of a decode.
 ///
 /// Decoding used to happen inline here, which meant that while a packet was
 /// being decoded the `select!` had already committed to this branch and was
@@ -239,7 +244,7 @@ fn decode(
 ) {
     // `permit` is held for the whole iteration and released with it, so the
     // budget reflects packets still owned by this thread, not merely queued.
-    while let Some((packet, _permit)) = packets.blocking_recv() {
+    'decode: while let Some((packet, _permit)) = packets.blocking_recv() {
         let decoded = router.handle(&packet);
         // Accounting first, and from this same thread, so a packet's wire
         // cost is always reported before whatever it decoded into.
@@ -269,7 +274,9 @@ fn decode(
                 }
             }
             if events.blocking_send(event).is_err() {
-                return;
+                // `break` rather than `return`, so this leaves through the
+                // same exit as every other path and is logged like them.
+                break 'decode;
             }
         }
     }
@@ -324,6 +331,9 @@ async fn receive(
     }
 }
 
+/// Snapshots what a packet cost on the wire, alongside the decoder metrics as
+/// they stand *after* it was routed -- so a HUD reads a packet's cost and the
+/// state it produced together, not one lagging the other.
 fn observe(packet: &MediaPacket, router: &StreamRouter) -> StreamPacket {
     StreamPacket {
         stream_id: packet.header.stream_id,
