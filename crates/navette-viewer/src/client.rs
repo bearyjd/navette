@@ -1,12 +1,13 @@
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
+use std::sync::Arc;
+
 use navette_protocol::media::{
-    InputValidationError, MEDIA_HEADER_LEN, MEDIA_WEBSOCKET_SUBPROTOCOL, MediaInput, MediaKind,
-    MediaPacket,
+    InputValidationError, MEDIA_HEADER_LEN, MEDIA_WEBSOCKET_SUBPROTOCOL, MediaInput, MediaPacket,
 };
 use thiserror::Error;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -14,9 +15,11 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use crate::router::{DecoderFactory, StreamEvent, StreamPacket, StreamRouter};
 
-/// Every packet now yields an accounting event as well as its frames, so this
-/// carries roughly twice the traffic it used to; too shallow a queue would
-/// leave the connection task parked mid-packet and slow to service input.
+/// Every packet yields an accounting event as well as its frames, so this
+/// carries roughly twice the traffic a frame count suggests. Too shallow a
+/// queue parks the *decode thread* on `blocking_send`, which backs packets up
+/// behind it and eventually reaches the connection task -- the same stall this
+/// split removes, one step removed.
 const EVENT_QUEUE_CAPACITY: usize = 32;
 
 /// Input is queued rather than written inline so a window loop never blocks on
@@ -24,6 +27,30 @@ const EVENT_QUEUE_CAPACITY: usize = 32;
 /// while a frame is being decoded, and shallow enough that a queue this long
 /// means something is genuinely wrong.
 pub const INPUT_QUEUE_CAPACITY: usize = 64;
+
+/// Packets that may be waiting on the decode thread before the socket is
+/// slowed down.
+///
+/// This is the headroom that keeps input flowing while the decoder is busy:
+/// once it is exhausted the connection task parks handing over a packet and
+/// stops draining input again, which is the stall this split exists to
+/// remove. Sized against the worst real case measured -- a stream
+/// reconfigure spawning a fresh FFmpeg process, ~600ms, against a stream
+/// running at tens of packets a second. Bytes are bounded separately by
+/// `PACKET_QUEUE_KIB`, since a count on its own is not a memory bound.
+const PACKET_QUEUE_CAPACITY: usize = 128;
+
+/// Payload bytes allowed to sit queued for the decode thread, in KiB.
+///
+/// A count alone is not a memory bound: the protocol permits payloads up to
+/// `MAX_MEDIA_PAYLOAD` (16 MiB), so 128 queued packets is 2 GiB in the worst
+/// case a peer can construct, where before this queue existed only one packet
+/// was ever in flight. Real traffic is nothing like that -- measured against a
+/// live session, frames run a median of 1.6 KiB and a maximum of 18 KiB -- so
+/// this budget still buys hundreds of ordinary packets of headroom, far more
+/// than the ~32 needed to cover a reconfigure, while capping what a
+/// misbehaving or hostile server can make this client allocate.
+const PACKET_QUEUE_KIB: u32 = 8 * 1024;
 const SUBPROTOCOL_HEADER: &str = "Sec-WebSocket-Protocol";
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -34,9 +61,10 @@ type Sink = SplitSink<Socket, Message>;
 /// The client owns the socket and a [`StreamRouter`]; decoded frames and
 /// stream lifecycle events are handed to the caller through a bounded channel,
 /// so a consumer that falls behind exerts backpressure on the socket instead
-/// of growing an unbounded backlog. Decoding runs on the connection task and
-/// briefly blocks it while FFmpeg works — acceptable for a validation client,
-/// which decodes a handful of small streams.
+/// of growing an unbounded backlog. Decoding runs on a thread of its own
+/// rather than on the connection task: it blocks for as long as FFmpeg takes,
+/// which on a stream reconfigure is a process spawn, and doing that on the
+/// connection task stalled input delivery and every timer in the process.
 pub struct MediaClient {
     events: mpsc::Receiver<StreamEvent>,
     inputs: mpsc::Sender<MediaInput>,
@@ -69,8 +97,27 @@ impl MediaClient {
         send_input(&mut sink, MediaInput::RequestKeyframe).await?;
         let (sender, events) = mpsc::channel(EVENT_QUEUE_CAPACITY);
         let (inputs, input_queue) = mpsc::channel(INPUT_QUEUE_CAPACITY);
+        let (packets, packet_queue) = mpsc::channel(PACKET_QUEUE_CAPACITY);
+        let budget = Arc::new(Semaphore::new(PACKET_QUEUE_KIB as usize));
         let router = StreamRouter::new(factory);
-        let connection = tokio::spawn(run(stream, sink, router, sender, input_queue));
+        // A dedicated one-slot channel for keyframe requests rather than a
+        // clone of `inputs`. Capacity one makes `Full` mean "a request is
+        // already pending", which is exactly right for an idempotent
+        // `RequestKeyframe`, and the connection task drains it from its own
+        // `select!` arm so the decode thread never has to block to be heard.
+        let (keyframes, keyframe_queue) = mpsc::channel(1);
+        std::thread::Builder::new()
+            .name("navette-decode".to_owned())
+            .spawn(move || decode(router, packet_queue, sender, keyframes))
+            .map_err(ClientError::DecodeThread)?;
+        let connection = tokio::spawn(run(
+            stream,
+            sink,
+            packets,
+            input_queue,
+            keyframe_queue,
+            budget,
+        ));
         Ok(Self {
             events,
             inputs,
@@ -110,23 +157,56 @@ impl MediaClient {
 }
 
 impl Drop for MediaClient {
+    /// Aborting the connection task drops its packet sender, which closes the
+    /// decode thread's channel and lets that thread fall out of its loop on
+    /// its own. It is deliberately not joined: the thread may be inside a
+    /// blocking FFmpeg read, and blocking `drop` on it could stall the caller
+    /// for as long as a reconfigure takes.
     fn drop(&mut self) {
         self.connection.abort();
     }
 }
 
+/// A packet plus the slice of the queue's byte budget it occupies. Dropping
+/// the permit returns that budget, so it is deliberately carried all the way
+/// to the end of the decode thread's work rather than released on receipt.
+type QueuedPacket = (MediaPacket, OwnedSemaphorePermit);
+
+/// Reads the socket and writes input to it, and never runs the decoder.
+///
+/// It can still park -- handing a packet to a full queue, or waiting on the
+/// byte budget -- but only for as long as the decode thread takes to catch
+/// up, never for the duration of a decode.
+///
+/// Decoding used to happen inline here, which meant that while a packet was
+/// being decoded the `select!` had already committed to this branch and was
+/// no longer polling `inputs.recv()`. A stream reconfigure spawns a fresh
+/// FFmpeg process and waits ~600ms for it to prime, so every keystroke and
+/// pointer movement queued during that window sat undelivered until it
+/// finished. Decoding now happens on its own thread; this task only hands
+/// packets over, so input keeps flowing while the decoder works.
 async fn run(
     mut stream: SplitStream<Socket>,
     mut sink: Sink,
-    mut router: StreamRouter,
-    sender: mpsc::Sender<StreamEvent>,
+    packets: mpsc::Sender<QueuedPacket>,
     mut inputs: mpsc::Receiver<MediaInput>,
+    mut keyframes: mpsc::Receiver<()>,
+    budget: Arc<Semaphore>,
 ) {
     loop {
         tokio::select! {
             message = stream.next() => {
                 let Some(message) = message else { break };
-                if !receive(message, &mut sink, &mut router, &sender).await {
+                if !receive(message, &packets, &budget).await {
+                    break;
+                }
+            }
+            // Recovery from a decode failure depends on this reaching the
+            // bridge: the router discards the decoder for a failed stream, so
+            // nothing rebuilds it until a fresh `stream_config` arrives, and
+            // nothing produces one until this request does.
+            Some(()) = keyframes.recv() => {
+                if send_input(&mut sink, MediaInput::RequestKeyframe).await.is_err() {
                     break;
                 }
             }
@@ -143,34 +223,72 @@ async fn run(
     tracing::debug!("media connection closed");
 }
 
-/// Runs blocking work without stalling the rest of the runtime.
+/// Owns the decode pipeline, on a thread of its own.
 ///
-/// `block_in_place` is only legal on the multi-threaded runtime and panics
-/// elsewhere, so the flavour is checked rather than assumed: a caller driving
-/// this client from a current-thread runtime (the integration tests do) gets
-/// the work run inline instead.
+/// A real thread rather than a task because this work is *inherently*
+/// blocking -- it writes to FFmpeg's stdin, reads frames back, and on a
+/// reconfigure spawns a new process and waits for it to prime. Blocking
+/// inside an async task is what previously stalled every timer in the
+/// process: exactly one runtime worker at a time holds tokio's I/O+time
+/// driver, and when that worker's task blocks nothing re-enters the driver,
+/// so `tokio::time` stops firing entirely. Giving the pipeline its own thread
+/// removes that failure mode rather than mitigating it.
 ///
-/// That fallback degrades silently, and deliberately: the closure runs either
-/// way, so behaviour is identical and only the runtime's responsiveness
-/// differs. It cannot promise anything about the caller, though -- a
-/// current-thread runtime with other timers on it would see those stall for
-/// the duration, exactly as this function exists to prevent elsewhere.
-fn without_starving_the_runtime<T>(work: impl FnOnce() -> T) -> T {
-    use tokio::runtime::{Handle, RuntimeFlavor};
-
-    match Handle::try_current().map(|handle| handle.runtime_flavor()) {
-        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
-        _ => work(),
+/// Exits when `packets` closes, which happens once the connection task is
+/// gone and its sender drops.
+fn decode(
+    mut router: StreamRouter,
+    mut packets: mpsc::Receiver<QueuedPacket>,
+    events: mpsc::Sender<StreamEvent>,
+    keyframes: mpsc::Sender<()>,
+) {
+    // `permit` is held for the whole iteration and released with it, so the
+    // budget reflects packets still owned by this thread, not merely queued.
+    'decode: while let Some((packet, _permit)) = packets.blocking_recv() {
+        let decoded = router.handle(&packet);
+        // Accounting first, and from this same thread, so a packet's wire
+        // cost is always reported before whatever it decoded into.
+        // `observe` reads the router's metrics *after* `handle` updated them.
+        let observation = observe(&packet, &router);
+        if events
+            .blocking_send(StreamEvent::Packet(observation))
+            .is_err()
+        {
+            break;
+        }
+        for event in decoded {
+            if let StreamEvent::DecodeFailed { stream_id } = event {
+                tracing::info!(stream_id, "requesting a keyframe after a decode failure");
+                // Never a blocking send: the connection task drains this and
+                // may itself be parked handing this thread a packet, which
+                // would close into a deadlock. `Full` here is not a loss --
+                // the channel holds one slot and `RequestKeyframe` carries no
+                // stream identity, so a request is already queued and will be
+                // sent. This must not simply be dropped: the router discards
+                // a failed stream's decoder (`router.rs`), so `DecodeFailed`
+                // fires exactly once per decoder and nothing else asks again.
+                // Losing it leaves that surface black until the user resizes
+                // or reattaches.
+                if let Err(mpsc::error::TrySendError::Closed(())) = keyframes.try_send(()) {
+                    tracing::debug!(stream_id, "connection gone; cannot request a keyframe");
+                }
+            }
+            if events.blocking_send(event).is_err() {
+                // `break` rather than `return`, so this leaves through the
+                // same exit as every other path and is logged like them.
+                break 'decode;
+            }
+        }
     }
+    tracing::debug!("decode pipeline stopped");
 }
 
-/// Routes one received WebSocket message. Returns `false` when the connection
-/// must be torn down.
+/// Hands one received WebSocket message to the decode thread. Returns `false`
+/// when the connection must be torn down.
 async fn receive(
     message: Result<Message, tokio_tungstenite::tungstenite::Error>,
-    sink: &mut Sink,
-    router: &mut StreamRouter,
-    sender: &mpsc::Sender<StreamEvent>,
+    packets: &mpsc::Sender<QueuedPacket>,
+    budget: &Arc<Semaphore>,
 ) -> bool {
     let message = match message {
         Ok(message) => message,
@@ -180,75 +298,28 @@ async fn receive(
         }
     };
     match message {
-        Message::Binary(bytes) => {
-            let packet = match MediaPacket::decode(&bytes) {
-                Ok(packet) => packet,
-                Err(error) => {
-                    tracing::warn!(%error, "discarding malformed media packet");
-                    return true;
-                }
-            };
-            // One packet can drain several buffered frames at once (the
-            // decode pipeline runs a few access units behind), so every
-            // event it produces is forwarded in order rather than at
-            // most one.
-            // `router.handle` is synchronous and genuinely blocking: it
-            // writes to FFmpeg's stdin, reads decoded frames back, and on a
-            // stream reconfigure spawns a whole new FFmpeg process and waits
-            // for it to prime -- measured at ~600ms against a real session.
-            //
-            // Running that on a worker does not "starve the runtime" in the
-            // obvious sense; this machine has 22 workers and one spawned
-            // task. The damage is narrower. Exactly one worker at a time
-            // holds tokio's I/O+time driver (it sits behind a `try_lock`,
-            // and the others park on a condvar). When the worker holding it
-            // stops parking because its task went blocking, nothing re-enters
-            // the driver: tokio's eager driver-handoff path is compiled out
-            // unless `tokio_unstable` is set, which this workspace does not
-            // set. The *time* driver therefore stops being polled and every
-            // timer in the process stops firing -- including the `interval`
-            // driving the viewer's input poll, and `tokio::signal::ctrl_c`.
-            //
-            // `block_in_place` hands this worker's core to a fresh thread,
-            // which finds no work, parks, and takes the driver -- repairing
-            // exactly what broke. It is used rather than `spawn_blocking`
-            // because the closure borrows `router` and `packet`, so moving it
-            // to another thread is a `'static` problem requiring the router
-            // to be owned elsewhere; `Send` is not the obstacle (`Decoder` is
-            // already `Send`). That distinction matters: a router-owning task
-            // fed by a channel is the shape that would also fix the gap
-            // below, and it is available.
-            //
-            // SCOPE: this restores the *cadence* of input sampling, not the
-            // *latency* of input delivery. While this branch is blocked the
-            // select's sibling `inputs.recv()` branch is not polled either,
-            // so queued input still waits for `router.handle` to return.
-            // Closing that needs the router moved off this task entirely.
-            //
-            // Metrics packets are a no-op in `router.handle`, so they skip
-            // the core handoff rather than paying one ~50 times a second.
-            let events = if matches!(packet.header.kind, MediaKind::Metrics) {
-                router.handle(&packet)
-            } else {
-                without_starving_the_runtime(|| router.handle(&packet))
-            };
-            let observation = observe(&packet, router);
-            if sender.send(StreamEvent::Packet(observation)).await.is_err() {
-                return false;
-            }
-            for event in events {
-                if let StreamEvent::DecodeFailed { stream_id } = event {
-                    tracing::info!(stream_id, "requesting a keyframe after a decode failure");
-                    if send_input(sink, MediaInput::RequestKeyframe).await.is_err() {
-                        return false;
-                    }
-                }
-                if sender.send(event).await.is_err() {
+        // Awaiting here is deliberate backpressure: a decoder that cannot
+        // keep up slows the socket rather than growing an unbounded backlog,
+        // which is the same contract this client has always had. It does mean
+        // input delivery stalls again once `PACKET_QUEUE_CAPACITY` is
+        // exhausted, so that capacity is sized against a real reconfigure.
+        Message::Binary(bytes) => match MediaPacket::decode(&bytes) {
+            Ok(packet) => {
+                // Charged in KiB, always at least one, so a flood of empty
+                // packets is still bounded by the queue's own capacity.
+                let kib = u32::try_from(packet.payload.len().div_ceil(1024))
+                    .unwrap_or(u32::MAX)
+                    .clamp(1, PACKET_QUEUE_KIB);
+                let Ok(permit) = Arc::clone(budget).acquire_many_owned(kib).await else {
                     return false;
-                }
+                };
+                packets.send((packet, permit)).await.is_ok()
             }
-            true
-        }
+            Err(error) => {
+                tracing::warn!(%error, "discarding malformed media packet");
+                true
+            }
+        },
         // The server reports protocol problems as JSON text; they are
         // informational and must not take the connection down.
         Message::Text(text) => {
@@ -260,9 +331,9 @@ async fn receive(
     }
 }
 
-/// Snapshots what a packet cost on the wire, plus its stream's decoder
-/// counters as they stand *after* it was routed, so a HUD sees this packet's
-/// own decode timing.
+/// Snapshots what a packet cost on the wire, alongside the decoder metrics as
+/// they stand *after* it was routed -- so a HUD reads a packet's cost and the
+/// state it produced together, not one lagging the other.
 fn observe(packet: &MediaPacket, router: &StreamRouter) -> StreamPacket {
     StreamPacket {
         stream_id: packet.header.stream_id,
@@ -271,6 +342,155 @@ fn observe(packet: &MediaPacket, router: &StreamRouter) -> StreamPacket {
         wire_bytes: MEDIA_HEADER_LEN.saturating_add(packet.payload.len()),
         discontinuity: packet.header.flags.discontinuity(),
         decoder: router.metrics(packet.header.stream_id),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use navette_protocol::media::{
+        MediaFlags, MediaHeader, MediaKind, StreamConfig as MediaStreamConfig,
+    };
+
+    use super::*;
+    use crate::decoder::{DecodedFrame, DecoderConfig, DecoderError, DecoderMetrics};
+    use crate::router::StreamEvent;
+
+    /// Fails every access unit, so the router raises `DecodeFailed` and the
+    /// decode loop tries to ask the bridge for a keyframe.
+    struct AlwaysFails(DecoderConfig);
+
+    impl crate::decoder::Decoder for AlwaysFails {
+        fn config(&self) -> &DecoderConfig {
+            &self.0
+        }
+        fn decode(&mut self, _access_unit: &[u8]) -> Result<Vec<DecodedFrame>, DecoderError> {
+            Err(DecoderError::EmptyAccessUnit)
+        }
+        fn drain(&mut self) -> Vec<DecodedFrame> {
+            Vec::new()
+        }
+        fn reconfigure(&mut self, config: DecoderConfig) -> Result<(), DecoderError> {
+            self.0 = config;
+            Ok(())
+        }
+        fn metrics(&self) -> DecoderMetrics {
+            DecoderMetrics::default()
+        }
+    }
+
+    fn header(kind: MediaKind, sequence: u64) -> MediaHeader {
+        MediaHeader {
+            kind,
+            flags: MediaFlags::new(true, false),
+            stream_id: 1,
+            sequence,
+            timestamp_us: sequence * 1000,
+            payload_len: 0,
+            width: 64,
+            height: 32,
+        }
+    }
+
+    /// A packet larger than the whole byte budget must still get through.
+    ///
+    /// Payloads are charged against a fixed budget, and the protocol allows a
+    /// single payload (up to `MAX_MEDIA_PAYLOAD`, 16 MiB) to exceed that
+    /// budget outright. Without the clamp, acquiring that many permits could
+    /// never succeed and the connection task would park forever on a packet
+    /// it is holding the only copy of -- a hang, not a slow path.
+    #[tokio::test]
+    async fn a_packet_larger_than_the_budget_is_still_queued() {
+        let (packets, mut packet_queue) = mpsc::channel(4);
+        let budget = Arc::new(Semaphore::new(PACKET_QUEUE_KIB as usize));
+
+        // One KiB past the entire budget.
+        let oversized = vec![0u8; (PACKET_QUEUE_KIB as usize + 1) * 1024];
+        let packet = MediaPacket::new(header(MediaKind::Video, 1), oversized).unwrap();
+        let encoded = packet.encode().unwrap();
+
+        let queued = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            receive(Ok(Message::Binary(encoded.into())), &packets, &budget),
+        )
+        .await
+        .expect("receive must not park forever on a packet bigger than the budget");
+        assert!(queued, "an oversized packet should still be handed on");
+        assert!(packet_queue.try_recv().is_ok(), "packet should be queued");
+    }
+
+    /// A keyframe request survives a busy connection instead of being lost.
+    ///
+    /// This asserts the opposite of what it did when first written. The
+    /// original justified dropping the request as self-healing, on the theory
+    /// that the next packet would raise `DecodeFailed` again. It does not:
+    /// the router *removes* a failed stream's decoder, so every later video
+    /// packet for it is discarded as unconfigured and `DecodeFailed` fires
+    /// exactly once per decoder lifetime (`router.rs` has a test asserting
+    /// precisely that). Nothing rebuilds the decoder until a fresh
+    /// `stream_config` arrives, and nothing produces one until this request
+    /// reaches the bridge -- so losing it leaves that surface black until the
+    /// user resizes or reattaches.
+    ///
+    /// The request therefore goes to a dedicated one-slot channel rather than
+    /// the shared input queue: it can never be crowded out by input, and
+    /// `Full` means "already pending" rather than "dropped".
+    #[test]
+    fn a_decode_failure_always_produces_a_keyframe_request() {
+        let (keyframes, mut keyframe_queue) = mpsc::channel(1);
+        let (packets, packet_queue) = mpsc::channel(4);
+        let (events, mut event_rx) = mpsc::channel(16);
+
+        let router = StreamRouter::new(Box::new(|config: &DecoderConfig| {
+            Ok(Box::new(AlwaysFails(config.clone())) as Box<dyn crate::decoder::Decoder>)
+        }));
+
+        let config = MediaStreamConfig {
+            client_id: 11,
+            surface_id: 12,
+            codec_config: vec![0, 0, 0, 1, 0x67, 0x42],
+        }
+        .encode()
+        .unwrap();
+        let budget = Arc::new(Semaphore::new(8));
+        let permit = |n| Arc::clone(&budget).try_acquire_many_owned(n).unwrap();
+        packets
+            .try_send((
+                MediaPacket::new(header(MediaKind::StreamConfig, 1), config).unwrap(),
+                permit(1),
+            ))
+            .unwrap();
+        packets
+            .try_send((
+                MediaPacket::new(header(MediaKind::Video, 2), vec![0, 0, 0, 1, 0x65, 9]).unwrap(),
+                permit(1),
+            ))
+            .unwrap();
+        drop(packets);
+
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            decode(router, packet_queue, events, keyframes);
+            let _ = done.send(());
+        });
+
+        assert!(
+            finished
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok(),
+            "decode loop wedged instead of completing"
+        );
+        assert!(
+            keyframe_queue.try_recv().is_ok(),
+            "a decode failure must always leave a keyframe request queued"
+        );
+
+        let mut saw_failure = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if matches!(event, StreamEvent::DecodeFailed { .. }) {
+                saw_failure = true;
+            }
+        }
+        assert!(saw_failure, "expected the decode failure to be reported");
     }
 }
 
@@ -293,6 +513,8 @@ pub enum ClientError {
     Send(Box<tokio_tungstenite::tungstenite::Error>),
     #[error("refusing to send out-of-range input: {0}")]
     InvalidInput(InputValidationError),
+    #[error("failed to start the decode thread: {0}")]
+    DecodeThread(std::io::Error),
     #[error("input queue is full; the connection is not keeping up")]
     InputBackpressure,
     #[error("the media connection has closed")]

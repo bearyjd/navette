@@ -688,6 +688,44 @@ while a raw `grep` found 159. `tracing`'s fmt layer colourises field names, so
 parser that silently finds zero of something is indistinguishable from the
 thing not happening -- always cross-check against a raw count.
 
+### Poll-cycle work, verified on a real stack (2026-08-29)
+
+The 626ms stalls are fixed, and the fix is not the one the plan predicted.
+Attributing time inside the poll loop showed frame handling peaking at 17ms
+and window polling at 15ms -- neither explains 622ms -- and the worst stalls
+happened with only two events handled, ruling out tick starvation. Every
+stall >=100ms fell within 0.23s of a decoder reconfiguration: `router.handle`
+spawns a fresh FFmpeg process and waits ~600ms for it to prime, and it ran
+inside an async task. Exactly one runtime worker at a time holds tokio's
+I/O+time driver, and when that worker's task blocks nothing re-enters it, so
+every timer in the process stops firing.
+
+Decoding now owns a dedicated thread (`navette_viewer::client::decode`),
+which removes that failure class rather than mitigating it, and keeps the
+connection task free to drain input while the decoder works.
+
+Measured against the real stack -- wprsd, navetted, a continuously-painting
+guest, real FFmpeg, two decoder reconfigurations in the run:
+
+| phase | p50 | p90 | max | cycles >=50ms |
+|---|---|---|---|---|
+| baseline | 14ms | 29ms | 34ms | 0 |
+| resize | 15ms | 18ms | 39ms | 0 |
+| all (n=186) | 15ms | 21ms | 39ms | **0** |
+
+Against 622ms max and 14 keypress-length cycles before. The residual (a
+press and release inside one cycle are dropped, though never latched) drops
+back to theoretical at these numbers.
+
+**Harness note, since this cost two sessions:** the measurement kept failing
+because the guest stopped painting. Firefox throttles paint when idle, so the
+decoder receives one access unit, never primes, and the viewer never opens a
+window -- a run that measures nothing while looking like a bug. Use the
+paint-loop guest (`scratchpad/paintloop.sh` behind a desktop entry in a
+scratch `XDG_DATA_HOME`) instead. Also check for leftover `wprsd` processes
+from earlier runs: one holding an X display makes new sessions die with
+"failed to start xwayland: Could not find a free socket".
+
 ### Two notes for whoever reads this next
 
 - **The previous session's "tick starvation" hypothesis was half right, and
