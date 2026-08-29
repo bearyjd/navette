@@ -11,6 +11,12 @@ use navette_viewer::{
 /// motion feels continuous, cheap enough to run alongside decoding.
 const POLL_INTERVAL: Duration = Duration::from_millis(8);
 
+/// A single phase taking longer than this has already cost the poll loop its
+/// cadence, so it is worth attributing. Deliberately just under
+/// `POLL_INTERVAL`: anything at or above this means the next tick is late
+/// because of *this* work rather than scheduling.
+const SLOW_PHASE: Duration = Duration::from_millis(4);
+
 #[derive(Parser, Debug)]
 #[command(name = "navette-viewer", version, about)]
 struct Cli {
@@ -53,6 +59,10 @@ async fn main() -> Result<()> {
     // rather than idling on `select!`. Measured against a real session this
     // reaches hundreds of milliseconds during a resize -- see docs/HANDOFF.md.
     let mut last_tick = Instant::now();
+    // Events handled since the last tick. If a burst of frames can starve the
+    // input tick, this is what proves it: the tick's lateness should track the
+    // number of events the other branch got to run first.
+    let mut handled_since_tick: u32 = 0;
 
     loop {
         tokio::select! {
@@ -61,7 +71,18 @@ async fn main() -> Result<()> {
                     tracing::info!("session media closed");
                     return Ok(());
                 };
-                session.handle(event, Instant::now());
+                // Attribution for the poll-cycle stalls measured in
+                // docs/HANDOFF.md: this branch prepares a decoded frame for
+                // display (pixel convert + HUD draw) and shares the thread
+                // with the input poll below, so time spent here is time the
+                // next tick is late by.
+                handled_since_tick += 1;
+                let started = Instant::now();
+                session.handle(event, started);
+                let spent = started.elapsed();
+                if spent >= SLOW_PHASE {
+                    tracing::debug!(ms = spent.as_millis(), "slow phase: frame handling");
+                }
             }
             _ = poll.tick() => {
                 let now = Instant::now();
@@ -69,10 +90,21 @@ async fn main() -> Result<()> {
                     .saturating_duration_since(last_tick)
                     .saturating_sub(POLL_INTERVAL);
                 if lag > Duration::from_millis(4) {
-                    tracing::debug!(lag_ms = lag.as_millis(), "poll tick fired late");
+                    tracing::debug!(
+                        lag_ms = lag.as_millis(),
+                        events = handled_since_tick,
+                        "poll tick fired late"
+                    );
                 }
+                handled_since_tick = 0;
                 last_tick = now;
-                let report = relay.dispatch(session.poll(now), now, |input| {
+                let started = Instant::now();
+                let polled = session.poll(now);
+                let spent = started.elapsed();
+                if spent >= SLOW_PHASE {
+                    tracing::debug!(ms = spent.as_millis(), "slow phase: window poll");
+                }
+                let report = relay.dispatch(polled, now, |input| {
                     // Sending never waits, so this handler always returns to
                     // the select and keeps draining events. One rejected or
                     // undeliverable event must not end the session; the

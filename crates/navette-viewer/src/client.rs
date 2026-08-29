@@ -142,6 +142,22 @@ async fn run(
     tracing::debug!("media connection closed");
 }
 
+/// Runs blocking work without stalling the rest of the runtime.
+///
+/// `block_in_place` is only legal on the multi-threaded runtime and panics
+/// elsewhere, so the flavour is checked rather than assumed: a caller driving
+/// this client from a current-thread runtime (the integration tests do) gets
+/// the work run inline, which is correct there because nothing else needs the
+/// runtime to stay responsive.
+fn without_starving_the_runtime<T>(work: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+
+    match Handle::try_current().map(|handle| handle.runtime_flavor()) {
+        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
+        _ => work(),
+    }
+}
+
 /// Routes one received WebSocket message. Returns `false` when the connection
 /// must be torn down.
 async fn receive(
@@ -170,7 +186,23 @@ async fn receive(
             // decode pipeline runs a few access units behind), so every
             // event it produces is forwarded in order rather than at
             // most one.
-            let events = router.handle(&packet);
+            // `router.handle` is synchronous and genuinely blocking: it
+            // writes to FFmpeg's stdin, reads decoded frames back, and on a
+            // stream reconfigure spawns a whole new FFmpeg process and waits
+            // for it to prime. Measured against a real session that costs
+            // ~600ms, and running it directly on a runtime worker starves the
+            // whole runtime for that long -- including the timer the viewer's
+            // input poll interval depends on, which is how a resize turned
+            // into a 622ms input stall with no slow phase anywhere in the
+            // poll loop itself (docs/HANDOFF.md).
+            //
+            // `block_in_place` hands this worker's other work to a sibling
+            // worker for the duration, so the runtime keeps running while
+            // FFmpeg does. It is used rather than `spawn_blocking` because the
+            // router owns `Box<dyn Decoder>` and borrows it mutably here;
+            // moving it to another thread would require it to be `Send` and
+            // would restructure ownership for no benefit.
+            let events = without_starving_the_runtime(|| router.handle(&packet));
             let observation = observe(&packet, router);
             if sender.send(StreamEvent::Packet(observation)).await.is_err() {
                 return false;
