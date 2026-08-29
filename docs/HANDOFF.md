@@ -824,6 +824,48 @@ This is the same defect fixed on the *client* in PRs #8 and #10 — input
 delivery serialised behind expensive work on a shared loop — at the other end
 of the pipe.
 
+### The fix is started — branch `perf/encode-off-the-bridge-loop`
+
+**Library compiles and is believed correct. The test module does not. Do not
+merge as-is.** Pushed so it is not lost; not opened as a PR for that reason.
+
+What is done: encoding moved to its own thread. `run_bridge` keeps
+composition, which needs `&scene`, and submits composited frames to an
+`EncodeQueue`; the thread owns every encoder and the stream map and publishes.
+`apply_encode_command` is the single code path, shared by the thread and by a
+`#[cfg(test)] drain_encode_queue` helper that runs it synchronously.
+
+Four decisions worth not re-litigating:
+
+- **Frames coalesce per surface.** Submitting one for a key already queued
+  replaces it *in place*, keeping queue position so ordering against
+  `EndStream` survives. This is also what bounds the queue — at most one
+  pending frame per stream — so it needs no arbitrary cap. Dropping frames is
+  correct here, unlike on the input path: a superseded frame is worth nothing,
+  a superseded keystroke is lost data.
+- **A replaced frame sets `discontinuity` on the next one encoded** for that
+  surface, or the viewer's HUD `DISC` counter silently under-counts.
+- **`EndStream`/`ClientGone` drop queued frames** for the affected surfaces.
+  The viewer would discard such packets anyway (`session.rs`'s `ignored`),
+  but encoding them is wasted work and noise.
+- **The thread is stopped and joined** as `run_bridge` unwinds, so FFmpeg
+  processes are never left owned by nobody.
+
+**What remains: 45 compile errors in `bridge.rs`'s test module**, three
+mechanical classes — 32 uses of `worker.streams`, 9 calls passing the old
+4-argument `handle_scene_events`, 4 constructions of `WorkerState` with a
+`streams` field. Encoding is no longer synchronous, so each affected test
+needs a local stream map plus a `drain_encode_queue` call after the
+submitting step. The existing assertions on stream state and published
+packets should then hold unchanged. This is judgement per test, not a
+find-and-replace: the drain has to go at the right point in each.
+
+**Then verify, in this order:** `cargo test --workspace`; a unit test at the
+thread boundary (submit `Frame`, `EndStream`, `Frame` for one key; assert
+nothing publishes after the end); then `e2e-keys.sh` **several times** —
+it scores 5/6 today and should be 6/6, and at one-in-six a single clean run
+proves nothing.
+
 ### The fix, as far as it was designed
 
 Move encoding to a worker thread; keep composition on the loop, because it
