@@ -322,6 +322,7 @@ async fn input_is_delivered_while_the_decoder_is_blocked() {
         Some(MediaCommand::Input {
             attachment_id: 1,
             input: navette_protocol::media::MediaInput::RequestKeyframe,
+            queued_at: std::time::Instant::now(),
         })
     );
 
@@ -354,6 +355,7 @@ async fn input_is_delivered_while_the_decoder_is_blocked() {
                 width: 800,
                 height: 600,
             },
+            queued_at: std::time::Instant::now(),
         })
     );
 
@@ -441,6 +443,7 @@ async fn client_decodes_the_bootstrap_replayed_on_attach() {
         Some(MediaCommand::Input {
             attachment_id: 1,
             input: navette_protocol::media::MediaInput::RequestKeyframe,
+            queued_at: std::time::Instant::now(),
         })
     );
 
@@ -514,6 +517,7 @@ async fn window_input_reaches_the_bridge_over_the_same_connection() {
         Some(MediaCommand::Input {
             attachment_id: 1,
             input: MediaInput::RequestKeyframe,
+            queued_at: std::time::Instant::now(),
         })
     );
 
@@ -547,6 +551,7 @@ async fn window_input_reaches_the_bridge_over_the_same_connection() {
             Some(MediaCommand::Input {
                 attachment_id: 1,
                 input,
+                queued_at: std::time::Instant::now(),
             })
         );
     }

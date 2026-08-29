@@ -20,6 +20,10 @@ use navette_protocol::media::{
 use crate::media::{MediaCommand, MediaHub};
 
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(100);
+/// TEMP-DIAG: report an iteration, or a waiting keystroke, at or above this.
+/// 20ms is above the loop's 10ms dispatch floor but well below the ~45-125ms
+/// of lateness the repeat bursts imply.
+const LOOP_LAG_THRESHOLD_US: u128 = 20_000;
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
@@ -190,20 +194,51 @@ fn run_bridge(
     // where flushing achieves nothing.
     let outcome = (|| -> Result<()> {
         while !stop.load(Ordering::Acquire) && transport.is_connected() {
+            // TEMP-DIAG: phase-split iteration timing. Input is drained only
+            // after every scene message in this iteration is applied and
+            // composited, so a keystroke arriving just after a drain waits a
+            // whole iteration. `apply` and `compose` are timed separately
+            // because they are different suspects with different fixes: if the
+            // time is in `apply` (incoming buffers), moving composition off
+            // the loop would fix nothing.
+            let iteration_start = Instant::now();
             event_loop.dispatch(Some(Duration::from_millis(10)), &mut pending)?;
+            let dispatch_us = iteration_start.elapsed().as_micros();
+            let mut apply_us = 0u128;
+            let mut compose_us = 0u128;
+            let mut messages = 0u32;
+            let mut composites = 0u32;
+            let scene_start = Instant::now();
             for event in pending.drain(..) {
                 if let ChannelEvent::Msg(message) = event {
-                    match worker.scene.apply(message) {
-                        Ok(events) => handle_scene_events(&mut worker, events),
+                    messages += 1;
+                    let apply_start = Instant::now();
+                    let applied = worker.scene.apply(message);
+                    apply_us += apply_start.elapsed().as_micros();
+                    match applied {
+                        Ok(events) => {
+                            let compose_start = Instant::now();
+                            composites += handle_scene_events(&mut worker, events);
+                            compose_us += compose_start.elapsed().as_micros();
+                        }
                         Err(error) => tracing::warn!(%error, "rejected wprs scene message"),
                     }
                 }
             }
+            let scene_us = scene_start.elapsed().as_micros();
+            let input_start = Instant::now();
+            let mut inputs = 0u32;
+            let mut worst_input_wait_us = 0u128;
             while let Ok(command) = commands.try_recv() {
+                if let MediaCommand::Input { queued_at, .. } = &command {
+                    inputs += 1;
+                    worst_input_wait_us = worst_input_wait_us.max(queued_at.elapsed().as_micros());
+                }
                 match command {
                     MediaCommand::Input {
                         attachment_id,
                         input: MediaInput::ViewportResize { width, height },
+                        ..
                     } => {
                         let _ = attachment_id;
                         resize = Some((Instant::now(), width, height));
@@ -211,12 +246,14 @@ fn run_bridge(
                     MediaCommand::Input {
                         attachment_id: _,
                         input: MediaInput::RequestKeyframe,
+                        ..
                     } => {
                         worker.encode.submit(EncodeCommand::ForceKeyframeAll);
                     }
                     MediaCommand::Input {
                         attachment_id,
                         input,
+                        ..
                     } => {
                         if let Err(error) =
                             worker
@@ -247,6 +284,28 @@ fn run_bridge(
                 worker.encode.submit(EncodeCommand::ForceKeyframeAll);
                 resize = None;
             }
+            // TEMP-DIAG: report only long iterations, plus every iteration in
+            // which a keystroke actually waited. A slow iteration with no
+            // input pending costs nothing, so the two are logged together to
+            // tell "the loop was slow" from "the loop was slow while input
+            // was waiting" -- which is the whole question.
+            let input_us = input_start.elapsed().as_micros();
+            let total_us = iteration_start.elapsed().as_micros();
+            if total_us >= LOOP_LAG_THRESHOLD_US || worst_input_wait_us >= LOOP_LAG_THRESHOLD_US {
+                tracing::debug!(
+                    total_us,
+                    dispatch_us,
+                    scene_us,
+                    apply_us,
+                    compose_us,
+                    input_us,
+                    messages,
+                    composites,
+                    inputs,
+                    worst_input_wait_us,
+                    "bridge loop iteration ran long"
+                );
+            }
         }
         Ok(())
     })();
@@ -274,7 +333,9 @@ fn run_bridge(
     outcome
 }
 
-fn handle_scene_events(worker: &mut WorkerState, events: Vec<SceneEvent>) {
+fn handle_scene_events(worker: &mut WorkerState, events: Vec<SceneEvent>) -> u32 {
+    // TEMP-DIAG: how many composites this batch performed.
+    let mut composites = 0u32;
     for event in events {
         match event {
             SceneEvent::SurfaceCommitted(key) => {
@@ -292,6 +353,7 @@ fn handle_scene_events(worker: &mut WorkerState, events: Vec<SceneEvent>) {
                 };
                 // Composition stays here because it needs `&scene`; only the
                 // blocking part is handed off.
+                composites += 1;
                 worker.encode.submit(EncodeCommand::Frame {
                     key: toplevel,
                     frame: normalize_frame(frame),
@@ -312,6 +374,7 @@ fn handle_scene_events(worker: &mut WorkerState, events: Vec<SceneEvent>) {
             SceneEvent::CursorChanged | SceneEvent::CapabilitiesChanged => {}
         }
     }
+    composites
 }
 
 fn encode_frame(

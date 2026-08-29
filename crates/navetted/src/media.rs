@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Instant;
 
 use navette_protocol::media::{MediaInput, MediaKind, MediaPacket};
 use thiserror::Error;
@@ -34,15 +35,52 @@ struct StreamBootstrap {
     last_sequence: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum MediaCommand {
     Input {
         attachment_id: u64,
         input: MediaInput,
+        /// TEMP-DIAG: when this command was handed to the queue, so the bridge
+        /// loop can report how long a keystroke actually waited before being
+        /// applied. Deliberately excluded from `PartialEq` -- two commands are
+        /// the same command regardless of when they were queued, and tests
+        /// compare them by value.
+        queued_at: Instant,
     },
     Disconnected {
         attachment_id: u64,
     },
+}
+
+/// Hand-written so the TEMP-DIAG `queued_at` stamp does not take part in
+/// equality: two commands carrying the same input are the same command
+/// whatever time they were queued, and tests compare them by value.
+impl PartialEq for MediaCommand {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Input {
+                    attachment_id: left,
+                    input: left_input,
+                    ..
+                },
+                Self::Input {
+                    attachment_id: right,
+                    input: right_input,
+                    ..
+                },
+            ) => left == right && left_input == right_input,
+            (
+                Self::Disconnected {
+                    attachment_id: left,
+                },
+                Self::Disconnected {
+                    attachment_id: right,
+                },
+            ) => left == right,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -228,6 +266,7 @@ impl MediaAttachment {
             .try_send(MediaCommand::Input {
                 attachment_id: self.client_id,
                 input,
+                queued_at: Instant::now(),
             })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => MediaHubError::InputBackpressure,
@@ -555,7 +594,9 @@ mod tests {
             one.recv().await,
             Some(MediaCommand::Input {
                 attachment_id: 1,
-                input: MediaInput::RequestKeyframe
+                input: MediaInput::RequestKeyframe,
+                // Ignored by `PartialEq`; any instant will do.
+                queued_at: Instant::now()
             })
         );
         assert!(two.try_recv().is_err());
