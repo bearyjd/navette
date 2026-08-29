@@ -303,7 +303,18 @@ impl Scene {
                     return Err(SceneError::IdentityMismatch);
                 }
                 let previous = self.surfaces.get(&key);
-                let previous_image = previous.and_then(|node| node.image.clone());
+                // Only carried forward when this commit brings no buffer of its
+                // own; `decode_assignment` discards it for both `New` and
+                // `Removed`. Cloning unconditionally meant deep-copying a whole
+                // framebuffer -- megabytes -- on every ordinary repaint, and
+                // then dropping it. Guarding the clone keeps the common path
+                // free, which matters because this runs per commit on the loop
+                // that also delivers keystrokes.
+                let previous_image = if state.buffer.is_none() {
+                    previous.and_then(|node| node.image.clone())
+                } else {
+                    None
+                };
                 let previous_parent = previous.and_then(|node| node.parent);
                 let previous_children: Vec<SurfaceKey> = previous
                     .map(|node| node.children.iter().map(|child| child.key).collect())
