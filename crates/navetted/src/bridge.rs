@@ -140,8 +140,10 @@ struct StreamState {
 
 struct WorkerState {
     scene: Scene,
-    streams: HashMap<SurfaceKey, StreamState>,
     input: InputState,
+    /// Composited frames go here rather than being encoded inline. See
+    /// `EncodeQueue` for why.
+    encode: Arc<EncodeQueue>,
 }
 
 fn run_bridge(
@@ -163,10 +165,20 @@ fn run_bridge(
         .insert_source(receiver, |event, _, pending| pending.push(event))
         .map_err(|_| anyhow!("failed to register wprs source"))?;
     let mut pending = Vec::new();
+    let encode = Arc::new(EncodeQueue::new());
+    let encoder_thread = {
+        let queue = Arc::clone(&encode);
+        let session = session.to_owned();
+        let media = media.clone();
+        thread::Builder::new()
+            .name("navette-encode".to_owned())
+            .spawn(move || encode_loop(session, media, queue))
+            .context("failed to start the encode thread")?
+    };
     let mut worker = WorkerState {
         scene: Scene::default(),
-        streams: HashMap::new(),
         input: InputState::default(),
+        encode: Arc::clone(&encode),
     };
     let mut resize: Option<(Instant, u32, u32)> = None;
 
@@ -182,7 +194,7 @@ fn run_bridge(
             for event in pending.drain(..) {
                 if let ChannelEvent::Msg(message) = event {
                     match worker.scene.apply(message) {
-                        Ok(events) => handle_scene_events(session, &media, &mut worker, events),
+                        Ok(events) => handle_scene_events(&mut worker, events),
                         Err(error) => tracing::warn!(%error, "rejected wprs scene message"),
                     }
                 }
@@ -200,9 +212,7 @@ fn run_bridge(
                         attachment_id: _,
                         input: MediaInput::RequestKeyframe,
                     } => {
-                        for stream in worker.streams.values_mut() {
-                            stream.force_keyframe = true;
-                        }
+                        worker.encode.submit(EncodeCommand::ForceKeyframeAll);
                     }
                     MediaCommand::Input {
                         attachment_id,
@@ -234,7 +244,7 @@ fn run_bridge(
                         &transport,
                     )
                     .ok();
-                force_keyframe_on_all_streams(&mut worker.streams);
+                worker.encode.submit(EncodeCommand::ForceKeyframeAll);
                 resize = None;
             }
         }
@@ -253,15 +263,18 @@ fn run_bridge(
     // arrives for a keycode this side no longer tracks and shows up on the
     // untracked-release path. That is expected here, not an anomaly.
     worker.input.release_all_held(&transport);
+    // Stop the encode thread and wait for it. Joining can take as long as one
+    // in-flight encode -- an FFmpeg spawn in the worst case -- but this runs
+    // as the session's own worker is unwinding, and letting the thread outlive
+    // it would leave FFmpeg processes owned by nobody.
+    encode.stop();
+    if encoder_thread.join().is_err() {
+        tracing::warn!("encode thread panicked");
+    }
     outcome
 }
 
-fn handle_scene_events(
-    session: &str,
-    media: &MediaHub,
-    worker: &mut WorkerState,
-    events: Vec<SceneEvent>,
-) {
+fn handle_scene_events(worker: &mut WorkerState, events: Vec<SceneEvent>) {
     for event in events {
         match event {
             SceneEvent::SurfaceCommitted(key) => {
@@ -277,31 +290,24 @@ fn handle_scene_events(
                 let Ok(frame) = worker.scene.compose_toplevel(toplevel) else {
                     continue;
                 };
-                if let Err(error) = encode_frame(
-                    session,
-                    media,
-                    &mut worker.streams,
-                    toplevel,
-                    normalize_frame(frame),
-                ) {
-                    tracing::warn!(?toplevel, %error, "failed to encode captured frame");
-                }
+                // Composition stays here because it needs `&scene`; only the
+                // blocking part is handed off.
+                worker.encode.submit(EncodeCommand::Frame {
+                    key: toplevel,
+                    frame: normalize_frame(frame),
+                });
             }
             SceneEvent::SurfaceDestroyed(key) => {
                 worker.input.surface_destroyed(key);
-                end_stream(session, media, &mut worker.streams, key)
+                worker.encode.submit(EncodeCommand::EndStream { key });
             }
             SceneEvent::ClientDisconnected(client_id) => {
                 worker.input.client_disconnected(client_id);
-                let keys = worker
-                    .streams
-                    .keys()
-                    .filter(|key| key.client_id == client_id)
-                    .copied()
-                    .collect::<Vec<_>>();
-                for key in keys {
-                    end_stream(session, media, &mut worker.streams, key);
-                }
+                // The encode thread owns the stream map, so it decides which
+                // of its streams belonged to this client.
+                worker
+                    .encode
+                    .submit(EncodeCommand::ClientGone { client_id });
             }
             SceneEvent::CursorChanged | SceneEvent::CapabilitiesChanged => {}
         }
@@ -375,6 +381,198 @@ fn force_keyframe_on_all_streams(streams: &mut HashMap<SurfaceKey, StreamState>)
     for stream in streams.values_mut() {
         stream.force_keyframe = true;
         stream.discontinuity = true;
+    }
+}
+
+/// Work handed to the encode thread.
+///
+/// Ordering between these matters: a frame composited before a surface was
+/// destroyed must not be encoded and published after that surface's
+/// `EndStream`, so they share one queue rather than travelling separately.
+enum EncodeCommand {
+    Frame { key: SurfaceKey, frame: Frame },
+    ForceKeyframeAll,
+    EndStream { key: SurfaceKey },
+    /// Every stream belonging to a client that went away. The encode thread
+    /// owns the stream map, so it is the only thing that can enumerate them.
+    ClientGone { client_id: u64 },
+}
+
+/// Queue between the bridge loop and the encode thread.
+///
+/// Encoding is moved off the bridge loop because it blocks: `encode` writes a
+/// whole frame into FFmpeg's stdin, and creating or *reconfiguring* a stream
+/// spawns a fresh FFmpeg process and waits for it, ~600ms. That loop also
+/// drains `MediaCommand::Input`, so every keystroke queued during a resize
+/// waited for the encoder to come back — long enough for the guest's own key
+/// repeat (wprsd advertises a 200ms delay) to fire and duplicate characters.
+///
+/// Frames coalesce per surface: submitting one for a key already queued
+/// replaces it in place, keeping its queue position so ordering against
+/// `EndStream` survives. That is what bounds the queue — at most one pending
+/// frame per stream — and it is the right policy here, unlike on the input
+/// path, because a superseded frame is worth nothing while a superseded
+/// keystroke is lost data.
+struct EncodeQueue {
+    inner: Mutex<QueueInner>,
+    signal: std::sync::Condvar,
+}
+
+struct QueueInner {
+    queue: std::collections::VecDeque<EncodeCommand>,
+    /// Surfaces whose queued frame was replaced. The next frame actually
+    /// encoded for one of these is flagged as a discontinuity, so the viewer's
+    /// HUD reports the gap rather than silently under-counting.
+    superseded: std::collections::BTreeSet<SurfaceKey>,
+    stopped: bool,
+}
+
+impl EncodeQueue {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(QueueInner {
+                queue: std::collections::VecDeque::new(),
+                superseded: std::collections::BTreeSet::new(),
+                stopped: false,
+            }),
+            signal: std::sync::Condvar::new(),
+        }
+    }
+
+    fn submit(&self, command: EncodeCommand) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        match &command {
+            EncodeCommand::Frame { key, .. } => {
+                let key = *key;
+                if let Some(slot) = inner.queue.iter_mut().find(
+                    |queued| matches!(queued, EncodeCommand::Frame { key: queued, .. } if *queued == key),
+                ) {
+                    *slot = command;
+                    inner.superseded.insert(key);
+                    self.signal.notify_one();
+                    return;
+                }
+            }
+            EncodeCommand::EndStream { key } => {
+                // Nothing composited before the destroy is worth encoding now.
+                let key = *key;
+                inner.queue.retain(
+                    |queued| !matches!(queued, EncodeCommand::Frame { key: queued, .. } if *queued == key),
+                );
+                inner.superseded.remove(&key);
+            }
+            EncodeCommand::ClientGone { client_id } => {
+                let client_id = *client_id;
+                inner.queue.retain(|queued| {
+                    !matches!(queued, EncodeCommand::Frame { key, .. } if key.client_id == client_id)
+                });
+                inner.superseded.retain(|key| key.client_id != client_id);
+            }
+            EncodeCommand::ForceKeyframeAll => {}
+        }
+        inner.queue.push_back(command);
+        self.signal.notify_one();
+    }
+
+    /// Blocks until there is work or the queue is stopped.
+    fn next(&self) -> Option<(EncodeCommand, bool)> {
+        let mut inner = self.inner.lock().ok()?;
+        loop {
+            if let Some(command) = inner.queue.pop_front() {
+                let superseded = match &command {
+                    EncodeCommand::Frame { key, .. } => inner.superseded.remove(key),
+                    _ => false,
+                };
+                return Some((command, superseded));
+            }
+            if inner.stopped {
+                return None;
+            }
+            inner = self.signal.wait(inner).ok()?;
+        }
+    }
+
+    fn stop(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.stopped = true;
+        }
+        self.signal.notify_all();
+    }
+}
+
+/// Applies one command to the stream map. Shared by the encode thread and by
+/// tests, which drive it synchronously so they can inspect the result.
+fn apply_encode_command(
+    session: &str,
+    media: &MediaHub,
+    streams: &mut HashMap<SurfaceKey, StreamState>,
+    command: EncodeCommand,
+    superseded: bool,
+) {
+    match command {
+        EncodeCommand::Frame { key, frame } => {
+            if superseded && let Some(stream) = streams.get_mut(&key) {
+                // A frame for this surface was dropped in favour of this one,
+                // so the stream really is missing data and must say so.
+                stream.discontinuity = true;
+            }
+            if let Err(error) = encode_frame(session, media, streams, key, frame) {
+                tracing::warn!(?key, %error, "failed to encode captured frame");
+            }
+        }
+        EncodeCommand::ForceKeyframeAll => force_keyframe_on_all_streams(streams),
+        EncodeCommand::EndStream { key } => end_stream(session, media, streams, key),
+        EncodeCommand::ClientGone { client_id } => {
+            let keys: Vec<SurfaceKey> = streams
+                .keys()
+                .filter(|key| key.client_id == client_id)
+                .copied()
+                .collect();
+            for key in keys {
+                end_stream(session, media, streams, key);
+            }
+        }
+    }
+}
+
+/// Owns every encoder for one session, on a thread of its own.
+fn encode_loop(session: String, media: MediaHub, queue: Arc<EncodeQueue>) {
+    let mut streams: HashMap<SurfaceKey, StreamState> = HashMap::new();
+    while let Some((command, superseded)) = queue.next() {
+        apply_encode_command(&session, &media, &mut streams, command, superseded);
+    }
+    tracing::debug!("encode pipeline stopped");
+}
+
+/// Drains everything currently queued, through the same code path the encode
+/// thread uses. Lets a test submit work and then inspect what it produced,
+/// without the timing of a real thread.
+#[cfg(test)]
+fn drain_encode_queue(
+    session: &str,
+    media: &MediaHub,
+    queue: &EncodeQueue,
+    streams: &mut HashMap<SurfaceKey, StreamState>,
+) {
+    loop {
+        let next = {
+            let Ok(mut inner) = queue.inner.lock() else {
+                return;
+            };
+            inner.queue.pop_front().map(|command| {
+                let superseded = match &command {
+                    EncodeCommand::Frame { key, .. } => inner.superseded.remove(key),
+                    _ => false,
+                };
+                (command, superseded)
+            })
+        };
+        let Some((command, superseded)) = next else {
+            return;
+        };
+        apply_encode_command(session, media, streams, command, superseded);
     }
 }
 
