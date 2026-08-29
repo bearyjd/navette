@@ -1150,7 +1150,7 @@ checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 [[package]]
 name = "minifb"
 version = "0.28.0"
-source = "git+https://github.com/bearyjd/rust_minifb.git?rev=0b542006be72498c3af9bccab6d7ff1553764e73#0b542006be72498c3af9bccab6d7ff1553764e73"
+source = "git+https://github.com/emoon/rust_minifb.git?rev=3a711add95bc6b9ffd4db09c93c3550178359905#3a711add95bc6b9ffd4db09c93c3550178359905"
 dependencies = [
  "cc",
  "console_error_panic_hook",
