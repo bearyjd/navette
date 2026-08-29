@@ -136,6 +136,51 @@ async fn next_frame(client: &mut MediaClient) -> StreamFrame {
     }
 }
 
+/// The same flow on a multi-threaded runtime, which is the flavour the
+/// binary actually uses (`#[tokio::main]` defaults to it).
+///
+/// Worth its own test because the decode path takes a *different branch*
+/// there: `without_starving_the_runtime` calls `block_in_place` on
+/// multi-thread and runs inline everywhere else. Every other test drives this
+/// client from a current-thread runtime, so without this the production
+/// branch is exercised nowhere -- and `block_in_place` panics outright if it
+/// is ever reached on the wrong flavour, which would surface only in the
+/// released binary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_decodes_on_a_multi_thread_runtime() {
+    let temp = TempDir::new().unwrap();
+    let state = test_state(&temp);
+    add_running_session(&state, "work");
+    let _input = state.media.register_session("work");
+    state
+        .media
+        .publish("work", stream_config_packet(1, 1))
+        .unwrap();
+    state.media.publish("work", video_packet(1, 2)).unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router(state)).await.unwrap();
+    });
+
+    let url = media_url(&format!("ws://{address}"), "work");
+    let mut client = MediaClient::connect(
+        &url,
+        Box::new(|config: &DecoderConfig| {
+            Ok(Box::new(FakeDecoder::new(config.clone())?) as Box<dyn Decoder>)
+        }),
+    )
+    .await
+    .unwrap();
+
+    let frame = next_frame(&mut client).await;
+    assert_eq!(frame.stream_id, 1);
+    assert_eq!((frame.frame.width, frame.frame.height), (64, 32));
+
+    server.abort();
+}
+
 #[tokio::test]
 async fn client_decodes_the_bootstrap_replayed_on_attach() {
     let temp = TempDir::new().unwrap();

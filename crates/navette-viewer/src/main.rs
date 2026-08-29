@@ -13,8 +13,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(8);
 
 /// A single phase taking longer than this has already cost the poll loop its
 /// cadence, so it is worth attributing. Deliberately just under
-/// `POLL_INTERVAL`: anything at or above this means the next tick is late
-/// because of *this* work rather than scheduling.
+/// half of `POLL_INTERVAL`: a single phase costing that much has already
+/// taken the cycle's whole slack, so the next tick is late because of *this*
+/// work rather than scheduling.
 const SLOW_PHASE: Duration = Duration::from_millis(4);
 
 #[derive(Parser, Debug)]
@@ -92,7 +93,7 @@ async fn main() -> Result<()> {
                 let lag = now
                     .saturating_duration_since(last_tick)
                     .saturating_sub(POLL_INTERVAL);
-                if lag > Duration::from_millis(4) {
+                if lag > SLOW_PHASE {
                     tracing::debug!(
                         lag_ms = lag.as_millis(),
                         events = handled_since_tick,

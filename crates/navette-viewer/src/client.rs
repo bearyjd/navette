@@ -148,8 +148,13 @@ async fn run(
 /// `block_in_place` is only legal on the multi-threaded runtime and panics
 /// elsewhere, so the flavour is checked rather than assumed: a caller driving
 /// this client from a current-thread runtime (the integration tests do) gets
-/// the work run inline, which is correct there because nothing else needs the
-/// runtime to stay responsive.
+/// the work run inline instead.
+///
+/// That fallback degrades silently, and deliberately: the closure runs either
+/// way, so behaviour is identical and only the runtime's responsiveness
+/// differs. It cannot promise anything about the caller, though -- a
+/// current-thread runtime with other timers on it would see those stall for
+/// the duration, exactly as this function exists to prevent elsewhere.
 fn without_starving_the_runtime<T>(work: impl FnOnce() -> T) -> T {
     use tokio::runtime::{Handle, RuntimeFlavor};
 
