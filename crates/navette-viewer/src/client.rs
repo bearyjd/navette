@@ -280,6 +280,117 @@ fn observe(packet: &MediaPacket, router: &StreamRouter) -> StreamPacket {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use navette_protocol::media::{
+        MediaFlags, MediaHeader, MediaKind, StreamConfig as MediaStreamConfig,
+    };
+
+    use super::*;
+    use crate::decoder::{DecodedFrame, DecoderConfig, DecoderError, DecoderMetrics};
+    use crate::router::StreamEvent;
+
+    /// Fails every access unit, so the router raises `DecodeFailed` and the
+    /// decode loop tries to ask the bridge for a keyframe.
+    struct AlwaysFails(DecoderConfig);
+
+    impl crate::decoder::Decoder for AlwaysFails {
+        fn config(&self) -> &DecoderConfig {
+            &self.0
+        }
+        fn decode(&mut self, _access_unit: &[u8]) -> Result<Vec<DecodedFrame>, DecoderError> {
+            Err(DecoderError::EmptyAccessUnit)
+        }
+        fn drain(&mut self) -> Vec<DecodedFrame> {
+            Vec::new()
+        }
+        fn reconfigure(&mut self, config: DecoderConfig) -> Result<(), DecoderError> {
+            self.0 = config;
+            Ok(())
+        }
+        fn metrics(&self) -> DecoderMetrics {
+            DecoderMetrics::default()
+        }
+    }
+
+    fn header(kind: MediaKind, sequence: u64) -> MediaHeader {
+        MediaHeader {
+            kind,
+            flags: MediaFlags::new(true, false),
+            stream_id: 1,
+            sequence,
+            timestamp_us: sequence * 1000,
+            payload_len: 0,
+            width: 64,
+            height: 32,
+        }
+    }
+
+    /// A saturated input queue must not wedge the decode pipeline.
+    ///
+    /// The keyframe request after a decode failure travels up the same
+    /// `inputs` channel the viewer's own input uses, and that channel is
+    /// drained only by the connection task -- which may itself be parked
+    /// handing this thread a packet. A blocking send here closes that into a
+    /// deadlock, so the request is `try_send` and a full queue drops it.
+    ///
+    /// This test holds `inputs` full for the whole run and requires the
+    /// decode loop to finish anyway.
+    #[test]
+    fn a_full_input_queue_does_not_wedge_the_decode_thread() {
+        // Capacity one, pre-filled, receiver kept alive so `try_send` reports
+        // `Full` rather than `Closed`.
+        let (inputs, _input_rx) = mpsc::channel(1);
+        inputs.try_send(MediaInput::RequestKeyframe).unwrap();
+
+        let (packets, packet_queue) = mpsc::channel(4);
+        let (events, mut event_rx) = mpsc::channel(16);
+
+        let router = StreamRouter::new(Box::new(|config: &DecoderConfig| {
+            Ok(Box::new(AlwaysFails(config.clone())) as Box<dyn crate::decoder::Decoder>)
+        }));
+
+        let config = MediaStreamConfig {
+            client_id: 11,
+            surface_id: 12,
+            codec_config: vec![0, 0, 0, 1, 0x67, 0x42],
+        }
+        .encode()
+        .unwrap();
+        packets
+            .try_send(MediaPacket::new(header(MediaKind::StreamConfig, 1), config).unwrap())
+            .unwrap();
+        packets
+            .try_send(
+                MediaPacket::new(header(MediaKind::Video, 2), vec![0, 0, 0, 1, 0x65, 9]).unwrap(),
+            )
+            .unwrap();
+        drop(packets);
+
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            decode(router, packet_queue, events, inputs);
+            let _ = done.send(());
+        });
+
+        assert!(
+            finished
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok(),
+            "decode loop wedged on a full input queue instead of dropping the keyframe request"
+        );
+
+        // It also has to have done its job, not just exited.
+        let mut saw_failure = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if matches!(event, StreamEvent::DecodeFailed { .. }) {
+                saw_failure = true;
+            }
+        }
+        assert!(saw_failure, "expected the decode failure to be reported");
+    }
+}
+
 async fn send_input(sink: &mut Sink, input: MediaInput) -> Result<(), ClientError> {
     let encoded = serde_json::to_string(&input).map_err(ClientError::Encode)?;
     sink.send(Message::Text(encoded.into()))
