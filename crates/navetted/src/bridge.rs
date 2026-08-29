@@ -140,8 +140,10 @@ struct StreamState {
 
 struct WorkerState {
     scene: Scene,
-    streams: HashMap<SurfaceKey, StreamState>,
     input: InputState,
+    /// Composited frames go here rather than being encoded inline. See
+    /// `EncodeQueue` for why.
+    encode: Arc<EncodeQueue>,
 }
 
 fn run_bridge(
@@ -163,10 +165,20 @@ fn run_bridge(
         .insert_source(receiver, |event, _, pending| pending.push(event))
         .map_err(|_| anyhow!("failed to register wprs source"))?;
     let mut pending = Vec::new();
+    let encode = Arc::new(EncodeQueue::new());
+    let encoder_thread = {
+        let queue = Arc::clone(&encode);
+        let session = session.to_owned();
+        let media = media.clone();
+        thread::Builder::new()
+            .name("navette-encode".to_owned())
+            .spawn(move || encode_loop(session, media, queue))
+            .context("failed to start the encode thread")?
+    };
     let mut worker = WorkerState {
         scene: Scene::default(),
-        streams: HashMap::new(),
         input: InputState::default(),
+        encode: Arc::clone(&encode),
     };
     let mut resize: Option<(Instant, u32, u32)> = None;
 
@@ -182,7 +194,7 @@ fn run_bridge(
             for event in pending.drain(..) {
                 if let ChannelEvent::Msg(message) = event {
                     match worker.scene.apply(message) {
-                        Ok(events) => handle_scene_events(session, &media, &mut worker, events),
+                        Ok(events) => handle_scene_events(&mut worker, events),
                         Err(error) => tracing::warn!(%error, "rejected wprs scene message"),
                     }
                 }
@@ -200,9 +212,7 @@ fn run_bridge(
                         attachment_id: _,
                         input: MediaInput::RequestKeyframe,
                     } => {
-                        for stream in worker.streams.values_mut() {
-                            stream.force_keyframe = true;
-                        }
+                        worker.encode.submit(EncodeCommand::ForceKeyframeAll);
                     }
                     MediaCommand::Input {
                         attachment_id,
@@ -234,7 +244,7 @@ fn run_bridge(
                         &transport,
                     )
                     .ok();
-                force_keyframe_on_all_streams(&mut worker.streams);
+                worker.encode.submit(EncodeCommand::ForceKeyframeAll);
                 resize = None;
             }
         }
@@ -253,15 +263,18 @@ fn run_bridge(
     // arrives for a keycode this side no longer tracks and shows up on the
     // untracked-release path. That is expected here, not an anomaly.
     worker.input.release_all_held(&transport);
+    // Stop the encode thread and wait for it. Joining can take as long as one
+    // in-flight encode -- an FFmpeg spawn in the worst case -- but this runs
+    // as the session's own worker is unwinding, and letting the thread outlive
+    // it would leave FFmpeg processes owned by nobody.
+    encode.stop();
+    if encoder_thread.join().is_err() {
+        tracing::warn!("encode thread panicked");
+    }
     outcome
 }
 
-fn handle_scene_events(
-    session: &str,
-    media: &MediaHub,
-    worker: &mut WorkerState,
-    events: Vec<SceneEvent>,
-) {
+fn handle_scene_events(worker: &mut WorkerState, events: Vec<SceneEvent>) {
     for event in events {
         match event {
             SceneEvent::SurfaceCommitted(key) => {
@@ -277,31 +290,24 @@ fn handle_scene_events(
                 let Ok(frame) = worker.scene.compose_toplevel(toplevel) else {
                     continue;
                 };
-                if let Err(error) = encode_frame(
-                    session,
-                    media,
-                    &mut worker.streams,
-                    toplevel,
-                    normalize_frame(frame),
-                ) {
-                    tracing::warn!(?toplevel, %error, "failed to encode captured frame");
-                }
+                // Composition stays here because it needs `&scene`; only the
+                // blocking part is handed off.
+                worker.encode.submit(EncodeCommand::Frame {
+                    key: toplevel,
+                    frame: normalize_frame(frame),
+                });
             }
             SceneEvent::SurfaceDestroyed(key) => {
                 worker.input.surface_destroyed(key);
-                end_stream(session, media, &mut worker.streams, key)
+                worker.encode.submit(EncodeCommand::EndStream { key });
             }
             SceneEvent::ClientDisconnected(client_id) => {
                 worker.input.client_disconnected(client_id);
-                let keys = worker
-                    .streams
-                    .keys()
-                    .filter(|key| key.client_id == client_id)
-                    .copied()
-                    .collect::<Vec<_>>();
-                for key in keys {
-                    end_stream(session, media, &mut worker.streams, key);
-                }
+                // The encode thread owns the stream map, so it decides which
+                // of its streams belonged to this client.
+                worker
+                    .encode
+                    .submit(EncodeCommand::ClientGone { client_id });
             }
             SceneEvent::CursorChanged | SceneEvent::CapabilitiesChanged => {}
         }
@@ -375,6 +381,210 @@ fn force_keyframe_on_all_streams(streams: &mut HashMap<SurfaceKey, StreamState>)
     for stream in streams.values_mut() {
         stream.force_keyframe = true;
         stream.discontinuity = true;
+    }
+}
+
+/// Work handed to the encode thread.
+///
+/// Ordering between these matters: a frame composited before a surface was
+/// destroyed must not be encoded and published after that surface's
+/// `EndStream`, so they share one queue rather than travelling separately.
+enum EncodeCommand {
+    Frame {
+        key: SurfaceKey,
+        frame: Frame,
+    },
+    ForceKeyframeAll,
+    EndStream {
+        key: SurfaceKey,
+    },
+    /// Every stream belonging to a client that went away. The encode thread
+    /// owns the stream map, so it is the only thing that can enumerate them.
+    ClientGone {
+        client_id: u64,
+    },
+}
+
+/// Queue between the bridge loop and the encode thread.
+///
+/// Encoding is moved off the bridge loop because it blocks: `encode` writes a
+/// whole frame into FFmpeg's stdin, and creating or *reconfiguring* a stream
+/// spawns a fresh FFmpeg process and waits for it, ~600ms. That loop also
+/// drains `MediaCommand::Input`, so every keystroke queued during a resize
+/// waited for the encoder to come back — long enough for the guest's own key
+/// repeat (wprsd advertises a 200ms delay) to fire and duplicate characters.
+///
+/// Frames coalesce per surface: submitting one for a key already queued
+/// replaces it in place, keeping its queue position so ordering against
+/// `EndStream` survives. That is what bounds the queue — at most one pending
+/// frame per stream — and it is the right policy here, unlike on the input
+/// path, because a superseded frame is worth nothing while a superseded
+/// keystroke is lost data.
+struct EncodeQueue {
+    inner: Mutex<QueueInner>,
+    signal: std::sync::Condvar,
+}
+
+struct QueueInner {
+    queue: std::collections::VecDeque<EncodeCommand>,
+    /// Surfaces whose queued frame was replaced. The next frame actually
+    /// encoded for one of these is flagged as a discontinuity, so the viewer's
+    /// HUD reports the gap rather than silently under-counting.
+    superseded: std::collections::BTreeSet<SurfaceKey>,
+    stopped: bool,
+}
+
+impl EncodeQueue {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(QueueInner {
+                queue: std::collections::VecDeque::new(),
+                superseded: std::collections::BTreeSet::new(),
+                stopped: false,
+            }),
+            signal: std::sync::Condvar::new(),
+        }
+    }
+
+    fn submit(&self, command: EncodeCommand) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        match &command {
+            EncodeCommand::Frame { key, .. } => {
+                let key = *key;
+                if let Some(slot) = inner.queue.iter_mut().find(
+                    |queued| matches!(queued, EncodeCommand::Frame { key: queued, .. } if *queued == key),
+                ) {
+                    *slot = command;
+                    inner.superseded.insert(key);
+                    self.signal.notify_one();
+                    return;
+                }
+            }
+            EncodeCommand::EndStream { key } => {
+                // Nothing composited before the destroy is worth encoding now.
+                let key = *key;
+                inner.queue.retain(
+                    |queued| !matches!(queued, EncodeCommand::Frame { key: queued, .. } if *queued == key),
+                );
+                inner.superseded.remove(&key);
+            }
+            EncodeCommand::ClientGone { client_id } => {
+                let client_id = *client_id;
+                inner.queue.retain(|queued| {
+                    !matches!(queued, EncodeCommand::Frame { key, .. } if key.client_id == client_id)
+                });
+                inner.superseded.retain(|key| key.client_id != client_id);
+            }
+            EncodeCommand::ForceKeyframeAll => {}
+        }
+        inner.queue.push_back(command);
+        self.signal.notify_one();
+    }
+
+    /// Blocks until there is work or the queue is stopped.
+    ///
+    /// The lock is released before the caller encodes, so a slow encode — an
+    /// FFmpeg spawn in the worst case — never makes `submit` wait. That is the
+    /// whole point of the queue; keep it that way.
+    fn next(&self) -> Option<(EncodeCommand, bool)> {
+        let mut inner = self.inner.lock().ok()?;
+        loop {
+            if let Some(next) = pop_next(&mut inner) {
+                return Some(next);
+            }
+            if inner.stopped {
+                return None;
+            }
+            inner = self.signal.wait(inner).ok()?;
+        }
+    }
+
+    /// Takes the next command if there is one, without blocking.
+    #[cfg(test)]
+    fn try_next(&self) -> Option<(EncodeCommand, bool)> {
+        let mut inner = self.inner.lock().ok()?;
+        pop_next(&mut inner)
+    }
+
+    fn stop(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.stopped = true;
+        }
+        self.signal.notify_all();
+    }
+}
+
+/// Takes the next command off a locked queue, reporting whether a frame was
+/// dropped in favour of the one being returned. The single place that pop and
+/// `superseded` bookkeeping happen, so the blocking and non-blocking paths
+/// cannot drift apart.
+fn pop_next(inner: &mut QueueInner) -> Option<(EncodeCommand, bool)> {
+    let command = inner.queue.pop_front()?;
+    let superseded = match &command {
+        EncodeCommand::Frame { key, .. } => inner.superseded.remove(key),
+        _ => false,
+    };
+    Some((command, superseded))
+}
+
+/// Applies one command to the stream map. Shared by the encode thread and by
+/// tests, which drive it synchronously so they can inspect the result.
+fn apply_encode_command(
+    session: &str,
+    media: &MediaHub,
+    streams: &mut HashMap<SurfaceKey, StreamState>,
+    command: EncodeCommand,
+    superseded: bool,
+) {
+    match command {
+        EncodeCommand::Frame { key, frame } => {
+            if superseded && let Some(stream) = streams.get_mut(&key) {
+                // A frame for this surface was dropped in favour of this one,
+                // so the stream really is missing data and must say so.
+                stream.discontinuity = true;
+            }
+            if let Err(error) = encode_frame(session, media, streams, key, frame) {
+                tracing::warn!(?key, %error, "failed to encode captured frame");
+            }
+        }
+        EncodeCommand::ForceKeyframeAll => force_keyframe_on_all_streams(streams),
+        EncodeCommand::EndStream { key } => end_stream(session, media, streams, key),
+        EncodeCommand::ClientGone { client_id } => {
+            let keys: Vec<SurfaceKey> = streams
+                .keys()
+                .filter(|key| key.client_id == client_id)
+                .copied()
+                .collect();
+            for key in keys {
+                end_stream(session, media, streams, key);
+            }
+        }
+    }
+}
+
+/// Owns every encoder for one session, on a thread of its own.
+fn encode_loop(session: String, media: MediaHub, queue: Arc<EncodeQueue>) {
+    let mut streams: HashMap<SurfaceKey, StreamState> = HashMap::new();
+    while let Some((command, superseded)) = queue.next() {
+        apply_encode_command(&session, &media, &mut streams, command, superseded);
+    }
+    tracing::debug!("encode pipeline stopped");
+}
+
+/// Drains everything currently queued, through the same code path the encode
+/// thread uses. Lets a test submit work and then inspect what it produced,
+/// without the timing of a real thread.
+#[cfg(test)]
+fn drain_encode_queue(
+    session: &str,
+    media: &MediaHub,
+    queue: &EncodeQueue,
+    streams: &mut HashMap<SurfaceKey, StreamState>,
+) {
+    while let Some((command, superseded)) = queue.try_next() {
+        apply_encode_command(session, media, streams, command, superseded);
     }
 }
 
@@ -576,6 +786,23 @@ mod tests {
             .expect("media channel closed unexpectedly")
     }
 
+    fn worker_fixture(scene: Scene) -> WorkerState {
+        WorkerState {
+            scene,
+            input: InputState::default(),
+            encode: Arc::new(EncodeQueue::new()),
+        }
+    }
+
+    /// The stream map the encode thread would own, held locally so a test can
+    /// inspect it. Encoding is no longer synchronous with `handle_scene_events`,
+    /// so a test drains between the steps whose effects it wants to separate —
+    /// draining only at the end would let two frames for one surface coalesce
+    /// into one, which is correct behaviour but not what those tests measure.
+    fn streams_fixture() -> HashMap<SurfaceKey, StreamState> {
+        HashMap::new()
+    }
+
     #[test]
     fn normalize_frame_pads_odd_dimensions_and_preserves_pixel_rows() {
         // 3x3 source: three rows, each with a distinguishable byte value, so
@@ -687,11 +914,8 @@ mod tests {
         let client = media.attach("s1").unwrap();
 
         let scene = scene_with_toplevels(&[(1, 1), (1, 2)]);
-        let mut worker = WorkerState {
-            scene,
-            streams: HashMap::new(),
-            input: InputState::default(),
-        };
+        let mut worker = worker_fixture(scene);
+        let mut streams = streams_fixture();
         let key1 = SurfaceKey {
             client_id: 1,
             surface_id: 1,
@@ -704,21 +928,20 @@ mod tests {
         // Each toplevel is encoded off its own commit, so both must commit
         // for both streams to exist.
         handle_scene_events(
-            "s1",
-            &media,
             &mut worker,
             vec![
                 SceneEvent::SurfaceCommitted(key1),
                 SceneEvent::SurfaceCommitted(key2),
             ],
         );
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
 
-        assert_eq!(worker.streams.len(), 2);
-        let stream1_id = worker.streams[&key1].id;
-        let stream2_id = worker.streams[&key2].id;
+        assert_eq!(streams.len(), 2);
+        let stream1_id = streams[&key1].id;
+        let stream2_id = streams[&key2].id;
         assert_ne!(stream1_id, stream2_id, "each toplevel gets its own stream");
-        assert_eq!(worker.streams[&key1].sequence, 2);
-        assert_eq!(worker.streams[&key2].sequence, 2);
+        assert_eq!(streams[&key1].sequence, 2);
+        assert_eq!(streams[&key2].sequence, 2);
 
         let mut by_stream: HashMap<u64, Vec<(MediaKind, u64, bool)>> = HashMap::new();
         for _ in 0..4 {
@@ -747,19 +970,19 @@ mod tests {
         // Publishing another frame to just one stream must not disturb the
         // other's sequence numbering.
         let frame = normalize_frame(worker.scene.compose_toplevel(key1).unwrap());
-        encode_frame("s1", &media, &mut worker.streams, key1, frame).unwrap();
-        assert!(worker.streams[&key1].sequence > 2);
+        encode_frame("s1", &media, &mut streams, key1, frame).unwrap();
+        assert!(streams[&key1].sequence > 2);
         assert_eq!(
-            worker.streams[&key2].sequence, 2,
+            streams[&key2].sequence, 2,
             "publishing to one stream must not disturb the other's sequencing"
         );
 
         // The resize path forces every live stream to re-key on its next frame.
-        force_keyframe_on_all_streams(&mut worker.streams);
-        assert!(worker.streams[&key1].force_keyframe);
-        assert!(worker.streams[&key1].discontinuity);
-        assert!(worker.streams[&key2].force_keyframe);
-        assert!(worker.streams[&key2].discontinuity);
+        force_keyframe_on_all_streams(&mut streams);
+        assert!(streams[&key1].force_keyframe);
+        assert!(streams[&key1].discontinuity);
+        assert!(streams[&key2].force_keyframe);
+        assert!(streams[&key2].discontinuity);
     }
 
     /// A commit belongs to one window. Re-encoding every open toplevel on
@@ -775,11 +998,8 @@ mod tests {
         let client = media.attach("s1").unwrap();
 
         let scene = scene_with_toplevels(&[(1, 1), (1, 2)]);
-        let mut worker = WorkerState {
-            scene,
-            streams: HashMap::new(),
-            input: InputState::default(),
-        };
+        let mut worker = worker_fixture(scene);
+        let mut streams = streams_fixture();
         let key1 = SurfaceKey {
             client_id: 1,
             surface_id: 1,
@@ -789,19 +1009,15 @@ mod tests {
             surface_id: 2,
         };
 
-        handle_scene_events(
-            "s1",
-            &media,
-            &mut worker,
-            vec![SceneEvent::SurfaceCommitted(key1)],
-        );
+        handle_scene_events(&mut worker, vec![SceneEvent::SurfaceCommitted(key1)]);
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
 
         assert_eq!(
-            worker.streams.len(),
+            streams.len(),
             1,
             "only the committed toplevel may be encoded"
         );
-        let stream1 = worker.streams[&key1].id;
+        let stream1 = streams[&key1].id;
         for expected in [MediaKind::StreamConfig, MediaKind::Video] {
             let packet = recv_packet(&client).await;
             assert_eq!(packet.header.stream_id, stream1);
@@ -815,33 +1031,28 @@ mod tests {
         );
 
         // The other window starts streaming on its own commit, and repeated
-        // commits to it leave the first window's stream alone.
-        handle_scene_events(
-            "s1",
-            &media,
-            &mut worker,
-            vec![SceneEvent::SurfaceCommitted(key2)],
-        );
-        assert_eq!(worker.streams.len(), 2);
-        let sequence1 = worker.streams[&key1].sequence;
+        // commits to it leave the first window's stream alone. Each commit is
+        // drained before the next is submitted: two queued frames for one
+        // surface would coalesce, which is right in production but would make
+        // this test measure one frame where it means to measure two.
+        handle_scene_events(&mut worker, vec![SceneEvent::SurfaceCommitted(key2)]);
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
+        assert_eq!(streams.len(), 2);
+        let sequence1 = streams[&key1].sequence;
         for expected in [MediaKind::StreamConfig, MediaKind::Video] {
             let packet = recv_packet(&client).await;
-            assert_eq!(packet.header.stream_id, worker.streams[&key2].id);
+            assert_eq!(packet.header.stream_id, streams[&key2].id);
             assert_eq!(packet.header.kind, expected);
         }
 
-        handle_scene_events(
-            "s1",
-            &media,
-            &mut worker,
-            vec![SceneEvent::SurfaceCommitted(key2)],
-        );
+        handle_scene_events(&mut worker, vec![SceneEvent::SurfaceCommitted(key2)]);
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
         assert_eq!(
-            worker.streams[&key1].sequence, sequence1,
+            streams[&key1].sequence, sequence1,
             "a commit to one window must not advance another window's stream"
         );
         let packet = recv_packet(&client).await;
-        assert_eq!(packet.header.stream_id, worker.streams[&key2].id);
+        assert_eq!(packet.header.stream_id, streams[&key2].id);
     }
 
     /// `Scene::compose_toplevel` draws subsurfaces into their toplevel's
@@ -857,11 +1068,8 @@ mod tests {
         let client = media.attach("s1").unwrap();
 
         let scene = scene_with_toplevel_and_subsurface(1, 1, 2);
-        let mut worker = WorkerState {
-            scene,
-            streams: HashMap::new(),
-            input: InputState::default(),
-        };
+        let mut worker = worker_fixture(scene);
+        let mut streams = streams_fixture();
         let toplevel = SurfaceKey {
             client_id: 1,
             surface_id: 1,
@@ -871,39 +1079,31 @@ mod tests {
             surface_id: 2,
         };
 
-        handle_scene_events(
-            "s1",
-            &media,
-            &mut worker,
-            vec![SceneEvent::SurfaceCommitted(child)],
-        );
+        handle_scene_events(&mut worker, vec![SceneEvent::SurfaceCommitted(child)]);
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
 
         assert!(
-            worker.streams.contains_key(&toplevel),
+            streams.contains_key(&toplevel),
             "a subsurface commit must re-encode its toplevel ancestor"
         );
         assert!(
-            !worker.streams.contains_key(&child),
+            !streams.contains_key(&child),
             "a subsurface has no stream of its own"
         );
-        assert_eq!(worker.streams.len(), 1);
-        let stream = worker.streams[&toplevel].id;
+        assert_eq!(streams.len(), 1);
+        let stream = streams[&toplevel].id;
         for expected in [MediaKind::StreamConfig, MediaKind::Video] {
             let packet = recv_packet(&client).await;
             assert_eq!(packet.header.stream_id, stream);
             assert_eq!(packet.header.kind, expected);
         }
 
-        let sequence = worker.streams[&toplevel].sequence;
-        handle_scene_events(
-            "s1",
-            &media,
-            &mut worker,
-            vec![SceneEvent::SurfaceCommitted(child)],
-        );
-        assert_eq!(worker.streams[&toplevel].id, stream);
+        let sequence = streams[&toplevel].sequence;
+        handle_scene_events(&mut worker, vec![SceneEvent::SurfaceCommitted(child)]);
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
+        assert_eq!(streams[&toplevel].id, stream);
         assert!(
-            worker.streams[&toplevel].sequence > sequence,
+            streams[&toplevel].sequence > sequence,
             "each subsurface commit publishes another frame on the same stream"
         );
         assert_eq!(recv_packet(&client).await.header.stream_id, stream);
@@ -921,11 +1121,8 @@ mod tests {
         // Two different clients, so `ClientDisconnected` for one must not
         // touch the other's stream.
         let scene = scene_with_toplevels(&[(1, 1), (2, 1)]);
-        let mut worker = WorkerState {
-            scene,
-            streams: HashMap::new(),
-            input: InputState::default(),
-        };
+        let mut worker = worker_fixture(scene);
+        let mut streams = streams_fixture();
         let key_a = SurfaceKey {
             client_id: 1,
             surface_id: 1,
@@ -936,43 +1133,192 @@ mod tests {
         };
 
         handle_scene_events(
-            "s1",
-            &media,
             &mut worker,
             vec![
                 SceneEvent::SurfaceCommitted(key_a),
                 SceneEvent::SurfaceCommitted(key_b),
             ],
         );
-        assert_eq!(worker.streams.len(), 2);
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
+        assert_eq!(streams.len(), 2);
         for _ in 0..4 {
             recv_packet(&client).await; // drain the initial config+video pairs
         }
 
-        handle_scene_events(
-            "s1",
-            &media,
-            &mut worker,
-            vec![SceneEvent::ClientDisconnected(1)],
-        );
-        assert!(!worker.streams.contains_key(&key_a));
-        assert!(worker.streams.contains_key(&key_b));
+        handle_scene_events(&mut worker, vec![SceneEvent::ClientDisconnected(1)]);
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
+        assert!(!streams.contains_key(&key_a));
+        assert!(streams.contains_key(&key_b));
         assert_eq!(
-            worker.streams[&key_b].sequence, 2,
+            streams[&key_b].sequence, 2,
             "client B's stream must be untouched by client A's disconnect"
         );
         let end_a = recv_packet(&client).await;
         assert_eq!(end_a.header.kind, MediaKind::StreamEnd);
 
-        handle_scene_events(
-            "s1",
-            &media,
-            &mut worker,
-            vec![SceneEvent::SurfaceDestroyed(key_b)],
-        );
-        assert!(worker.streams.is_empty());
+        handle_scene_events(&mut worker, vec![SceneEvent::SurfaceDestroyed(key_b)]);
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
+        assert!(streams.is_empty());
         let end_b = recv_packet(&client).await;
         assert_eq!(end_b.header.kind, MediaKind::StreamEnd);
         assert_ne!(end_a.header.stream_id, end_b.header.stream_id);
+    }
+
+    /// Everything the media hub published, read until it goes quiet. Lets a
+    /// test assert on how *many* packets a step produced, which is the whole
+    /// question for coalescing.
+    async fn drain_packets(client: &MediaAttachment) -> Vec<(MediaKind, bool)> {
+        let mut packets = Vec::new();
+        while let Ok(Some(packet)) =
+            tokio::time::timeout(Duration::from_millis(250), client.recv()).await
+        {
+            packets.push((packet.header.kind, packet.header.flags.discontinuity()));
+        }
+        packets
+    }
+
+    /// Two frames queued for one surface collapse to one — that is what bounds
+    /// the queue without an arbitrary cap. The survivor must be flagged as a
+    /// discontinuity, or the viewer's HUD `DISC` counter under-reports a gap
+    /// that really happened.
+    #[tokio::test]
+    async fn a_superseded_frame_collapses_into_one_encode_flagged_as_a_discontinuity() {
+        if !ffmpeg_available() {
+            return;
+        }
+        let media = MediaHub::default();
+        let _input = media.register_session("s1");
+        let client = media.attach("s1").unwrap();
+
+        let mut worker = worker_fixture(scene_with_toplevels(&[(1, 1)]));
+        let mut streams = streams_fixture();
+        let key = SurfaceKey {
+            client_id: 1,
+            surface_id: 1,
+        };
+
+        // Establish the stream first: a brand-new stream's first frame is
+        // always a discontinuity, which would mask the flag under test.
+        handle_scene_events(&mut worker, vec![SceneEvent::SurfaceCommitted(key)]);
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
+        drain_packets(&client).await;
+        assert!(
+            !streams[&key].discontinuity,
+            "an established stream starts this test with no pending gap"
+        );
+
+        // Two commits, no drain between them, so the second frame replaces the
+        // first while it is still queued.
+        handle_scene_events(&mut worker, vec![SceneEvent::SurfaceCommitted(key)]);
+        handle_scene_events(&mut worker, vec![SceneEvent::SurfaceCommitted(key)]);
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
+
+        let published = drain_packets(&client).await;
+        let video: Vec<_> = published
+            .iter()
+            .filter(|(kind, _)| *kind == MediaKind::Video)
+            .collect();
+        assert_eq!(
+            video.len(),
+            1,
+            "two frames queued for one surface must encode once, not twice"
+        );
+        assert!(
+            video[0].1,
+            "the frame that replaced another must report the gap as a discontinuity"
+        );
+    }
+
+    /// A frame composited before a surface was destroyed must not be encoded
+    /// and published after that surface's stream has ended. Sharing one queue
+    /// is what makes the ordering decidable; dropping the frame is what makes
+    /// it cheap.
+    #[tokio::test]
+    async fn a_frame_composited_before_a_destroy_never_publishes_after_the_stream_ends() {
+        if !ffmpeg_available() {
+            return;
+        }
+        let media = MediaHub::default();
+        let _input = media.register_session("s1");
+        let client = media.attach("s1").unwrap();
+
+        let mut worker = worker_fixture(scene_with_toplevels(&[(1, 1)]));
+        let mut streams = streams_fixture();
+        let key = SurfaceKey {
+            client_id: 1,
+            surface_id: 1,
+        };
+
+        handle_scene_events(&mut worker, vec![SceneEvent::SurfaceCommitted(key)]);
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
+        drain_packets(&client).await;
+
+        // Commit then destroy in one batch: the frame is queued behind nothing
+        // and the destroy lands while it is still waiting.
+        handle_scene_events(
+            &mut worker,
+            vec![
+                SceneEvent::SurfaceCommitted(key),
+                SceneEvent::SurfaceDestroyed(key),
+            ],
+        );
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
+
+        let published = drain_packets(&client).await;
+        assert!(
+            !published.iter().any(|(kind, _)| *kind == MediaKind::Video),
+            "a frame from before the destroy must not be encoded once the stream is gone"
+        );
+        assert_eq!(
+            published
+                .iter()
+                .filter(|(kind, _)| *kind == MediaKind::StreamEnd)
+                .count(),
+            1,
+            "the stream still has to end exactly once"
+        );
+        assert!(streams.is_empty());
+    }
+
+    /// The real thread, not the synchronous drain every other test uses: it
+    /// has to finish the work already queued, then stop and be joinable. A
+    /// `stop()`/`join()` deadlock here would otherwise only ever show up as a
+    /// hung session teardown on real hardware.
+    #[tokio::test]
+    async fn the_encode_thread_finishes_queued_work_then_stops_and_joins() {
+        if !ffmpeg_available() {
+            return;
+        }
+        let media = MediaHub::default();
+        let _input = media.register_session("s1");
+        let client = media.attach("s1").unwrap();
+
+        let scene = scene_with_toplevels(&[(1, 1)]);
+        let key = SurfaceKey {
+            client_id: 1,
+            surface_id: 1,
+        };
+        let frame = normalize_frame(scene.compose_toplevel(key).unwrap());
+
+        let queue = Arc::new(EncodeQueue::new());
+        let thread = {
+            let queue = Arc::clone(&queue);
+            let media = media.clone();
+            thread::spawn(move || encode_loop("s1".to_owned(), media, queue))
+        };
+
+        queue.submit(EncodeCommand::Frame { key, frame });
+        // Stopping with work still queued must drain it rather than discard
+        // it -- `run_bridge` stops the thread on every session teardown.
+        queue.stop();
+        thread.join().expect("the encode thread must not panic");
+
+        let published = drain_packets(&client).await;
+        let kinds: Vec<MediaKind> = published.iter().map(|(kind, _)| *kind).collect();
+        assert_eq!(
+            kinds,
+            vec![MediaKind::StreamConfig, MediaKind::Video],
+            "the queued frame must be encoded and published before the thread exits"
+        );
     }
 }
