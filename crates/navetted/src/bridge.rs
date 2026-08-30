@@ -435,6 +435,12 @@ fn flush_composites(
                 frame: normalize_frame(frame),
             });
         }
+        // After the composite rather than before, which means a
+        // `ForceKeyframeAll` submitted by a pump lands *between* two windows'
+        // frames: the later window re-keys this batch, the earlier one next
+        // batch. Deliberate. Pumping first would only move the same asymmetry
+        // onto the last composite, and no consumer compares keyframe timing
+        // across streams -- each surface owns its own stream and encoder.
         between(&mut worker.input, &worker.scene);
     }
     composites
@@ -444,7 +450,14 @@ fn flush_composites(
 #[derive(Default)]
 struct InputStats {
     inputs: u32,
+    /// The longest any single input sat queued before being applied. This is
+    /// the number that decides whether the guest repeats a key, not
+    /// `busy_us` and not the iteration total.
     worst_wait_us: u128,
+    /// Time spent applying input, summed across **every** pump in the
+    /// iteration -- between each message, each composite, and once at the end.
+    /// Logs from before input was pumped more than once per iteration report
+    /// this field as a single drain phase, so the two are not comparable.
     busy_us: u128,
 }
 

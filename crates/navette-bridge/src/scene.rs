@@ -685,6 +685,72 @@ mod tests {
         }))
     }
 
+    /// `run_bridge` drains client input *between* wprs messages, so input is
+    /// validated against a scene that has applied only part of a message group.
+    /// The safety argument for that rests entirely on `InputState::apply` using
+    /// point lookups, and on those lookups being stable for surfaces already
+    /// committed while a later surface in the same group is still arriving.
+    ///
+    /// This pins the second half. Without it the invariant lives only in a
+    /// comment, and the failure it guards -- input resolving differently
+    /// depending on where in a batch it happened to land -- would be
+    /// intermittent and miserable to trace.
+    #[test]
+    fn point_lookups_are_stable_midway_through_a_message_group() {
+        let mut scene = Scene::default();
+        scene
+            .apply(RecvType::RawBuffer(vec![0; 64 * 64 * 4]))
+            .unwrap();
+        let mut parent = state(1, 1, Some(toplevel()));
+        parent.buffer = Some(external_buffer(64, 64, BufferFormat::Xrgb8888));
+        parent.z_ordered_children.push(SubsurfacePosition {
+            id: WlSurfaceId(2),
+            position: Point { x: 0, y: 0 },
+        });
+        scene.apply(commit(parent)).unwrap();
+
+        let parent_key = SurfaceKey::new(ClientId(1), WlSurfaceId(1));
+        let settled_toplevels = scene.toplevels();
+        let settled_dimensions = scene.surface_dimensions(parent_key);
+        assert!(settled_toplevels.contains(&parent_key));
+        assert!(settled_dimensions.is_some());
+
+        // The child's group is now half-applied: its raw buffer has landed but
+        // its commit has not, so the parent lists a child the scene has no node
+        // for. This is exactly the window input can be pumped in.
+        scene
+            .apply(RecvType::RawBuffer(vec![0; 4 * 4 * 4]))
+            .unwrap();
+        assert!(
+            scene.has_pending_raw_buffer(),
+            "the group must actually be half-applied for this to test anything"
+        );
+
+        assert_eq!(
+            scene.toplevels(),
+            settled_toplevels,
+            "a half-applied group must not change which surfaces are toplevels"
+        );
+        assert_eq!(
+            scene.surface_dimensions(parent_key),
+            settled_dimensions,
+            "a half-applied group must not change an already-committed surface's dimensions"
+        );
+
+        // And completing the group leaves them stable too.
+        let mut child = state(1, 2, None);
+        child.role = Some(Role::SubSurface(SubSurfaceState {
+            parent: WlSurfaceId(1),
+            location: Point { x: 0, y: 0 },
+            sync: true,
+        }));
+        child.buffer = Some(external_buffer(4, 4, BufferFormat::Argb8888));
+        scene.apply(commit(child)).unwrap();
+
+        assert_eq!(scene.toplevels(), settled_toplevels);
+        assert_eq!(scene.surface_dimensions(parent_key), settled_dimensions);
+    }
+
     #[test]
     fn pairs_raw_buffer_and_preserves_image_on_damage_only_commit() {
         let mut scene = Scene::default();

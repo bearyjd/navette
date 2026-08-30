@@ -1148,11 +1148,36 @@ the ~20% fall in `apply_us` above. Real waste on the hottest path, but not the
 root cause -- worth separating, because fixing only this would have left the
 defect in place.
 
-**Still true:** iterations still run 350-390ms at three windows, and `apply`
-(~186ms) plus `compose` (~171ms) are what fill them. Nothing there is a symptom
-any more, but a guest with many more windows would push frame *throughput*
-down even though input stays responsive. That is a different problem from this
-one and should not be conflated with it again.
+### The loop is still saturated, and the alarm for it is now gone
+
+Stated as throughput, because milliseconds understate it and because the
+symptom that used to make anyone look at this is fixed.
+
+Three windows, post-fix, per-iteration total: **p50 31-33ms, p90 57-119ms, max
+356-392ms**. A window that commits every iteration gets one composite per
+iteration, so its frame rate tracks that: **roughly 30fps at the median,
+8-17fps at p90, and ~2.6fps in the tail** -- the tail being exactly what a
+resize burst looks like. `apply` (~186ms) and `compose` (~171ms) fill it.
+
+Nothing there is a *symptom* now. Input stays responsive throughout, which is
+the point of the fix. But the honest reading is that during a resize the guest
+is a slideshow, and a guest with more windows is worse. Two things follow:
+
+1. **Do not treat this as closed because typing works.** The repeat defect was
+   the alarm for loop saturation and it was never a good one -- it fired at a
+   threshold (wprsd's 200ms repeat delay) unrelated to throughput, so a loop at
+   190ms per iteration produced ~5fps and rang nothing at all. That alarm is
+   now permanently silent. The next signal will be someone saying "video is
+   choppy", which is much harder to trace back to `run_bridge`.
+2. **The ceiling is `Scene::apply` decoding a full framebuffer per commit**
+   (`decode_image`: a `vec![0; ~3MB]` plus a per-byte `unfilter` pass). The
+   discarded-clone fix took ~20% off it. The rest is real work, and reducing it
+   means not decoding frames nobody composites, or decoding them off the loop.
+   That is a throughput problem and wants the opposite treatment from the
+   latency one: less interleaving, less work -- not more pumping.
+
+Keep the two apart. Conflating them is what sent the previous two sessions to
+the wrong layer.
 
 ## What's next
 
