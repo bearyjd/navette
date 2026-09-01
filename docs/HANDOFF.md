@@ -1102,6 +1102,83 @@ So: land the coalescing (it is a strict improvement and removes ~90% of a
 real waste), but **M2's gate should not be called closed on single-window
 evidence.** The symptom is gone for one window and returns at three.
 
+## FIXED at three windows too: bound the wait, don't shrink the work (2026-08-29)
+
+Branch `perf/bound-input-latency`. Three-window guest: **4/4 runs at 6/6**,
+against 6/6, 3/6, 3/6 before.
+
+**The framing "fix the scene.apply bottleneck" was wrong, and optimising apply
+would not have fixed this.** Input latency was unbounded *by construction*:
+`run_bridge` drained `MediaCommand::Input` only after every message in a batch
+and then every owed composite, so a keystroke inherited the whole batch's
+cost. That cost scales with window count -- each commit decodes a full
+framebuffer, each painting window owes a composite -- and once it clears
+wprsd's 200ms repeat delay the guest repeats. Coalescing lowered the constant.
+It never bounded the wait. That is why the symptom returned at three windows
+even with composition already doing the minimum work possible.
+
+`pump_input` now runs between messages *and* between composites.
+
+| 3 windows | before | after |
+|---|---|---|
+| `worst_input_wait_us` max | 339,490 | **46,803 / 29,490** |
+| `total_us` max | 375,819 | 355,980 / 392,356 |
+| `apply_us` max | 239,288 | 186,316 / 202,674 |
+| `compose_us` max | 168,001 | 171,472 / 189,480 |
+
+**Read the second row before the first.** Total iteration time is *unchanged*
+and composition is *unchanged* -- the batch is exactly as expensive as it was.
+Input wait still fell 7-11x, to a ~4x margin under the 200ms line. That is the
+signature of the right fix: latency decoupled from batch duration rather than
+the batch made faster. It removes the dependence on window count instead of
+lowering its constant, so a fourth and fifth window do not re-break it.
+
+**Safety of draining mid-batch:** `InputState::apply` only does read-only point
+lookups (`validate_surface`, `surface_dimensions`), and each message's scene
+update completes atomically, so the scene is always internally consistent. For
+pointer input it is arguably *more* correct -- coordinates are clamped against
+the dimensions the client actually saw, not a frame composited later in the
+same batch.
+
+**Also fixed, separately:** `apply_surface` cloned the previous surface image
+on every commit, but `decode_assignment` carries it forward only when the
+commit brings no buffer of its own. Every ordinary repaint deep-copied a whole
+framebuffer and dropped it. Guarding on `state.buffer.is_none()` accounts for
+the ~20% fall in `apply_us` above. Real waste on the hottest path, but not the
+root cause -- worth separating, because fixing only this would have left the
+defect in place.
+
+### The loop is still saturated, and the alarm for it is now gone
+
+Stated as throughput, because milliseconds understate it and because the
+symptom that used to make anyone look at this is fixed.
+
+Three windows, post-fix, per-iteration total: **p50 31-33ms, p90 57-119ms, max
+356-392ms**. A window that commits every iteration gets one composite per
+iteration, so its frame rate tracks that: **roughly 30fps at the median,
+8-17fps at p90, and ~2.6fps in the tail** -- the tail being exactly what a
+resize burst looks like. `apply` (~186ms) and `compose` (~171ms) fill it.
+
+Nothing there is a *symptom* now. Input stays responsive throughout, which is
+the point of the fix. But the honest reading is that during a resize the guest
+is a slideshow, and a guest with more windows is worse. Two things follow:
+
+1. **Do not treat this as closed because typing works.** The repeat defect was
+   the alarm for loop saturation and it was never a good one -- it fired at a
+   threshold (wprsd's 200ms repeat delay) unrelated to throughput, so a loop at
+   190ms per iteration produced ~5fps and rang nothing at all. That alarm is
+   now permanently silent. The next signal will be someone saying "video is
+   choppy", which is much harder to trace back to `run_bridge`.
+2. **The ceiling is `Scene::apply` decoding a full framebuffer per commit**
+   (`decode_image`: a `vec![0; ~3MB]` plus a per-byte `unfilter` pass). The
+   discarded-clone fix took ~20% off it. The rest is real work, and reducing it
+   means not decoding frames nobody composites, or decoding them off the loop.
+   That is a throughput problem and wants the opposite treatment from the
+   latency one: less interleaving, less work -- not more pumping.
+
+Keep the two apart. Conflating them is what sent the previous two sessions to
+the wrong layer.
+
 ## What's next
 
 Items 1-4 of the previous list are done and are kept below only as history.

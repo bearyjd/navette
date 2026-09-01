@@ -303,7 +303,18 @@ impl Scene {
                     return Err(SceneError::IdentityMismatch);
                 }
                 let previous = self.surfaces.get(&key);
-                let previous_image = previous.and_then(|node| node.image.clone());
+                // Only carried forward when this commit brings no buffer of its
+                // own; `decode_assignment` discards it for both `New` and
+                // `Removed`. Cloning unconditionally meant deep-copying a whole
+                // framebuffer -- megabytes -- on every ordinary repaint, and
+                // then dropping it. Guarding the clone keeps the common path
+                // free, which matters because this runs per commit on the loop
+                // that also delivers keystrokes.
+                let previous_image = if state.buffer.is_none() {
+                    previous.and_then(|node| node.image.clone())
+                } else {
+                    None
+                };
                 let previous_parent = previous.and_then(|node| node.parent);
                 let previous_children: Vec<SurfaceKey> = previous
                     .map(|node| node.children.iter().map(|child| child.key).collect())
@@ -672,6 +683,127 @@ mod tests {
             surface: state.id,
             payload: SurfaceRequestPayload::Commit(state),
         }))
+    }
+
+    /// `run_bridge` drains client input *between* wprs messages, so input is
+    /// validated against a scene that has applied only part of a message group.
+    /// The safety argument for that rests entirely on `InputState::apply` using
+    /// point lookups, and on those lookups being stable for surfaces already
+    /// committed while a later surface in the same group is still arriving.
+    ///
+    /// This pins the second half. Without it the invariant lives only in a
+    /// comment, and the failure it guards -- input resolving differently
+    /// depending on where in a batch it happened to land -- would be
+    /// intermittent and miserable to trace.
+    #[test]
+    fn point_lookups_are_stable_midway_through_a_message_group() {
+        let mut scene = Scene::default();
+        scene
+            .apply(RecvType::RawBuffer(vec![0; 64 * 64 * 4]))
+            .unwrap();
+        let mut parent = state(1, 1, Some(toplevel()));
+        parent.buffer = Some(external_buffer(64, 64, BufferFormat::Xrgb8888));
+        parent.z_ordered_children.push(SubsurfacePosition {
+            id: WlSurfaceId(2),
+            position: Point { x: 0, y: 0 },
+        });
+        scene.apply(commit(parent)).unwrap();
+
+        let parent_key = SurfaceKey::new(ClientId(1), WlSurfaceId(1));
+        let settled_toplevels = scene.toplevels();
+        let settled_dimensions = scene.surface_dimensions(parent_key);
+        assert!(settled_toplevels.contains(&parent_key));
+        assert!(settled_dimensions.is_some());
+
+        // The child's group is now half-applied: its raw buffer has landed but
+        // its commit has not, so the parent lists a child the scene has no node
+        // for. This is exactly the window input can be pumped in.
+        scene
+            .apply(RecvType::RawBuffer(vec![0; 4 * 4 * 4]))
+            .unwrap();
+        assert!(
+            scene.has_pending_raw_buffer(),
+            "the group must actually be half-applied for this to test anything"
+        );
+
+        assert_eq!(
+            scene.toplevels(),
+            settled_toplevels,
+            "a half-applied group must not change which surfaces are toplevels"
+        );
+        assert_eq!(
+            scene.surface_dimensions(parent_key),
+            settled_dimensions,
+            "a half-applied group must not change an already-committed surface's dimensions"
+        );
+
+        // And completing the group leaves them stable too.
+        let mut child = state(1, 2, None);
+        child.role = Some(Role::SubSurface(SubSurfaceState {
+            parent: WlSurfaceId(1),
+            location: Point { x: 0, y: 0 },
+            sync: true,
+        }));
+        child.buffer = Some(external_buffer(4, 4, BufferFormat::Argb8888));
+        scene.apply(commit(child)).unwrap();
+
+        assert_eq!(scene.toplevels(), settled_toplevels);
+        assert_eq!(scene.surface_dimensions(parent_key), settled_dimensions);
+    }
+
+    /// The other half of the invariant above: a destroy mid-group, not just a
+    /// commit mid-group. A parent's commit can list a child that never
+    /// arrives -- its raw buffer and commit are still in flight -- and before
+    /// they do, the parent itself is destroyed. The group never completes at
+    /// all. `toplevels()` must reflect that removal the instant the destroy
+    /// is applied, not wait for a completion that is now never coming, since
+    /// input pumped right after this message has to see it gone.
+    ///
+    /// A raw buffer cannot be pending across an unrelated message (the scene
+    /// rejects that outright, see `rejects_invalid_or_unpaired_buffers_...`),
+    /// so unlike the commit half above, the realistic gap here is between two
+    /// whole messages, not mid-buffer-pairing: the parent's own commit has
+    /// already resolved by the time its listed child's group can still be
+    /// outstanding.
+    #[test]
+    fn destroying_a_toplevel_midway_through_a_group_removes_it_immediately() {
+        let mut scene = Scene::default();
+        scene
+            .apply(RecvType::RawBuffer(vec![0; 64 * 64 * 4]))
+            .unwrap();
+        let mut parent = state(1, 1, Some(toplevel()));
+        parent.buffer = Some(external_buffer(64, 64, BufferFormat::Xrgb8888));
+        parent.z_ordered_children.push(SubsurfacePosition {
+            id: WlSurfaceId(2),
+            position: Point { x: 0, y: 0 },
+        });
+        scene.apply(commit(parent)).unwrap();
+
+        let parent_key = SurfaceKey::new(ClientId(1), WlSurfaceId(1));
+        assert!(scene.toplevels().contains(&parent_key));
+        assert!(
+            !scene.pending_parents.is_empty(),
+            "the child listed above must actually be outstanding for this to test anything"
+        );
+
+        // The child's group -- its own raw buffer and commit -- never arrives:
+        // the parent is destroyed first.
+        let events = scene
+            .apply(RecvType::Object(Request::Surface(SurfaceRequest {
+                client: ClientId(1),
+                surface: WlSurfaceId(1),
+                payload: SurfaceRequestPayload::Destroyed,
+            })))
+            .unwrap();
+
+        assert!(
+            events.contains(&SceneEvent::SurfaceDestroyed(parent_key)),
+            "the destroy must be reported, not swallowed by the incomplete group"
+        );
+        assert!(
+            !scene.toplevels().contains(&parent_key),
+            "a destroy mid-group must remove the surface immediately, not wait for the group to complete"
+        );
     }
 
     #[test]

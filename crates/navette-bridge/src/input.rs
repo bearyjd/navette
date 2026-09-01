@@ -39,6 +39,22 @@ pub struct InputState {
 }
 
 impl InputState {
+    /// Translates one client input into wprs protocol events.
+    ///
+    /// **Scene access here must stay point-lookup only** -- `toplevels()` and
+    /// `surface_dimensions()`, never a walk of the parent/child graph.
+    /// `run_bridge` calls this *between* wprs messages, not at a batch
+    /// boundary, so the graph can be mid-update: wprsd sends a parent and its
+    /// children as a group, and `sync_child_back_pointers` runs per commit, so
+    /// between two messages a child can point at a parent that does not yet
+    /// list it. Nothing here traverses that today, which is the only reason
+    /// draining input mid-batch is safe.
+    ///
+    /// If you add an ancestor walk (the shape `Scene::toplevel_ancestor` has),
+    /// it either has to tolerate a partial group or this call has to move back
+    /// to a batch boundary -- which would restore the unbounded input latency
+    /// that mid-batch draining exists to fix. See
+    /// `scene::tests::point_lookups_are_stable_midway_through_a_message_group`.
     pub fn apply(
         &mut self,
         attachment_id: u64,
