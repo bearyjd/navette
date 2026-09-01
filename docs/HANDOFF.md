@@ -1179,6 +1179,63 @@ is a slideshow, and a guest with more windows is worse. Two things follow:
 Keep the two apart. Conflating them is what sent the previous two sessions to
 the wrong layer.
 
+## Decode was the ceiling, and half of it was wasted (2026-08-31)
+
+Confirmed the suspicion above with a microbenchmark of `decode_image` in
+isolation, at realistic window sizes:
+
+| window size | zero-init alloc | `filtering::unfilter` (SIMD defilter) | full `decode_image` |
+|---|---|---|---|
+| 64x64 (test fixture) | ~0us | ~22us | ~16us |
+| 800x600 | ~38us | ~1,779us | ~1,955us |
+| 1920x1080 | ~203us | ~4,662us | ~3,397us |
+
+`filtering::unfilter` -- the vendored `wprs` SIMD routine that reverses the
+delta-encoded pixel filter wprsd applies before sending buffers over the
+socket -- is 91-96% of decode's cost, and scales with pixel count as expected.
+Allocation is noise. Nothing pathological in the vendored code; the cost is
+real and roughly linear.
+
+But *which* commits paid it was the actual problem, not the cost per call.
+PR #13's own diagnostic already showed a resize burst sends ~10 commits to one
+window per iteration, all superseding each other, and only the last one
+before the batch's single composite ever mattered -- composite coalescing was
+already fixed for exactly this shape. Nothing coalesced decode the same way:
+every one of those 10 commits still carried a brand-new buffer (a resize
+always reallocates), so `Scene::apply` unfiltered all 10 full framebuffers
+even though 9 were thrown away before the batch's one composite. At
+1920x1080 that is ~42ms of real CPU time per iteration, per window, spent
+decoding images nobody ever looked at.
+
+**Fixed** the same way PR #13 fixed composition: don't do the work eagerly.
+`SurfaceNode.image` is now `SurfaceImage`, an enum of `None` /
+`Pending { width, height, stride, format, filtered }` / `Decoded(Image)`.
+A commit with a new buffer validates it synchronously (dimensions, stride,
+buffer-length consistency all still checked at commit time, so a malformed
+buffer is still rejected from `Scene::apply` immediately, exactly as before --
+see `validate_buffer`) but stores the still-filtered bytes and stops there.
+The actual SIMD defilter runs the first time something asks for pixels --
+`Scene::compose_toplevel`, now `&mut self` instead of `&self` -- and the
+result is cached, so a second composite in the same batch is free and a
+superseded commit is never decoded at all.
+
+Verified with the same kind of A/B this project has used before: a synthetic
+10-commit resize burst to one 1920x1080 window, one compose, measured through
+the real `Scene` API. Forcing eager decode (a one-line mutation reverting the
+laziness) cost 64.3ms total; the fix costs 24.5ms -- a ~2.6x reduction from
+eliminating 9 of 10 wasted decodes, in line with the isolated benchmark above.
+Guarded by `a_second_new_buffer_before_any_compose_supersedes_the_first_without_decoding_it`,
+mutation-verified to fail if decode is forced eager again.
+
+**Not yet re-verified live.** All prior throughput numbers in this file (the
+30fps/2.6fps figures two sections up) were measured before this fix. The
+scratchpad e2e harness from those sessions is gone (ephemeral, `/tmp`), and
+rebuilding it was out of scope for this pass -- the evidence here is a unit-level
+benchmark of the actual mechanism, not a live remeasurement of the bridge loop
+under a real resize burst. Before this is called closed, re-run the same
+3-window e2e harness used for PRs #13/#14 and confirm the iteration-time
+percentiles actually moved, not just the isolated decode cost.
+
 ## What's next
 
 Items 1-4 of the previous list are done and are kept below only as history.
