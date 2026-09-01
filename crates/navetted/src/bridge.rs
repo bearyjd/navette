@@ -1656,7 +1656,7 @@ mod tests {
         let _input = media.register_session("s1");
         let client = media.attach("s1").unwrap();
 
-        let scene = scene_with_toplevels(&[(1, 1)]);
+        let mut scene = scene_with_toplevels(&[(1, 1)]);
         let key = SurfaceKey {
             client_id: 1,
             surface_id: 1,

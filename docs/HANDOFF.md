@@ -1179,6 +1179,115 @@ is a slideshow, and a guest with more windows is worse. Two things follow:
 Keep the two apart. Conflating them is what sent the previous two sessions to
 the wrong layer.
 
+## Decode was the ceiling, and half of it was wasted (2026-08-31)
+
+Confirmed the suspicion above with a microbenchmark of `decode_image` in
+isolation, at realistic window sizes:
+
+| window size | zero-init alloc | `filtering::unfilter` (SIMD defilter) | full `decode_image` |
+|---|---|---|---|
+| 64x64 (test fixture) | ~0us | ~22us | ~16us |
+| 800x600 | ~38us | ~1,779us | ~1,955us |
+| 1920x1080 | ~203us | ~4,662us | ~3,397us |
+
+`filtering::unfilter` -- the vendored `wprs` SIMD routine that reverses the
+delta-encoded pixel filter wprsd applies before sending buffers over the
+socket -- is 91-96% of decode's cost, and scales with pixel count as expected.
+Allocation is noise. Nothing pathological in the vendored code; the cost is
+real and roughly linear.
+
+But *which* commits paid it was the actual problem, not the cost per call.
+PR #13's own diagnostic already showed a resize burst sends ~10 commits to one
+window per iteration, all superseding each other, and only the last one
+before the batch's single composite ever mattered -- composite coalescing was
+already fixed for exactly this shape. Nothing coalesced decode the same way:
+every one of those 10 commits still carried a brand-new buffer (a resize
+always reallocates), so `Scene::apply` unfiltered all 10 full framebuffers
+even though 9 were thrown away before the batch's one composite. At
+1920x1080 that is ~42ms of real CPU time per iteration, per window, spent
+decoding images nobody ever looked at.
+
+**Fixed** the same way PR #13 fixed composition: don't do the work eagerly.
+`SurfaceNode.image` is now `SurfaceImage`, an enum of `None` /
+`Pending { width, height, stride, format, filtered }` / `Decoded(Image)`.
+A commit with a new buffer validates it synchronously (dimensions, stride,
+buffer-length consistency all still checked at commit time, so a malformed
+buffer is still rejected from `Scene::apply` immediately, exactly as before --
+see `validate_buffer`) but stores the still-filtered bytes and stops there.
+The actual SIMD defilter runs the first time something asks for pixels --
+`Scene::compose_toplevel`, now `&mut self` instead of `&self` -- and the
+result is cached, so a second composite in the same batch is free and a
+superseded commit is never decoded at all.
+
+Verified with the same kind of A/B this project has used before: a synthetic
+10-commit resize burst to one 1920x1080 window, one compose, measured through
+the real `Scene` API. Forcing eager decode (a one-line mutation reverting the
+laziness) cost 64.3ms total; the fix costs 24.5ms -- a ~2.6x reduction from
+eliminating 9 of 10 wasted decodes, in line with the isolated benchmark above.
+Guarded by `a_second_new_buffer_before_any_compose_supersedes_the_first_without_decoding_it`,
+mutation-verified to fail if decode is forced eager again.
+
+## Re-verified live, and it's not just faster -- master doesn't recover (2026-08-31, later)
+
+The old sway+wtype+viewer e2e harness from PRs #13/#14 was gone (ephemeral
+`/tmp`), and its keyboard-scoring half measures a different problem (M2's
+already-closed repeat defect). Rebuilt a narrower rig instead, scoped to what
+this fix actually changes -- bridge-loop throughput, not keystroke scoring:
+`navetted` + `wprsd` + a continuously-painting guest, read straight out of
+`navetted`'s own iteration-timing trace. No viewer, no nested sway, no wtype.
+
+- **Guest**: `crates/navette-viewer/examples/paintloop_guest.rs`, checked in
+  this time rather than left in scratch -- three sessions have now paid to
+  rebuild a lost harness (this file's own history above, twice; the
+  keyprobe/e2e-keys lineage a third time). `PAINTLOOP_WINDOWS` native `minifb`
+  windows (1280x720), each repainting flat out with `set_target_fps(0)` --
+  no throttling of its own, deliberately harsher than a real resize (which
+  settles after a few frames; this never does). Run under a session's
+  `WAYLAND_DISPLAY` via a `.desktop` entry in a scratch `XDG_DATA_HOME`
+  (`navetted` spawns `wprsd` and the guest itself, `supervisor.rs:175-197` --
+  no manual wiring needed) and `XDG_CONFIG_HOME` pointing at a `wprsd.ron`
+  with `enable_xwayland: false` (the guest is native Wayland; without this,
+  `wprsd` panics trying to exec a `xwayland-xdg-shell` helper that isn't on
+  this machine).
+- **Measurement**: a `TEMP-DIAG` unconditional `tracing::trace!` mirroring
+  the shipped `LOOP_LAG_THRESHOLD_US`-gated line, so every iteration is
+  visible, not just the slow ones -- added identically to a `git worktree` at
+  `7ce27f3` (master, pre-fix) and this branch, never committed to either.
+  20-second runs, 1 and 3 windows, each side.
+
+| | iterations logged (20s) | apply_us p50 | apply_us max | total_us p50 | total_us max | msgs/composite |
+|---|---|---|---|---|---|---|
+| master, 1 window | 27 | 1,230,085 | 1,294,591 | 1,236,656 | 1,301,820 | 756 |
+| branch, 1 window | 2067 | 2,272 | 10,217 | 10,431 | 20,605 | 15.8 |
+| master, 3 windows | 30 | 1,004,230 | 1,350,052 | 1,020,395 | 1,365,681 | 239 |
+| branch, 3 windows | 896 | 4,180 | 10,299 | 27,790 | 37,853 | 10.7 |
+
+That is not a percentage improvement, it is a phase change. On master,
+`apply_us` **is** `total_us` (within a few percent) and both grow across
+successive iterations -- 21ms, 41ms, 77ms, 138ms, 249ms, 496ms, 921ms,
+1.3s, climbing with the message count each time (2, 12, 28, 58, 106, 188,
+364, 742, 1024) -- because decode is slow enough that a fast guest outpaces
+it, the backlog grows, and a bigger backlog makes the next iteration slower
+still. It never recovers inside the 20s window; only 27-30 iterations happen
+at all. On the branch the same guest holds a steady ~100-190ms window
+(3-window) or ~10ms window (1-window) indefinitely -- ~30-100 iterations per
+second, sustained, not degrading.
+
+**Read this honestly, not as a clean win to bank without qualification.**
+This guest never yields for a compositor frame callback the way a real
+client's paint loop normally would, so it is a harsher and more sustained
+load than an actual resize burst, which is self-limiting (the guest settles
+at the new size and stops). The master numbers above are worse than the
+historical 30fps/2.6fps resize figures for exactly that reason, and are not
+directly comparable to them. What this run *does* prove, cleanly: `apply_us`
+tracking `total_us` on master confirms decode is the mechanism, and the
+divergence -- master compounding into runaway backlog, branch holding
+steady -- confirms the fix removes a genuine unbounded-growth failure mode,
+not just a constant-factor cost. Whether a real client can ever sustain
+enough sequential commits to trigger this on master in practice is not
+established here; what's established is that when it does, this fix is the
+difference between recovering and not.
+
 ## What's next
 
 Items 1-4 of the previous list are done and are kept below only as history.

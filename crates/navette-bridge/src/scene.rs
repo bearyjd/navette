@@ -82,6 +82,76 @@ struct Image {
     pixels: Vec<u8>,
 }
 
+/// A surface's most recent buffer. Decoding -- the SIMD defilter in
+/// `filtering::unfilter`, ~2-5ms for a real window, see the investigation
+/// this shape came out of -- is deferred from commit time to whatever first
+/// asks for pixels, almost always [`Scene::compose_toplevel`].
+///
+/// This matters because a surface can commit several new buffers in one
+/// batch before anything composites it -- a resize burst sends ~10 -- each
+/// superseding the last. Eager decoding paid the SIMD cost for every one of
+/// them; this way only the buffer actually still current when compositing
+/// happens ever gets decoded, mirroring what `pending_composites` (bridge.rs)
+/// already does for composition itself: don't do work whose result a later
+/// commit in the same batch is going to discard.
+///
+/// Validation (dimensions, stride, buffer-length consistency) is NOT
+/// deferred -- it happens at commit time in `validate_buffer`, before this is
+/// ever constructed, so a malformed buffer is still rejected synchronously
+/// from `Scene::apply` exactly as before. Only the expensive transform is
+/// deferred, never the cheap safety check.
+#[derive(Clone, Debug)]
+enum SurfaceImage {
+    None,
+    Decoded(Image),
+    Pending {
+        width: u32,
+        height: u32,
+        stride: usize,
+        format: PixelFormat,
+        filtered: Vec<u8>,
+    },
+}
+
+impl SurfaceImage {
+    fn dimensions(&self) -> Option<(u32, u32)> {
+        match self {
+            SurfaceImage::None => None,
+            SurfaceImage::Decoded(image) => Some((image.width, image.height)),
+            SurfaceImage::Pending { width, height, .. } => Some((*width, *height)),
+        }
+    }
+
+    /// Runs the deferred SIMD defilter the first time this is called after a
+    /// new buffer landed, and caches the result -- a second call in the same
+    /// batch (a surface composited more than once, or a commit with no new
+    /// buffer of its own) does no decode work at all.
+    fn decoded(&mut self) -> Option<&Image> {
+        if let SurfaceImage::Pending {
+            width,
+            height,
+            stride,
+            format,
+            filtered,
+        } = self
+        {
+            let mut pixels = vec![0; filtered.len()];
+            filtering::unfilter(&std::mem::take(filtered).into(), &mut pixels);
+            *self = SurfaceImage::Decoded(Image {
+                width: *width,
+                height: *height,
+                stride: *stride,
+                format: *format,
+                pixels,
+            });
+        }
+        match self {
+            SurfaceImage::Decoded(image) => Some(image),
+            SurfaceImage::None | SurfaceImage::Pending { .. } => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 enum SurfaceRole {
     None,
@@ -115,7 +185,7 @@ struct SurfaceNode {
     /// own committed state and why this needs active maintenance instead of
     /// being read once.
     parent: Option<SurfaceKey>,
-    image: Option<Image>,
+    image: SurfaceImage,
     damage: Vec<Rectangle<i32>>,
 }
 
@@ -244,21 +314,23 @@ impl Scene {
     pub fn surface_dimensions(&self, key: SurfaceKey) -> Option<(u32, u32)> {
         self.surfaces
             .get(&key)
-            .and_then(|node| node.image.as_ref())
-            .map(|image| (image.width, image.height))
+            .and_then(|node| node.image.dimensions())
     }
 
-    pub fn compose_toplevel(&self, root: SurfaceKey) -> Result<Frame, SceneError> {
+    /// Takes `&mut self`, not `&self`: compositing is what actually needs
+    /// pixels, so it is where the deferred decode (see [`SurfaceImage`]) for
+    /// this toplevel and every surface it composites finally runs.
+    pub fn compose_toplevel(&mut self, root: SurfaceKey) -> Result<Frame, SceneError> {
         let node = self
             .surfaces
-            .get(&root)
+            .get_mut(&root)
             .ok_or(SceneError::UnknownSurface(root))?;
         if !matches!(node.role, SurfaceRole::Toplevel { .. }) {
             return Err(SceneError::NotToplevel(root));
         }
         let image = node
             .image
-            .as_ref()
+            .decoded()
             .ok_or(SceneError::UnknownSurface(root))?;
         let mut frame = Frame {
             width: image.width,
@@ -309,11 +381,16 @@ impl Scene {
                 // framebuffer -- megabytes -- on every ordinary repaint, and
                 // then dropping it. Guarding the clone keeps the common path
                 // free, which matters because this runs per commit on the loop
-                // that also delivers keystrokes.
+                // that also delivers keystrokes. Still worth guarding now that
+                // `SurfaceImage` can carry an undecoded buffer instead of
+                // `Image`'s pixels: the clone is the same number of bytes
+                // either way, only their arrangement differs.
                 let previous_image = if state.buffer.is_none() {
-                    previous.and_then(|node| node.image.clone())
+                    previous
+                        .map(|node| node.image.clone())
+                        .unwrap_or(SurfaceImage::None)
                 } else {
-                    None
+                    SurfaceImage::None
                 };
                 let previous_parent = previous.and_then(|node| node.parent);
                 let previous_children: Vec<SurfaceKey> = previous
@@ -399,14 +476,19 @@ impl Scene {
         events
     }
 
+    /// Validates a new buffer and stashes it undecoded -- see
+    /// [`SurfaceImage`] for why the expensive part waits. Validation itself
+    /// is NOT deferred: `validate_buffer` runs here, synchronously, so a
+    /// malformed buffer is still rejected from `Scene::apply` at commit time,
+    /// exactly as before this change.
     fn decode_assignment(
         &mut self,
         assignment: Option<&BufferAssignment>,
-        previous: Option<Image>,
-    ) -> Result<Option<Image>, SceneError> {
+        previous: SurfaceImage,
+    ) -> Result<SurfaceImage, SceneError> {
         match assignment {
             None => Ok(previous),
-            Some(BufferAssignment::Removed) => Ok(None),
+            Some(BufferAssignment::Removed) => Ok(SurfaceImage::None),
             Some(BufferAssignment::New(buffer)) => {
                 let filtered = match &buffer.data {
                     BufferData::External => self
@@ -416,7 +498,15 @@ impl Scene {
                     BufferData::Uncompressed(data) => data.0.as_ref().to_vec(),
                     BufferData::Compressed(_) => return Err(SceneError::InlineCompressedBuffer),
                 };
-                decode_image(buffer.metadata, filtered).map(Some)
+                let (width, height, stride, format) =
+                    validate_buffer(buffer.metadata, filtered.len())?;
+                Ok(SurfaceImage::Pending {
+                    width,
+                    height,
+                    stride,
+                    format,
+                    filtered,
+                })
             }
         }
     }
@@ -466,7 +556,7 @@ impl Scene {
     }
 
     fn composite_children(
-        &self,
+        &mut self,
         parent: SurfaceKey,
         parent_x: i32,
         parent_y: i32,
@@ -500,13 +590,13 @@ impl Scene {
             if !visiting.insert(child.key) {
                 return Err(SceneError::SurfaceCycle);
             }
-            let Some(child_node) = self.surfaces.get(&child.key) else {
+            let x = parent_x.saturating_add(child.x);
+            let y = parent_y.saturating_add(child.y);
+            let Some(child_node) = self.surfaces.get_mut(&child.key) else {
                 visiting.remove(&child.key);
                 continue;
             };
-            let x = parent_x.saturating_add(child.x);
-            let y = parent_y.saturating_add(child.y);
-            if let Some(image) = &child_node.image {
+            if let Some(image) = child_node.image.decoded() {
                 blend_image(frame, image, x, y);
             }
             self.composite_children(child.key, x, y, frame, visiting)?;
@@ -556,10 +646,14 @@ fn consumes_raw_buffer(request: &Request) -> bool {
     )
 }
 
-fn decode_image(
+/// Checks a buffer's metadata against its actual byte length -- the cheap
+/// half of what used to be `decode_image`, kept eager (unlike the SIMD
+/// defilter, deferred to [`SurfaceImage::decoded`]) so a malformed buffer is
+/// still rejected at commit time without ever allocating a decode target.
+fn validate_buffer(
     metadata: wprs::serialization::wayland::BufferMetadata,
-    filtered: Vec<u8>,
-) -> Result<Image, SceneError> {
+    filtered_len: usize,
+) -> Result<(u32, u32, usize, PixelFormat), SceneError> {
     let width = u32::try_from(metadata.width)
         .map_err(|_| SceneError::InvalidBuffer("width must be positive".into()))?;
     let height = u32::try_from(metadata.height)
@@ -574,23 +668,16 @@ fn decode_image(
     let expected = stride
         .checked_mul(height as usize)
         .ok_or_else(|| SceneError::InvalidBuffer("buffer length overflow".into()))?;
-    if stride < width as usize * 4 || expected > MAX_BUFFER_BYTES || filtered.len() != expected {
+    if stride < width as usize * 4 || expected > MAX_BUFFER_BYTES || filtered_len != expected {
         return Err(SceneError::InvalidBuffer(
             "stride or buffer length is inconsistent".into(),
         ));
     }
-    let mut pixels = vec![0; expected];
-    filtering::unfilter(&filtered.into(), &mut pixels);
-    Ok(Image {
-        width,
-        height,
-        stride,
-        format: match metadata.format {
-            BufferFormat::Argb8888 => PixelFormat::Argb8888,
-            BufferFormat::Xrgb8888 => PixelFormat::Xrgb8888,
-        },
-        pixels,
-    })
+    let format = match metadata.format {
+        BufferFormat::Argb8888 => PixelFormat::Argb8888,
+        BufferFormat::Xrgb8888 => PixelFormat::Xrgb8888,
+    };
+    Ok((width, height, stride, format))
 }
 
 fn blend_image(frame: &mut Frame, image: &Image, x: i32, y: i32) {
@@ -837,6 +924,110 @@ mod tests {
         assert_eq!(scene.toplevel_info()[0].title.as_deref(), Some("Test"));
         assert_eq!(scene.toplevel_info()[0].app_id.as_deref(), Some("test"));
         assert!(!scene.has_pending_raw_buffer());
+    }
+
+    /// The point of deferring decode: a surface that commits twice in one
+    /// batch -- no compose in between, the resize-burst shape -- must not pay
+    /// the SIMD defilter for the first commit at all. It stays `Pending` right
+    /// up until something actually asks for pixels, and only the buffer still
+    /// current at that point is ever decoded.
+    #[test]
+    fn a_second_new_buffer_before_any_compose_supersedes_the_first_without_decoding_it() {
+        let key = SurfaceKey {
+            client_id: 1,
+            surface_id: 2,
+        };
+        let mut scene = Scene::default();
+        scene
+            .apply(RecvType::RawBuffer(vec![1, 2, 3, 255]))
+            .unwrap();
+        let mut first = state(1, 2, Some(toplevel()));
+        first.buffer = Some(external_buffer(1, 1, BufferFormat::Xrgb8888));
+        scene.apply(commit(first)).unwrap();
+        assert!(
+            matches!(
+                scene.surfaces.get(&key).unwrap().image,
+                SurfaceImage::Pending { .. }
+            ),
+            "a commit must not decode eagerly"
+        );
+
+        scene
+            .apply(RecvType::RawBuffer(vec![9, 8, 7, 255]))
+            .unwrap();
+        let mut second = state(1, 2, Some(toplevel()));
+        second.buffer = Some(external_buffer(1, 1, BufferFormat::Xrgb8888));
+        scene.apply(commit(second)).unwrap();
+        assert!(
+            matches!(
+                scene.surfaces.get(&key).unwrap().image,
+                SurfaceImage::Pending { .. }
+            ),
+            "a second commit before any compose must still leave the surface undecoded"
+        );
+
+        let frame = scene.compose_toplevel(key).unwrap();
+        assert_eq!(
+            frame.pixels,
+            [9, 8, 7, 255],
+            "compose must decode the buffer still current, not the superseded first one"
+        );
+        assert!(
+            matches!(
+                scene.surfaces.get(&key).unwrap().image,
+                SurfaceImage::Decoded(_)
+            ),
+            "compose must decode and cache, so a second composite in the same batch is free"
+        );
+    }
+
+    /// `surface_dimensions` must stay a cheap point lookup even for a
+    /// surface whose latest buffer is still `Pending`, and specifically must
+    /// never trigger a decode as a side effect. `InputState::apply` takes
+    /// `scene: &Scene` (not `&mut Scene`) and leans on `surface_dimensions`
+    /// staying read-only and cheap to justify draining input *between* wprs
+    /// messages instead of at a batch boundary -- see the invariant
+    /// documented on `InputState::apply` and
+    /// `point_lookups_are_stable_midway_through_a_message_group`. If this
+    /// ever started calling the decode path, it would silently reintroduce
+    /// the unbounded input latency PR #14 exists to bound, and nothing but
+    /// this test would notice.
+    #[test]
+    fn surface_dimensions_reads_a_pending_buffers_size_without_decoding() {
+        let key = SurfaceKey {
+            client_id: 1,
+            surface_id: 2,
+        };
+        // Deliberately non-square: width and height swapped would still pass
+        // an equality check against a square buffer, so this uses 8x4 to
+        // make a transposition bug in `dimensions()` actually observable.
+        let mut scene = Scene::default();
+        scene
+            .apply(RecvType::RawBuffer(vec![0; 8 * 4 * 4]))
+            .unwrap();
+        let mut committed = state(1, 2, Some(toplevel()));
+        committed.buffer = Some(external_buffer(8, 4, BufferFormat::Xrgb8888));
+        scene.apply(commit(committed)).unwrap();
+        assert!(
+            matches!(
+                scene.surfaces.get(&key).unwrap().image,
+                SurfaceImage::Pending { .. }
+            ),
+            "the buffer must actually still be pending for this to test anything"
+        );
+
+        assert_eq!(
+            scene.surface_dimensions(key),
+            Some((8, 4)),
+            "dimensions must be readable straight off the pending buffer's metadata"
+        );
+        assert!(
+            matches!(
+                scene.surfaces.get(&key).unwrap().image,
+                SurfaceImage::Pending { .. }
+            ),
+            "reading dimensions must not have triggered a decode"
+        );
     }
 
     #[test]
