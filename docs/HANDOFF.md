@@ -1227,14 +1227,66 @@ eliminating 9 of 10 wasted decodes, in line with the isolated benchmark above.
 Guarded by `a_second_new_buffer_before_any_compose_supersedes_the_first_without_decoding_it`,
 mutation-verified to fail if decode is forced eager again.
 
-**Not yet re-verified live.** All prior throughput numbers in this file (the
-30fps/2.6fps figures two sections up) were measured before this fix. The
-scratchpad e2e harness from those sessions is gone (ephemeral, `/tmp`), and
-rebuilding it was out of scope for this pass -- the evidence here is a unit-level
-benchmark of the actual mechanism, not a live remeasurement of the bridge loop
-under a real resize burst. Before this is called closed, re-run the same
-3-window e2e harness used for PRs #13/#14 and confirm the iteration-time
-percentiles actually moved, not just the isolated decode cost.
+## Re-verified live, and it's not just faster -- master doesn't recover (2026-08-31, later)
+
+The old sway+wtype+viewer e2e harness from PRs #13/#14 was gone (ephemeral
+`/tmp`), and its keyboard-scoring half measures a different problem (M2's
+already-closed repeat defect). Rebuilt a narrower rig instead, scoped to what
+this fix actually changes -- bridge-loop throughput, not keystroke scoring:
+`navetted` + `wprsd` + a continuously-painting guest, read straight out of
+`navetted`'s own iteration-timing trace. No viewer, no nested sway, no wtype.
+
+- **Guest**: `crates/navette-viewer/examples/paintloop_guest.rs`, checked in
+  this time rather than left in scratch -- three sessions have now paid to
+  rebuild a lost harness (this file's own history above, twice; the
+  keyprobe/e2e-keys lineage a third time). `PAINTLOOP_WINDOWS` native `minifb`
+  windows (1280x720), each repainting flat out with `set_target_fps(0)` --
+  no throttling of its own, deliberately harsher than a real resize (which
+  settles after a few frames; this never does). Run under a session's
+  `WAYLAND_DISPLAY` via a `.desktop` entry in a scratch `XDG_DATA_HOME`
+  (`navetted` spawns `wprsd` and the guest itself, `supervisor.rs:175-197` --
+  no manual wiring needed) and `XDG_CONFIG_HOME` pointing at a `wprsd.ron`
+  with `enable_xwayland: false` (the guest is native Wayland; without this,
+  `wprsd` panics trying to exec a `xwayland-xdg-shell` helper that isn't on
+  this machine).
+- **Measurement**: a `TEMP-DIAG` unconditional `tracing::trace!` mirroring
+  the shipped `LOOP_LAG_THRESHOLD_US`-gated line, so every iteration is
+  visible, not just the slow ones -- added identically to a `git worktree` at
+  `7ce27f3` (master, pre-fix) and this branch, never committed to either.
+  20-second runs, 1 and 3 windows, each side.
+
+| | iterations logged (20s) | apply_us p50 | apply_us max | total_us p50 | total_us max | msgs/composite |
+|---|---|---|---|---|---|---|
+| master, 1 window | 27 | 1,230,085 | 1,294,591 | 1,236,656 | 1,301,820 | 756 |
+| branch, 1 window | 2067 | 2,272 | 10,217 | 10,431 | 20,605 | 15.8 |
+| master, 3 windows | 30 | 1,004,230 | 1,350,052 | 1,020,395 | 1,365,681 | 239 |
+| branch, 3 windows | 896 | 4,180 | 10,299 | 27,790 | 37,853 | 10.7 |
+
+That is not a percentage improvement, it is a phase change. On master,
+`apply_us` **is** `total_us` (within a few percent) and both grow across
+successive iterations -- 21ms, 41ms, 77ms, 138ms, 249ms, 496ms, 921ms,
+1.3s, climbing with the message count each time (2, 12, 28, 58, 106, 188,
+364, 742, 1024) -- because decode is slow enough that a fast guest outpaces
+it, the backlog grows, and a bigger backlog makes the next iteration slower
+still. It never recovers inside the 20s window; only 27-30 iterations happen
+at all. On the branch the same guest holds a steady ~100-190ms window
+(3-window) or ~10ms window (1-window) indefinitely -- ~30-100 iterations per
+second, sustained, not degrading.
+
+**Read this honestly, not as a clean win to bank without qualification.**
+This guest never yields for a compositor frame callback the way a real
+client's paint loop normally would, so it is a harsher and more sustained
+load than an actual resize burst, which is self-limiting (the guest settles
+at the new size and stops). The master numbers above are worse than the
+historical 30fps/2.6fps resize figures for exactly that reason, and are not
+directly comparable to them. What this run *does* prove, cleanly: `apply_us`
+tracking `total_us` on master confirms decode is the mechanism, and the
+divergence -- master compounding into runaway backlog, branch holding
+steady -- confirms the fix removes a genuine unbounded-growth failure mode,
+not just a constant-factor cost. Whether a real client can ever sustain
+enough sequential commits to trigger this on master in practice is not
+established here; what's established is that when it does, this fix is the
+difference between recovering and not.
 
 ## What's next
 
