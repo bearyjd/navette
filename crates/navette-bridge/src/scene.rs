@@ -981,6 +981,55 @@ mod tests {
         );
     }
 
+    /// `surface_dimensions` must stay a cheap point lookup even for a
+    /// surface whose latest buffer is still `Pending`, and specifically must
+    /// never trigger a decode as a side effect. `InputState::apply` takes
+    /// `scene: &Scene` (not `&mut Scene`) and leans on `surface_dimensions`
+    /// staying read-only and cheap to justify draining input *between* wprs
+    /// messages instead of at a batch boundary -- see the invariant
+    /// documented on `InputState::apply` and
+    /// `point_lookups_are_stable_midway_through_a_message_group`. If this
+    /// ever started calling the decode path, it would silently reintroduce
+    /// the unbounded input latency PR #14 exists to bound, and nothing but
+    /// this test would notice.
+    #[test]
+    fn surface_dimensions_reads_a_pending_buffers_size_without_decoding() {
+        let key = SurfaceKey {
+            client_id: 1,
+            surface_id: 2,
+        };
+        // Deliberately non-square: width and height swapped would still pass
+        // an equality check against a square buffer, so this uses 8x4 to
+        // make a transposition bug in `dimensions()` actually observable.
+        let mut scene = Scene::default();
+        scene
+            .apply(RecvType::RawBuffer(vec![0; 8 * 4 * 4]))
+            .unwrap();
+        let mut committed = state(1, 2, Some(toplevel()));
+        committed.buffer = Some(external_buffer(8, 4, BufferFormat::Xrgb8888));
+        scene.apply(commit(committed)).unwrap();
+        assert!(
+            matches!(
+                scene.surfaces.get(&key).unwrap().image,
+                SurfaceImage::Pending { .. }
+            ),
+            "the buffer must actually still be pending for this to test anything"
+        );
+
+        assert_eq!(
+            scene.surface_dimensions(key),
+            Some((8, 4)),
+            "dimensions must be readable straight off the pending buffer's metadata"
+        );
+        assert!(
+            matches!(
+                scene.surfaces.get(&key).unwrap().image,
+                SurfaceImage::Pending { .. }
+            ),
+            "reading dimensions must not have triggered a decode"
+        );
+    }
+
     #[test]
     fn rejects_invalid_or_unpaired_buffers_without_allocating_them() {
         let mut scene = Scene::default();
