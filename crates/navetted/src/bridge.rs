@@ -229,50 +229,36 @@ fn run_bridge(
             let mut messages = 0u32;
             let mut composites = 0u32;
             let mut stats = InputStats::default();
+            // One closure shared by every call site below, so the seven-argument
+            // `pump_input` call is written once instead of three times drifting
+            // independently.
+            let mut pump = |input: &mut InputState, scene: &Scene| {
+                pump_input(
+                    &mut commands,
+                    input,
+                    scene,
+                    &encode,
+                    &transport,
+                    &mut resize,
+                    &mut stats,
+                );
+            };
             let scene_start = Instant::now();
             let batch = pending.drain(..).filter_map(|event| match event {
                 ChannelEvent::Msg(message) => Some(message),
                 _ => None,
             });
-            let applied = apply_scene_messages(&mut worker, batch, |input, scene| {
-                pump_input(
-                    &mut commands,
-                    input,
-                    scene,
-                    &encode,
-                    &transport,
-                    &mut resize,
-                    &mut stats,
-                );
-            });
+            let applied = apply_scene_messages(&mut worker, batch, &mut pump);
             messages += applied.0;
             apply_us += applied.1;
             // One composite per surface for the whole batch, not one per commit.
             let compose_start = Instant::now();
-            composites += flush_composites(&mut worker, |input, scene| {
-                pump_input(
-                    &mut commands,
-                    input,
-                    scene,
-                    &encode,
-                    &transport,
-                    &mut resize,
-                    &mut stats,
-                );
-            });
+            composites += flush_composites(&mut worker, &mut pump);
             compose_us += compose_start.elapsed().as_micros();
             let scene_us = scene_start.elapsed().as_micros();
             // A final pump catches anything that arrived after the last unit of
             // work above.
-            pump_input(
-                &mut commands,
-                &mut worker.input,
-                &worker.scene,
-                &worker.encode,
-                &transport,
-                &mut resize,
-                &mut stats,
-            );
+            pump(&mut worker.input, &worker.scene);
             let InputStats {
                 inputs,
                 worst_wait_us: worst_input_wait_us,
@@ -1625,6 +1611,36 @@ mod tests {
             "and compositing the batch runs exactly once"
         );
         assert!(worker.pending_composites.is_empty());
+    }
+
+    /// A composite that fails still cost wall-clock time (it walked the scene
+    /// graph before erroring), so input queued behind it must not wait for the
+    /// next surface's composite too. Mirrors
+    /// `applying_a_message_batch_serves_input_between_each_message`, which
+    /// pins the same property for a rejected message; this is the equivalent
+    /// for `flush_composites`, whose old `let Ok(frame) = ... else { continue };`
+    /// shape would have skipped the pump entirely on failure.
+    #[test]
+    fn a_failed_composite_still_serves_input_before_the_next_one() {
+        let mut worker = worker_fixture(scene_with_toplevels(&[(1, 2)]));
+        // Never committed, so `compose_toplevel` fails with `UnknownSurface`.
+        worker.pending_composites.insert(SurfaceKey {
+            client_id: 1,
+            surface_id: 1,
+        });
+        worker.pending_composites.insert(SurfaceKey {
+            client_id: 1,
+            surface_id: 2,
+        });
+
+        let mut served = 0;
+        let composites = flush_composites(&mut worker, |_, _| served += 1);
+
+        assert_eq!(composites, 1, "only the committed surface composites");
+        assert_eq!(
+            served, 2,
+            "input must be pumped after the failure too, not only after the success"
+        );
     }
 
     /// The real thread, not the synchronous drain every other test uses: it

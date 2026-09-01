@@ -751,6 +751,61 @@ mod tests {
         assert_eq!(scene.surface_dimensions(parent_key), settled_dimensions);
     }
 
+    /// The other half of the invariant above: a destroy mid-group, not just a
+    /// commit mid-group. A parent's commit can list a child that never
+    /// arrives -- its raw buffer and commit are still in flight -- and before
+    /// they do, the parent itself is destroyed. The group never completes at
+    /// all. `toplevels()` must reflect that removal the instant the destroy
+    /// is applied, not wait for a completion that is now never coming, since
+    /// input pumped right after this message has to see it gone.
+    ///
+    /// A raw buffer cannot be pending across an unrelated message (the scene
+    /// rejects that outright, see `rejects_invalid_or_unpaired_buffers_...`),
+    /// so unlike the commit half above, the realistic gap here is between two
+    /// whole messages, not mid-buffer-pairing: the parent's own commit has
+    /// already resolved by the time its listed child's group can still be
+    /// outstanding.
+    #[test]
+    fn destroying_a_toplevel_midway_through_a_group_removes_it_immediately() {
+        let mut scene = Scene::default();
+        scene
+            .apply(RecvType::RawBuffer(vec![0; 64 * 64 * 4]))
+            .unwrap();
+        let mut parent = state(1, 1, Some(toplevel()));
+        parent.buffer = Some(external_buffer(64, 64, BufferFormat::Xrgb8888));
+        parent.z_ordered_children.push(SubsurfacePosition {
+            id: WlSurfaceId(2),
+            position: Point { x: 0, y: 0 },
+        });
+        scene.apply(commit(parent)).unwrap();
+
+        let parent_key = SurfaceKey::new(ClientId(1), WlSurfaceId(1));
+        assert!(scene.toplevels().contains(&parent_key));
+        assert!(
+            !scene.pending_parents.is_empty(),
+            "the child listed above must actually be outstanding for this to test anything"
+        );
+
+        // The child's group -- its own raw buffer and commit -- never arrives:
+        // the parent is destroyed first.
+        let events = scene
+            .apply(RecvType::Object(Request::Surface(SurfaceRequest {
+                client: ClientId(1),
+                surface: WlSurfaceId(1),
+                payload: SurfaceRequestPayload::Destroyed,
+            })))
+            .unwrap();
+
+        assert!(
+            events.contains(&SceneEvent::SurfaceDestroyed(parent_key)),
+            "the destroy must be reported, not swallowed by the incomplete group"
+        );
+        assert!(
+            !scene.toplevels().contains(&parent_key),
+            "a destroy mid-group must remove the surface immediately, not wait for the group to complete"
+        );
+    }
+
     #[test]
     fn pairs_raw_buffer_and_preserves_image_on_damage_only_commit() {
         let mut scene = Scene::default();
