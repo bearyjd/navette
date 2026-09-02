@@ -43,13 +43,13 @@ fun DrawerScreen(
     onRefresh: () -> Unit,
     onRunApp: (String) -> Unit,
     onAttachSession: (String) -> Unit,
-    onSnackbarDismissed: () -> Unit,
+    onSnackbarDismissed: (shown: String) -> Unit,
 ) {
     val snackbarHostState = remember { SnackbarHostState() }
     LaunchedEffect(snackbarMessage) {
         if (snackbarMessage != null) {
             snackbarHostState.showSnackbar(snackbarMessage)
-            onSnackbarDismissed()
+            onSnackbarDismissed(snackbarMessage)
         }
     }
 

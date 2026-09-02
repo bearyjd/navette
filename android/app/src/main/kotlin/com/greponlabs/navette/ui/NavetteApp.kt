@@ -26,7 +26,7 @@ fun NavetteApp(viewModel: AppViewModel = viewModel()) {
             onRefresh = { viewModel.onEvent(AppEvent.Refresh) },
             onRunApp = { appId -> viewModel.onEvent(AppEvent.RunApp(appId)) },
             onAttachSession = { session -> viewModel.onEvent(AppEvent.AttachSession(session)) },
-            onSnackbarDismissed = { viewModel.onEvent(AppEvent.DismissSnackbar) },
+            onSnackbarDismissed = { shown -> viewModel.onEvent(AppEvent.DismissSnackbar(shown)) },
         )
     } else {
         ConnectScreen(

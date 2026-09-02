@@ -3,6 +3,7 @@ package com.greponlabs.navette.ui
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.greponlabs.navette.net.ConnectionState
+import com.greponlabs.navette.net.NavetteApi
 import com.greponlabs.navette.net.NavetteClient
 import com.greponlabs.navette.net.controlWebSocketUrl
 import com.greponlabs.navette.protocol.App
@@ -12,6 +13,7 @@ import com.greponlabs.navette.protocol.appsOrNull
 import com.greponlabs.navette.protocol.errorOrNull
 import com.greponlabs.navette.protocol.sessionsOrNull
 import kotlin.coroutines.cancellation.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -38,19 +40,39 @@ sealed interface AppEvent {
 
     data class AttachSession(val session: String) : AppEvent
 
-    data object DismissSnackbar : AppEvent
+    /**
+     * [shown] is the message the caller just finished displaying. Only
+     * clears [AppUiState.snackbarMessage] if it still equals [shown] --
+     * without this check, dismissing an older message could race a newer
+     * one that arrived while the first was still showing and clobber it
+     * before it ever got a chance to display.
+     */
+    data class DismissSnackbar(val shown: String) : AppEvent
 }
 
 /**
- * Owns the one [NavetteClient] this screen uses. Single-host only, no
- * reconnect/backoff, no session screen wired up yet -- this is the drawer
- * slice of M3 (see docs/ROADMAP.md Phase 1), not the whole milestone.
+ * Owns the one [NavetteApi] connection this screen uses. Single-host only,
+ * no reconnect/backoff, no session screen wired up yet -- this is the
+ * drawer slice of M3 (see docs/ROADMAP.md Phase 1), not the whole milestone.
+ *
+ * [clientFactory] defaults to a real [NavetteClient] but is overridable so
+ * tests can inject a fake instead of standing up real networking -- see
+ * `AppViewModelTest`.
  */
-class AppViewModel : ViewModel() {
+class AppViewModel(
+    private val clientFactory: (host: String) -> NavetteApi = { host -> NavetteClient(controlWebSocketUrl(host)) },
+) : ViewModel() {
     private val _state = MutableStateFlow(AppUiState())
     val state: StateFlow<AppUiState> = _state.asStateFlow()
 
-    private var client: NavetteClient? = null
+    private var client: NavetteApi? = null
+
+    // The previous connection's connectionState collector must be cancelled
+    // before starting a new one -- a StateFlow never completes on its own,
+    // so without this, every reconnect attempt (e.g. retrying after a
+    // Failed state) leaks a collector that sits idle for the rest of this
+    // ViewModel's lifetime instead of stopping when its client is replaced.
+    private var connectionJob: Job? = null
 
     fun onEvent(event: AppEvent) {
         when (event) {
@@ -59,7 +81,10 @@ class AppViewModel : ViewModel() {
             AppEvent.Refresh -> refresh()
             is AppEvent.RunApp -> runApp(event.appId)
             is AppEvent.AttachSession -> attachSession(event.session)
-            AppEvent.DismissSnackbar -> _state.update { it.copy(snackbarMessage = null) }
+            is AppEvent.DismissSnackbar ->
+                _state.update {
+                    if (it.snackbarMessage == event.shown) it.copy(snackbarMessage = null) else it
+                }
         }
     }
 
@@ -67,21 +92,23 @@ class AppViewModel : ViewModel() {
         val host = _state.value.host.trim()
         if (host.isEmpty()) return
 
+        connectionJob?.cancel()
         client?.close()
-        val newClient = NavetteClient(controlWebSocketUrl(host))
+        val newClient = clientFactory(host)
         client = newClient
 
-        viewModelScope.launch {
-            newClient.connectionState.collect { connectionState ->
-                _state.update { it.copy(connection = connectionState) }
-                if (connectionState is ConnectionState.Connected) {
-                    refresh()
-                }
-                if (connectionState is ConnectionState.Failed) {
-                    _state.update { it.copy(snackbarMessage = connectionState.reason) }
+        connectionJob =
+            viewModelScope.launch {
+                newClient.connectionState.collect { connectionState ->
+                    _state.update { it.copy(connection = connectionState) }
+                    if (connectionState is ConnectionState.Connected) {
+                        refresh()
+                    }
+                    if (connectionState is ConnectionState.Failed) {
+                        _state.update { it.copy(snackbarMessage = connectionState.reason) }
+                    }
                 }
             }
-        }
         newClient.connect()
     }
 
