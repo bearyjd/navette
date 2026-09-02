@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Cleartext (plain ws colon slash slash) is intentional, not an oversight:
+  navetted's own control-channel API binds to a tailnet address only and
+  speaks ws, not wss (see docs/prp/PRP-plan.md, the security-model devil's
+  advocate item: "sockets in $XDG_RUNTIME_DIR, ... tailnet or SSH is the
+  auth boundary"). Tailscale is a WireGuard-encrypted overlay, so a TLS
+  layer on top would encrypt already-encrypted transport without changing
+  the actual trust boundary, which is tailnet membership, not this app's
+  socket. Scoping this globally rather than per-host because the whole
+  point is "any host on my tailnet, entered by IP or MagicDNS name";
+  there is no fixed domain list to enumerate.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
