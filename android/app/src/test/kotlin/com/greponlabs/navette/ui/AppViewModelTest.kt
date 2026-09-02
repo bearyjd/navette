@@ -53,6 +53,10 @@ private class FakeNavetteApi : NavetteApi {
         return responseFor(command)
     }
 
+    // Unlike the real client's close(), this doesn't interrupt an in-flight
+    // call() -- fine today since no test exercises that overlap, but worth
+    // flagging so a future test doesn't assume this fake matches that
+    // behavior.
     override fun close() {
         closed = true
     }

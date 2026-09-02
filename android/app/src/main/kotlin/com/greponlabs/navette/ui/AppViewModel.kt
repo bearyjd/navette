@@ -14,6 +14,8 @@ import com.greponlabs.navette.protocol.errorOrNull
 import com.greponlabs.navette.protocol.sessionsOrNull
 import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -74,6 +76,12 @@ class AppViewModel(
     // ViewModel's lifetime instead of stopping when its client is replaced.
     private var connectionJob: Job? = null
 
+    // Guards against two refresh() calls overlapping -- e.g. a manual
+    // Refresh while the post-Connect refresh is still in flight -- where
+    // whichever response happened to land last would win regardless of
+    // which request was actually newer.
+    private var refreshJob: Job? = null
+
     fun onEvent(event: AppEvent) {
         when (event) {
             is AppEvent.HostChanged -> _state.update { it.copy(host = event.host) }
@@ -93,6 +101,7 @@ class AppViewModel(
         if (host.isEmpty()) return
 
         connectionJob?.cancel()
+        refreshJob?.cancel()
         client?.close()
         val newClient = clientFactory(host)
         client = newClient
@@ -114,28 +123,34 @@ class AppViewModel(
 
     private fun refresh() {
         val current = client ?: return
-        viewModelScope.launch {
-            _state.update { it.copy(isLoading = true) }
-            try {
-                val appsResponse = current.call(RequestCommand.ListApps)
-                val sessionsResponse = current.call(RequestCommand.ListSessions)
-                val firstError = appsResponse.errorOrNull() ?: sessionsResponse.errorOrNull()
-                _state.update {
-                    it.copy(
-                        apps = appsResponse.appsOrNull() ?: it.apps,
-                        sessions = sessionsResponse.sessionsOrNull() ?: it.sessions,
-                        isLoading = false,
-                        snackbarMessage = firstError?.message ?: it.snackbarMessage,
-                    )
-                }
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: Exception) {
-                _state.update {
-                    it.copy(isLoading = false, snackbarMessage = error.message ?: "refresh failed")
+        refreshJob?.cancel()
+        refreshJob =
+            viewModelScope.launch {
+                _state.update { it.copy(isLoading = true) }
+                try {
+                    val (appsResponse, sessionsResponse) =
+                        coroutineScope {
+                            val apps = async { current.call(RequestCommand.ListApps) }
+                            val sessions = async { current.call(RequestCommand.ListSessions) }
+                            apps.await() to sessions.await()
+                        }
+                    val firstError = appsResponse.errorOrNull() ?: sessionsResponse.errorOrNull()
+                    _state.update {
+                        it.copy(
+                            apps = appsResponse.appsOrNull() ?: it.apps,
+                            sessions = sessionsResponse.sessionsOrNull() ?: it.sessions,
+                            isLoading = false,
+                            snackbarMessage = firstError?.message ?: it.snackbarMessage,
+                        )
+                    }
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: Exception) {
+                    _state.update {
+                        it.copy(isLoading = false, snackbarMessage = error.message ?: "refresh failed")
+                    }
                 }
             }
-        }
     }
 
     private fun runApp(appId: String) {

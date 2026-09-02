@@ -10,9 +10,11 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withTimeout
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response as OkHttpResponse
@@ -77,14 +79,28 @@ class NavetteClient(private val webSocketUrl: String) : NavetteApi {
     override fun connect() {
         _connectionState.value = ConnectionState.Connecting
         val request =
-            Request.Builder()
-                .url(webSocketUrl)
-                .addHeader("Sec-WebSocket-Protocol", CONTROL_WEBSOCKET_SUBPROTOCOL)
-                .build()
+            try {
+                Request.Builder()
+                    .url(webSocketUrl)
+                    .addHeader("Sec-WebSocket-Protocol", CONTROL_WEBSOCKET_SUBPROTOCOL)
+                    .build()
+            } catch (error: IllegalArgumentException) {
+                // A malformed webSocketUrl (okhttp throws IllegalArgumentException
+                // for one) must surface as a Failed state, not crash the caller --
+                // controlWebSocketUrl can't fully validate every host shape itself.
+                _connectionState.value = ConnectionState.Failed(error.message ?: "invalid host")
+                return
+            }
         webSocket = httpClient.newWebSocket(request, listener)
     }
 
-    /** Sends [command] and suspends until `navetted` answers it, by `request_id`. */
+    /**
+     * Sends [command] and suspends until `navetted` answers it, by
+     * `request_id`, or [CALL_TIMEOUT_MS] elapses. Connection loss is already
+     * covered by [failAllPending] -- this covers the other way a call can
+     * hang forever: the connection stays healthy but `navetted` never
+     * answers this particular request.
+     */
     override suspend fun call(command: RequestCommand): Response {
         val requestId = nextRequestId.getAndIncrement()
         val deferred = CompletableDeferred<Response>()
@@ -100,7 +116,13 @@ class NavetteClient(private val webSocketUrl: String) : NavetteApi {
             pending.remove(requestId)
             throw IllegalStateException("failed to send request $requestId")
         }
-        return deferred.await()
+        return try {
+            withTimeout(CALL_TIMEOUT_MS) { deferred.await() }
+        } catch (error: TimeoutCancellationException) {
+            throw IllegalStateException("request $requestId timed out waiting for a response")
+        } finally {
+            pending.remove(requestId)
+        }
     }
 
     override fun close() {
@@ -149,8 +171,20 @@ class NavetteClient(private val webSocketUrl: String) : NavetteApi {
 
     private companion object {
         const val NORMAL_CLOSURE = 1000
+        const val CALL_TIMEOUT_MS = 15_000L
     }
 }
 
-fun controlWebSocketUrl(host: String, port: Int = 9417): String =
-    "ws://$host:$port$CONTROL_WEBSOCKET_PATH"
+/**
+ * Builds the control-channel WebSocket URL for [host]:[port]. A bare IPv6
+ * literal (e.g. a Tailscale address like `fd7a:115c:a1e0::1`) is
+ * bracket-wrapped so the authority is unambiguous -- hostnames and IPv4
+ * addresses, which never contain more than one colon, pass through
+ * unchanged. This can't validate every malformed [host] (one that already
+ * smuggles in a port, for instance); [NavetteClient.connect] guards
+ * against building an invalid [Request] from whatever comes out of here.
+ */
+fun controlWebSocketUrl(host: String, port: Int = 9417): String {
+    val authorityHost = if (host.count { it == ':' } >= 2 && !host.startsWith("[")) "[$host]" else host
+    return "ws://$authorityHost:$port$CONTROL_WEBSOCKET_PATH"
+}
