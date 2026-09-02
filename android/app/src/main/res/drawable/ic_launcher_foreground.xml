@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A shuttle-ish chevron, matching the name (Fr. "shuttle"). Placeholder
+     until a real mark is designed. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#7CE0C6"
+        android:pathData="M34,30 L74,54 L34,78 L44,54 Z" />
+</vector>

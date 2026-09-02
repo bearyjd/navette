@@ -1288,6 +1288,91 @@ enough sequential commits to trigger this on master in practice is not
 established here; what's established is that when it does, this fix is the
 difference between recovering and not.
 
+## M3 slice 1: Android scaffold + drawer screen, in review (2026-09-01)
+
+PR #16 (`feat/android-drawer-scaffold`, open, CI green, `mergeStateStatus:
+CLEAN`) is the first slice of M3 -- scope agreed with the user up front
+(docs/prp/PRP-plan.md §6 milestone M3 is the whole Android client; too big
+for one PR). This slice: Gradle/Kotlin/Compose project skeleton, a Kotlin
+mirror of `navette-protocol`'s control-channel wire types
+(`android/app/.../protocol/ControlProtocol.kt`), a WebSocket client
+(`net/NavetteClient.kt`), and Connect/Drawer screens. No MediaCodec/session
+screen yet -- that's the next, separate slice.
+
+Environment note for whoever picks this up: Android SDK (platforms 31-36,
+build-tools, cmake, ndk), `adb`, `sdkmanager`, and system `gradle` are all
+present on this machine. No AVD and no `emulator` binary -- every claim
+below is build/unit-test/live-smoke-test verified, **none is an on-device or
+emulator run**. `android/local.properties` (git-ignored) needs
+`sdk.dir=/home/user/android-sdk` to build here again.
+
+**Verification chain, strongest to weakest:**
+1. `./gradlew clean assembleDebug testDebugUnitTest lintDebug` -- clean.
+2. Protocol round-trip tests use the *exact* JSON fixtures
+   `navette-protocol`'s own Rust tests assert against
+   (`request_fixtures_round_trip`, `response_fixtures_round_trip`,
+   `unknown_fields_are_accepted_for_additive_evolution`) -- the two suites
+   are meant to drift apart loudly if the wire shape ever changes, not
+   silently.
+3. **Live wire-compatibility smoke test** against a real running `navetted`
+   (subprotocol negotiation, `list_apps` against the real XDG index,
+   `list_sessions`, and an error envelope for `kill` on a nonexistent
+   session) -- not just static fixtures.
+
+**Two review passes so far, both by this session (caveat: not
+independent):**
+
+- **Self-review** (`.claude/PRPs/reviews/pr-16-review.md`) found two real
+  `AppViewModel` bugs, both mutation-verified and fixed: a leaked
+  `connectionState` collector on every reconnect (a `StateFlow` never
+  completes on its own, so retrying after a `Failed` state left the old
+  collector running for the rest of the ViewModel's lifetime), and a
+  snackbar-dismiss race (an older message's delayed dismiss could clobber a
+  newer one that arrived while the first was still showing). Also
+  introduced `NavetteApi` as a constructor-injectable seam so
+  `AppViewModel` has real tests now (5 of them) instead of none.
+- **Devil's-advocate pass** (this session, same day) on the *full* PR diff
+  found four more real issues, agreed but **not yet implemented**:
+  1. `controlWebSocketUrl` does raw string interpolation
+     (`"ws://$host:$port$path"`) with no host validation. A Tailscale IPv6
+     address (`fd7a:115c:a1e0::1`) or a host string that already includes a
+     port produces a malformed authority (`ws://fd7a:115c:a1e0::1:9417/...`)
+     -- ambiguous colons, no bracket-wrapping. Worse: `NavetteClient.connect()`
+     builds the `Request` unguarded, so this doesn't just fail to connect,
+     it throws `IllegalArgumentException` out of `connect()` and crashes the
+     tap.
+  2. `NavetteClient.call()` has no timeout. Connection-loss is already
+     covered (`onFailure`/`onClosed` fail every pending call), but "the
+     connection stays healthy and `navetted` just never answers this one
+     `request_id`" hangs the caller forever -- `isLoading` stuck `true`
+     with no way out short of killing the app. `pending.remove(requestId)`
+     should also move into a `finally` so a timed-out entry doesn't linger
+     in the map.
+  3. `AppViewModel.refresh()` awaits `ListApps` then `ListSessions`
+     sequentially despite `NavetteClient` already supporting concurrent
+     in-flight requests by `request_id` -- and nothing stops two `refresh()`
+     calls from overlapping, so whichever response lands last wins
+     regardless of freshness. Fix is the same shape as the
+     already-fixed `connectionJob` leak: run both calls concurrently via
+     `coroutineScope`/`async`, and track/cancel a `refreshJob` before each
+     new `refresh()`.
+  4. (Minor, maintainability) `FakeNavetteApi.close()` in the test file
+     doesn't interrupt an in-flight `call()` the way the real client's
+     `close()` does -- fine today since nothing exercises that, but worth a
+     one-line comment so a future test doesn't assume otherwise.
+
+  Full transcript with code snippets for each fix is in this session's
+  conversation; not re-committed to a file since the PR isn't merged yet --
+  apply them as commits on `feat/android-drawer-scaffold` before merging,
+  the same way the two self-review rounds were.
+
+**Not done, explicitly deferred (recorded in the self-review, not
+blocking):** a `NavetteClient`-level test using `okhttp3:mockwebserver`
+(only the live smoke test and, transitively through the fake, the
+ViewModel's own tests exercise its contract); `onOpen` doesn't verify
+`navetted` actually negotiated the `navette.v1` subprotocol it asked for
+(low risk -- the live smoke test confirms it does today).
+
 ## What's next
 
 Items 1-4 of the previous list are done and are kept below only as history.
@@ -1306,7 +1391,11 @@ As of 2026-08-29 the remaining work is:
 4. **Repin minifb to a crates.io version** once upstream ships a release
    containing #429. Blocked on emoon, not on us; 0.28.0 predates the merge.
 5. **M3, the Android client** -- the milestone the roadmap treats as the real
-   product moment. Everything so far has been proving the plumbing works.
+   product moment. Slice 1 (scaffold + drawer screen) is in PR #16, open,
+   with 4 agreed-but-unimplemented fixes from a devil's-advocate pass -- see
+   the section above. Apply those, merge, then the session screen
+   (MediaCodec H.264 decode, input, clipboard, resize-follows-viewport) is
+   the next and much larger slice.
 
 ### Done (2026-08-29), kept for context
 
