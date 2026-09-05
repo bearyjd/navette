@@ -28,10 +28,10 @@ import com.greponlabs.navette.protocol.SessionStatus
 
 /**
  * Two sections -- Running (live sessions) and Apps (the remote XDG menu) --
- * per docs/prp/PRP-plan.md §4.3. Tap Running to attach; tap an app to
- * run-and-attach. Attach currently only confirms success (see
- * [com.greponlabs.navette.ui.AppViewModel]'s AttachSession handler) since
- * the MediaCodec session screen is the next slice of M3, not this one.
+ * per docs/prp/PRP-plan.md §4.3. Tapping a running session attaches and opens
+ * [com.greponlabs.navette.ui.session.SessionScreen]; a failed attach stays
+ * here with the server's message. Tapping an app still only runs it -- it
+ * does not attach afterwards, which remains a later slice.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable

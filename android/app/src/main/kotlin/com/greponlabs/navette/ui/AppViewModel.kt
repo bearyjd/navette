@@ -1,5 +1,6 @@
 package com.greponlabs.navette.ui
 
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.greponlabs.navette.net.ConnectionState
@@ -29,6 +30,8 @@ data class AppUiState(
     val sessions: List<Session> = emptyList(),
     val isLoading: Boolean = false,
     val snackbarMessage: String? = null,
+    /** The session the user is attached to, or `null` when the drawer is showing. */
+    val activeSession: String? = null,
 )
 
 sealed interface AppEvent {
@@ -42,6 +45,9 @@ sealed interface AppEvent {
 
     data class AttachSession(val session: String) : AppEvent
 
+    /** Leaves the session screen: detaches server-side and returns to the drawer. */
+    data object LeaveSession : AppEvent
+
     /**
      * [shown] is the message the caller just finished displaying. Only
      * clears [AppUiState.snackbarMessage] if it still equals [shown] --
@@ -53,9 +59,13 @@ sealed interface AppEvent {
 }
 
 /**
- * Owns the one [NavetteApi] connection this screen uses. Single-host only,
- * no reconnect/backoff, no session screen wired up yet -- this is the
- * drawer slice of M3 (see docs/ROADMAP.md Phase 1), not the whole milestone.
+ * Owns the one [NavetteApi] control connection this app uses, and which
+ * session (if any) is currently attached. Single-host only, no
+ * reconnect/backoff.
+ *
+ * Media state is deliberately not here: `SessionScreen` owns its own
+ * `MediaClient` and decoder, and this ViewModel stays the control-channel
+ * owner it has always been.
  *
  * [clientFactory] defaults to a real [NavetteClient] but is overridable so
  * tests can inject a fake instead of standing up real networking -- see
@@ -89,6 +99,7 @@ class AppViewModel(
             AppEvent.Refresh -> refresh()
             is AppEvent.RunApp -> runApp(event.appId)
             is AppEvent.AttachSession -> attachSession(event.session)
+            AppEvent.LeaveSession -> leaveSession()
             is AppEvent.DismissSnackbar ->
                 _state.update {
                     if (it.snackbarMessage == event.shown) it.copy(snackbarMessage = null) else it
@@ -103,6 +114,9 @@ class AppViewModel(
         connectionJob?.cancel()
         refreshJob?.cancel()
         client?.close()
+        // A reconnect must not leave the user on a session screen belonging to
+        // the connection being replaced.
+        _state.update { it.copy(activeSession = null) }
         val newClient = clientFactory(host)
         client = newClient
 
@@ -172,16 +186,22 @@ class AppViewModel(
         }
     }
 
+    /**
+     * A successful attach navigates; a failed one stays on the drawer with the
+     * server's own message. Navigation is the confirmation, so success adds no
+     * snackbar of its own.
+     */
     private fun attachSession(session: String) {
         val current = client ?: return
         viewModelScope.launch {
             try {
                 val response = current.call(RequestCommand.Attach(session))
                 val error = response.errorOrNull()
-                val message =
-                    error?.message
-                        ?: "Attached to $session -- the session screen isn't built yet (next slice of M3)."
-                _state.update { it.copy(snackbarMessage = message) }
+                if (error != null) {
+                    _state.update { it.copy(snackbarMessage = error.message) }
+                } else {
+                    _state.update { it.copy(activeSession = session) }
+                }
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
@@ -190,7 +210,37 @@ class AppViewModel(
         }
     }
 
+    /**
+     * The state flip happens first and synchronously: leaving the screen must
+     * never be blocked by a `Detach` that fails or hangs, and a stale
+     * [AppUiState.activeSession] would strand the user on a dead screen.
+     *
+     * `Detach` is not `Kill` -- the session keeps running server-side and
+     * shows up on the drawer again.
+     */
+    private fun leaveSession() {
+        val session = _state.value.activeSession ?: return
+        _state.update { it.copy(activeSession = null) }
+        val current = client ?: return
+        viewModelScope.launch {
+            try {
+                current.call(RequestCommand.Detach(session))
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                // Best-effort: the user has already left, and the bridge drops
+                // an attachment when its media socket closes regardless.
+                Log.d(TAG, "detach from $session failed: ${error.message}")
+            }
+            refresh()
+        }
+    }
+
     override fun onCleared() {
         client?.close()
+    }
+
+    private companion object {
+        const val TAG = "AppViewModel"
     }
 }

@@ -35,6 +35,16 @@ android {
     buildFeatures {
         compose = true
     }
+
+    testOptions {
+        unitTests {
+            // MediaClient/H264Decoder log through android.util.Log, which is a
+            // stub that throws in a JVM unit test unless calls return defaults.
+            // Only android.jar stubs are affected -- this project's own code is
+            // real on the test classpath.
+            isReturnDefaultValues = true
+        }
+    }
 }
 
 dependencies {
@@ -56,4 +66,5 @@ dependencies {
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.mockwebserver)
 }
