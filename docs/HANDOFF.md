@@ -1411,3 +1411,106 @@ As of 2026-08-29 the remaining work is:
 
    the one the roadmap treats as the real product moment — everything
    before it is proving the plumbing works.
+
+## M3 slice 2: the session screen — implemented, on-device-verified, one real bug found and fixed (2026-09-06)
+
+**Branch `feat/android-session-screen`, two commits, not pushed:** `7d089f1`
+(the slice itself — MediaCodec decode, input, resize) and `8cc011b` (a real
+bug found during on-device testing, see below). `git log --oneline -2` on
+that branch shows both. Base was `master` @ `8448fa6` (PR #16, the drawer
+slice).
+
+### How this slice was built
+
+Planned via `/prp-plan` (written to
+`.claude/PRPs/plans/completed/android-session-screen.plan.md`), implemented
+via `/prp-implement`, then carried through **three rounds** of independent
+`code-reviewer` + `security-reviewer` passes before being called
+merge-ready. Worth knowing if this pattern gets reused: rounds 1-2 each
+found real HIGH-severity bugs that the *previous* round's own fix had
+introduced (an IME backspace/typing divergence; a landscape-lock bug that
+recreated the Activity; a receive-path memory bound with no byte budget;
+then, fixing that, a data race the dispatcher change introduced; then a
+byte-budget bypass on the "must never drop this" packet path). Round 3
+broke that pattern — the implementer's own whole-system audit caught its
+own bug (a semaphore-permit leak) before review did, which the reviewer
+read as real evidence the surface had stabilized, not just a clean pass.
+109 unit tests by the end of that process (up from 16 at the drawer slice),
+`./gradlew clean assembleDebug testDebugUnitTest lintDebug` — the exact CI
+command — green throughout.
+
+**What was never verified until this session: does any of it actually work
+on a real device.** No AVD/emulator exists in this environment (still
+true — the drawer slice's own README already said so), so Tasks 8-10
+(`H264Decoder`, `SessionScreen`, the touch/keyboard input path) had zero
+on-device coverage until a phone was actually plugged in.
+
+### On-device verification, this session (Pixel 9 Pro Fold, Android 17)
+
+Stood up real end-to-end test infrastructure on this machine to make that
+possible: cloned and built `wprsd`/`wprsc`/`xwayland-xdg-shell` fresh at
+`../wprs` (sibling to this repo, pinned rev `5763d746` matching
+`crates/navette-bridge/Cargo.toml`), built this repo's own
+`navetted`/`navette` fresh (**do not use `~/.local/bin/navetted`** — that's
+an unrelated binary of the same name, a "Claude Code" pairing daemon, not
+this project's daemon; a real naming collision on this machine that cost a
+few minutes to notice), and ran a live Firefox session against it.
+
+**Confirmed working, for the first time, on real hardware:**
+- The full connect → drawer → attach flow against a live `navetted`.
+- **MediaCodec H.264 decode against the real VA-API-encoded stream** — the
+  plan's own flagged highest-risk item (`csd-0`/`csd-1` handling) — works
+  correctly, first try.
+- Landscape lock engages and correctly releases back to portrait on leave.
+- "Disconnected: connection failed" renders correctly when `navetted` dies
+  mid-session (killed it outright to check) — a clean state, not a hang.
+- The on-screen "Keyboard" toggle raises the real IME correctly.
+
+**Found one real bug, root-caused and fixed (`8cc011b`):** touch and
+keyboard input reached the wire correctly the whole time, but the bridge
+silently rejected every single input event for this session. Root cause:
+`MediaInput`'s `client_id`/`surface_id` are genuine unsigned 64-bit wire
+values that can exceed `Long.MAX_VALUE` (a real session's `client_id` was
+`15272202610726850855`) — Kotlin's `Long` serializes that as a *negative*
+JSON decimal, and the bridge's `serde` deserializer correctly refuses a
+`-` sign for a `u64` field. No crash, no client-visible error: input just
+did nothing. Fixed by changing those fields to `ULong` (kotlinx.serialization
+encodes it as the correct unsigned decimal). Full root-cause writeup,
+including two false leads chased first (a Compose `AndroidView` touch-interop
+theory that turned out not to be the actual cause, and why `tcpdump`
+couldn't have proven anything about outgoing WebSocket frames — RFC 6455
+masks client frames — plus why `adb shell input tap` is invisible to
+`getevent`) is in this session's `/investigate` transcript and logged as
+gstack learnings (`kotlinx-serialization-long-as-u64`,
+`tcpdump-websocket-client-frames-masked`, `adb-input-tap-bypasses-evdev`,
+`logcat-filter-by-tag-not-package`) if picking this back up.
+
+**Verified live after the fix**: tapping a page element opened a genuine
+new browser session (page navigated to Firefox's own start page — real
+proof of a real click, not a coincidence); dragging moved the pointer
+(confirmed via Firefox's own link-hover status-bar text tracking the drag
+in real time); the bridge's `invalid_input` rejection is gone from the
+logs entirely.
+
+### What's still not verified
+
+Only ran out of session time, not blocked on anything: hardware Bluetooth/USB
+keyboard typing, on-screen IME with an actual autocomplete-triggered
+replacement, and a live resize (rotating/resizing while attached). None of
+these have known issues — they're just untested. The plan's Manual
+Validation checklist in `android/README.md` has the full list.
+
+### Environment note for whoever picks this up
+
+If you want to re-run any of this: `wprsd`/`wprsc`/`xwayland-xdg-shell`
+binaries live at `../wprs/target/release/` (relative to this repo) — put
+that dir on `PATH` before starting `navetted`. Start it with
+`--bind <tailnet-ip>:9417 --allow-remote` (loopback-only default can't
+reach a phone). `RUST_LOG="info,navetted=debug,navette_bridge=debug"` is
+worth it — it's what surfaced the `invalid_input` rejections once logcat
+was filtered correctly (by the `MediaClient` TAG, *not* by grepping for the
+app's package name — Android log lines don't contain it). A `navetted`
+process bound to `100.111.143.67:9417` with debug logging may still be
+running on this machine from this session (`ps aux | grep navetted`) with
+a `phonetest` session (Firefox) still attached to it — check before
+starting a second one.
