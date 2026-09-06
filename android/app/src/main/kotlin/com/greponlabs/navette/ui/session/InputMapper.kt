@@ -28,7 +28,7 @@ object InputMapper {
     const val LAYOUT_INDEX: Int = 0
 
     fun pointerMotion(clientId: Long, surfaceId: Long, x: Double, y: Double): MediaInput.PointerMotion =
-        MediaInput.PointerMotion(clientId = clientId, surfaceId = surfaceId, x = x, y = y)
+        MediaInput.PointerMotion(clientId = clientId.toULong(), surfaceId = surfaceId.toULong(), x = x, y = y)
 
     /**
      * Button is always `BTN_LEFT`: this slice maps a tap to a left click and
@@ -36,8 +36,8 @@ object InputMapper {
      */
     fun pointerButton(clientId: Long, surfaceId: Long, pressed: Boolean): MediaInput.PointerButton =
         MediaInput.PointerButton(
-            clientId = clientId,
-            surfaceId = surfaceId,
+            clientId = clientId.toULong(),
+            surfaceId = surfaceId.toULong(),
             button = BTN_LEFT,
             pressed = pressed,
         )
@@ -49,16 +49,16 @@ object InputMapper {
         pressed: Boolean,
     ): MediaInput.KeyboardKey =
         MediaInput.KeyboardKey(
-            clientId = clientId,
-            surfaceId = surfaceId,
+            clientId = clientId.toULong(),
+            surfaceId = surfaceId.toULong(),
             keycode = evdevCode,
             pressed = pressed,
         )
 
     fun keyboardModifiers(clientId: Long, surfaceId: Long, metaState: Int): MediaInput.KeyboardModifiers =
         MediaInput.KeyboardModifiers(
-            clientId = clientId,
-            surfaceId = surfaceId,
+            clientId = clientId.toULong(),
+            surfaceId = surfaceId.toULong(),
             ctrl = metaState and KeyEvent.META_CTRL_ON != 0,
             alt = metaState and KeyEvent.META_ALT_ON != 0,
             shift = metaState and KeyEvent.META_SHIFT_ON != 0,

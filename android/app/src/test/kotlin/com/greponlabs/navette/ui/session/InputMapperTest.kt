@@ -217,7 +217,7 @@ class InputMapperTest {
     fun `pointer motion carries the surface identity it is addressed to`() {
         val motion = InputMapper.pointerMotion(CLIENT_ID, SURFACE_ID, 12.5, 34.75)
 
-        assertEquals(MediaInput.PointerMotion(CLIENT_ID, SURFACE_ID, 12.5, 34.75), motion)
+        assertEquals(MediaInput.PointerMotion(CLIENT_ID.toULong(), SURFACE_ID.toULong(), 12.5, 34.75), motion)
         assertNull(motion.validate())
     }
 
@@ -241,7 +241,17 @@ class InputMapperTest {
         val modifiers = InputMapper.keyboardModifiers(CLIENT_ID, SURFACE_ID, 0)
 
         assertEquals(
-            MediaInput.KeyboardModifiers(CLIENT_ID, SURFACE_ID, false, false, false, false, false, false, 0),
+            MediaInput.KeyboardModifiers(
+                CLIENT_ID.toULong(),
+                SURFACE_ID.toULong(),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                0,
+            ),
             modifiers,
         )
     }

@@ -5,13 +5,12 @@ import android.content.Context
 import android.content.ContextWrapper
 import android.content.pm.ActivityInfo
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.focusable
-import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
@@ -40,8 +39,6 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.onKeyEvent
-import androidx.compose.ui.input.pointer.PointerInputScope
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -139,12 +136,35 @@ fun SessionScreen(
                 .onKeyEvent { event -> controller.onKeyEvent(event.nativeKeyEvent) },
     ) {
         AndroidView(
-            factory = { context -> SurfaceView(context).apply { holder.addCallback(controller.surfaceCallback) } },
+            // Touch is wired via View.setOnTouchListener on the raw
+            // SurfaceView, not a Compose pointerInput modifier. This was
+            // tried first because AndroidView always installs an internal
+            // pointerInteropFilter that dispatches to the wrapped View
+            // during Compose's Initial pointer-event pass, before ANY
+            // pointerInput's Main-pass awaitFirstDown() runs -- a real,
+            // documented mechanism by which a pointerInput on or around an
+            // AndroidView can go silent. On this device, though, that
+            // wasn't actually the fault: touch was reaching sendMotion/
+            // sendButton correctly the whole time, under both this and the
+            // original pointerInput-based approach: the real bug was
+            // MediaInput's client_id/surface_id serializing as negative
+            // Longs (see MediaProtocol.kt's header comment), which the
+            // bridge silently rejected regardless of how input reached this
+            // client. Kept anyway, now that it's verified working end to
+            // end on a real device: it sidesteps the pointerInteropFilter
+            // question entirely rather than merely ruling it out this once,
+            // and needs no coroutine gesture-scope ceremony for
+            // single-pointer tracking.
+            factory = { context ->
+                SurfaceView(context).apply {
+                    holder.addCallback(controller.surfaceCallback)
+                    setOnTouchListener { _, event -> controller.onTouchEvent(event) }
+                }
+            },
             modifier =
                 Modifier
                     .fillMaxSize()
-                    .onSizeChanged { size -> controller.onSurfaceResized(size.width, size.height) }
-                    .pointerInput(controller) { controller.trackPointer(this) },
+                    .onSizeChanged { size -> controller.onSurfaceResized(size.width, size.height) },
         )
 
         ImeLayer(controller = controller, surfaceFocus = focusRequester)
@@ -450,23 +470,26 @@ private class SessionController(mediaUrl: String) {
             }
     }
 
-    suspend fun trackPointer(pointerScope: PointerInputScope) =
-        with(pointerScope) {
-            awaitEachGesture {
-                val down = awaitFirstDown(requireUnconsumed = false)
-                down.consume()
-                sendMotion(down.position.x, down.position.y)
+    /**
+     * A raw `View.OnTouchListener` callback, not a Compose gesture -- see
+     * the comment on the `AndroidView` call site for why. Single-pointer
+     * only (index 0): matches this slice's scope (tap/drag, no multi-touch)
+     * and is what the Compose gesture code this replaces also tracked.
+     * Returns `true` (event consumed) for every action this handles, so the
+     * View system does not also try its own default touch handling on it.
+     */
+    fun onTouchEvent(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                sendMotion(event.x, event.y)
                 sendButton(pressed = true)
-                while (true) {
-                    val event = awaitPointerEvent()
-                    val change = event.changes.firstOrNull { it.id == down.id }
-                    if (change == null || !change.pressed) break
-                    sendMotion(change.position.x, change.position.y)
-                    change.consume()
-                }
-                sendButton(pressed = false)
             }
+            MotionEvent.ACTION_MOVE -> sendMotion(event.x, event.y)
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> sendButton(pressed = false)
+            else -> return false
         }
+        return true
+    }
 
     /** Returns whether the key was consumed; an unmapped one is left to the system. */
     fun onKeyEvent(event: KeyEvent): Boolean {

@@ -149,11 +149,11 @@ class MediaProtocolTest {
     fun `input validation rejects adversarial values`() {
         assertEquals(
             InputValidationError.NonFiniteCoordinate,
-            MediaInput.PointerMotion(1, 2, Double.NaN, 0.0).validate(),
+            MediaInput.PointerMotion(1uL, 2uL, Double.NaN, 0.0).validate(),
         )
         assertEquals(
             InputValidationError.NonFiniteCoordinate,
-            MediaInput.PointerMotion(1, 2, 0.0, Double.POSITIVE_INFINITY).validate(),
+            MediaInput.PointerMotion(1uL, 2uL, 0.0, Double.POSITIVE_INFINITY).validate(),
         )
         assertEquals(InputValidationError.ViewportOutOfRange, MediaInput.ViewportResize(10, 10).validate())
         assertNull(MediaInput.ViewportResize(MIN_VIEWPORT_WIDTH, MIN_VIEWPORT_HEIGHT).validate())
@@ -166,19 +166,19 @@ class MediaProtocolTest {
 
     @Test
     fun `input validation bounds buttons and keycodes`() {
-        assertNull(MediaInput.PointerButton(1, 2, BTN_LEFT, true).validate())
+        assertNull(MediaInput.PointerButton(1uL, 2uL, BTN_LEFT, true).validate())
         assertEquals(
             InputValidationError.ButtonOutOfRange(0x10f),
-            MediaInput.PointerButton(1, 2, 0x10f, true).validate(),
+            MediaInput.PointerButton(1uL, 2uL, 0x10f, true).validate(),
         )
         assertEquals(
             InputValidationError.ButtonOutOfRange(0x120),
-            MediaInput.PointerButton(1, 2, 0x120, true).validate(),
+            MediaInput.PointerButton(1uL, 2uL, 0x120, true).validate(),
         )
-        assertNull(MediaInput.KeyboardKey(1, 2, MAX_KEYCODE, true).validate())
+        assertNull(MediaInput.KeyboardKey(1uL, 2uL, MAX_KEYCODE, true).validate())
         assertEquals(
             InputValidationError.KeyOutOfRange(MAX_KEYCODE + 1),
-            MediaInput.KeyboardKey(1, 2, MAX_KEYCODE + 1, true).validate(),
+            MediaInput.KeyboardKey(1uL, 2uL, MAX_KEYCODE + 1, true).validate(),
         )
     }
 
@@ -186,8 +186,8 @@ class MediaProtocolTest {
     fun `input validation bounds the keyboard layout index`() {
         fun modifiers(layoutIndex: Int) =
             MediaInput.KeyboardModifiers(
-                clientId = 1,
-                surfaceId = 2,
+                clientId = 1uL,
+                surfaceId = 2uL,
                 ctrl = false,
                 alt = false,
                 shift = false,
@@ -216,15 +216,15 @@ class MediaProtocolTest {
         )
         assertEquals(
             """{"type":"pointer_motion","client_id":11,"surface_id":12,"x":3.5,"y":4.5}""",
-            mediaJson.encodeToString(MediaInput.serializer(), MediaInput.PointerMotion(11, 12, 3.5, 4.5)),
+            mediaJson.encodeToString(MediaInput.serializer(), MediaInput.PointerMotion(11uL, 12uL, 3.5, 4.5)),
         )
         assertEquals(
             """{"type":"pointer_button","client_id":11,"surface_id":12,"button":272,"pressed":true}""",
-            mediaJson.encodeToString(MediaInput.serializer(), MediaInput.PointerButton(11, 12, BTN_LEFT, true)),
+            mediaJson.encodeToString(MediaInput.serializer(), MediaInput.PointerButton(11uL, 12uL, BTN_LEFT, true)),
         )
         assertEquals(
             """{"type":"keyboard_key","client_id":11,"surface_id":12,"keycode":30,"pressed":false}""",
-            mediaJson.encodeToString(MediaInput.serializer(), MediaInput.KeyboardKey(11, 12, 30, false)),
+            mediaJson.encodeToString(MediaInput.serializer(), MediaInput.KeyboardKey(11uL, 12uL, 30, false)),
         )
         assertEquals(
             """{"type":"viewport_resize","width":1280,"height":720}""",
@@ -235,7 +235,31 @@ class MediaProtocolTest {
                 """"shift":true,"caps_lock":false,"logo":false,"num_lock":false,"layout_index":0}""",
             mediaJson.encodeToString(
                 MediaInput.serializer(),
-                MediaInput.KeyboardModifiers(11, 12, true, false, true, false, false, false, 0),
+                MediaInput.KeyboardModifiers(11uL, 12uL, true, false, true, false, false, false, 0),
+            ),
+        )
+    }
+
+    /**
+     * Regression test for a real on-device bug: a session's `client_id`
+     * genuinely exceeds `Long.MAX_VALUE` (confirmed live against
+     * `wprsd` -- e.g. `15272202610726850855`), and the bridge rejected
+     * every pointer/keyboard event this client sent with
+     * `invalid value: integer` `-3174541462982700761`, expected u64` --
+     * a `Long`'s two's-complement bit pattern serialized as a negative
+     * JSON literal, which `serde` refuses for a `u64` field. `ULong`
+     * serializes the same bit pattern as its correct unsigned decimal
+     * form, which is what this test pins.
+     */
+    @Test
+    fun `a client_id above Long MAX_VALUE serializes as an unsigned decimal, not negative`() {
+        val aboveLongMax = 15_272_202_610_726_850_855uL
+        assertEquals(
+            """{"type":"pointer_motion","client_id":15272202610726850855,"surface_id":16817429954436193089,""" +
+                """"x":1.0,"y":2.0}""",
+            mediaJson.encodeToString(
+                MediaInput.serializer(),
+                MediaInput.PointerMotion(aboveLongMax, 16_817_429_954_436_193_089uL, 1.0, 2.0),
             ),
         )
     }

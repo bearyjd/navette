@@ -23,9 +23,23 @@ import kotlinx.serialization.json.Json
  * of reading back as a negative Int -- which would silently pass the
  * "reject before allocating" bound below. `u64` fields (`stream_id`,
  * `sequence`, `timestamp_us`, `client_id`, `surface_id`) are carried as
- * [Long] with identical two's-complement bits: they round-trip byte-exactly,
- * and a value above `Long.MAX_VALUE` reads back negative but is never
- * compared or arithmetic'd on, only echoed back.
+ * [Long] with identical two's-complement bits: they round-trip byte-exactly
+ * within this binary protocol, and a value above `Long.MAX_VALUE` reads back
+ * negative but is never compared or arithmetic'd on there.
+ *
+ * `client_id`/`surface_id` are the exception to "only echoed back": they
+ * also flow *out* through [MediaInput], which is JSON, not this binary
+ * format -- and unlike a byte-for-byte binary echo, JSON has no
+ * two's-complement concept. A `Long` above `Long.MAX_VALUE` serializes as a
+ * negative decimal literal, which the bridge's `u64` field then rejects
+ * outright (`serde` does not accept a `-` sign for an unsigned type) --
+ * confirmed on a real device against a session whose `client_id` genuinely
+ * exceeds `Long.MAX_VALUE`, where every pointer/keyboard event was silently
+ * rejected server-side this way. [MediaInput]'s `client_id`/`surface_id`
+ * fields are therefore `ULong`, not `Long` -- kotlinx.serialization encodes
+ * a `ULong` as its correct unsigned decimal JSON number, which is exactly
+ * what a `u64` field expects. `StreamConfig`'s own `Long` fields are
+ * unchanged; only the JSON-crossing boundary in `InputMapper` converts.
  */
 
 /** Matches `navette_protocol::media::MEDIA_WEBSOCKET_SUBPROTOCOL`. */
@@ -298,8 +312,8 @@ sealed interface MediaInput {
     @Serializable
     @SerialName("pointer_motion")
     data class PointerMotion(
-        @SerialName("client_id") val clientId: Long,
-        @SerialName("surface_id") val surfaceId: Long,
+        @SerialName("client_id") val clientId: ULong,
+        @SerialName("surface_id") val surfaceId: ULong,
         val x: Double,
         val y: Double,
     ) : MediaInput
@@ -307,8 +321,8 @@ sealed interface MediaInput {
     @Serializable
     @SerialName("pointer_button")
     data class PointerButton(
-        @SerialName("client_id") val clientId: Long,
-        @SerialName("surface_id") val surfaceId: Long,
+        @SerialName("client_id") val clientId: ULong,
+        @SerialName("surface_id") val surfaceId: ULong,
         val button: Int,
         val pressed: Boolean,
     ) : MediaInput
@@ -316,8 +330,8 @@ sealed interface MediaInput {
     @Serializable
     @SerialName("pointer_axis")
     data class PointerAxis(
-        @SerialName("client_id") val clientId: Long,
-        @SerialName("surface_id") val surfaceId: Long,
+        @SerialName("client_id") val clientId: ULong,
+        @SerialName("surface_id") val surfaceId: ULong,
         val horizontal: Double,
         val vertical: Double,
     ) : MediaInput
@@ -325,8 +339,8 @@ sealed interface MediaInput {
     @Serializable
     @SerialName("keyboard_key")
     data class KeyboardKey(
-        @SerialName("client_id") val clientId: Long,
-        @SerialName("surface_id") val surfaceId: Long,
+        @SerialName("client_id") val clientId: ULong,
+        @SerialName("surface_id") val surfaceId: ULong,
         val keycode: Int,
         val pressed: Boolean,
     ) : MediaInput
@@ -334,8 +348,8 @@ sealed interface MediaInput {
     @Serializable
     @SerialName("keyboard_modifiers")
     data class KeyboardModifiers(
-        @SerialName("client_id") val clientId: Long,
-        @SerialName("surface_id") val surfaceId: Long,
+        @SerialName("client_id") val clientId: ULong,
+        @SerialName("surface_id") val surfaceId: ULong,
         val ctrl: Boolean,
         val alt: Boolean,
         val shift: Boolean,
