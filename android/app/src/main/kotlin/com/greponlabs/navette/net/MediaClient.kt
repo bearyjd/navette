@@ -67,7 +67,16 @@ internal fun packetBudgetKib(packet: MediaPacket, budgetKib: Int): Int {
 class MediaClient(private val webSocketUrl: String) {
     private val httpClient =
         OkHttpClient.Builder()
-            .pingInterval(20, TimeUnit.SECONDS)
+            // OkHttp fails the socket if a ping goes unanswered for a whole
+            // interval, so this doubles as how fast a silently-dropped link is
+            // noticed -- a dead tailnet route stops delivering frames but does
+            // not close the TCP socket, and nothing else here would detect it.
+            // The session screen retries on that failure, so a shorter interval
+            // is what turns a frozen picture into a "Reconnecting..." within
+            // seconds. Pongs are answered on OkHttp's own I/O thread, not the
+            // main thread, so app jank cannot cause a false timeout; only a
+            // genuine [PING_INTERVAL_SECONDS]-long network stall can.
+            .pingInterval(PING_INTERVAL_SECONDS, TimeUnit.SECONDS)
             .build()
 
     @Volatile
@@ -354,6 +363,15 @@ class MediaClient(private val webSocketUrl: String) {
     private companion object {
         const val TAG = "MediaClient"
         const val NORMAL_CLOSURE = 1000
+
+        /**
+         * How often the socket is pinged, and so the ceiling on how long a
+         * silently-dropped link takes to surface as a failure the session
+         * screen can retry. Lowered from a keepalive-only 20s once reconnect
+         * existed: 5s detects a real drop within ~5-10s while staying well
+         * clear of a false positive on a healthy link.
+         */
+        const val PING_INTERVAL_SECONDS = 5L
 
         /**
          * Matches `EVENT_QUEUE_CAPACITY` in `client.rs:23`. Deep enough to

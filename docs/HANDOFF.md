@@ -1644,3 +1644,76 @@ no error -- the same signature as the `8cc011b` u64 bug.
   arrows and an actual Bluetooth keyboard remain); IME autocomplete and live
   resize are still open, and now sit under a second slice of changes to the
   same file.
+
+## M3 slice 3b: media auto-reconnect — implemented and on-device-verified (2026-09-06)
+
+Same session as the gesture slice, committed on `feat/android-session-screen`
+after it. Purely client-side (Android); **no Rust changed** — the server
+already supported reconnect.
+
+### Why it exists
+
+Testing the gestures surfaced it repeatedly: any media-socket drop stranded
+the session on a dead "Disconnected" screen with only "Back to sessions".
+On a phone over a tailnet that is a real, frequent failure. The roadmap
+(Phase 1) already lists reconnect UX; this is it.
+
+### What it does
+
+- The media socket is pinged every 5s (`MediaClient.PING_INTERVAL_SECONDS`,
+  down from a keepalive-only 20s), so a silently-dropped link — a dead
+  tailnet route stops delivering frames without closing the TCP socket —
+  surfaces as an OkHttp failure within ~5-10s instead of up to 40s.
+- On that failure the session screen retries up to
+  `MAX_RECONNECT_ATTEMPTS` (5) times on a linear backoff
+  (`RECONNECT_BASE_DELAY_MS` × attempt: 1s, 2s, …), showing
+  "Reconnecting…"/"Connecting…". A working connection resets the budget.
+- Exhausting the budget falls back to a manual "Reconnect" button.
+- A real `StreamEnd` (guest window closed) and a decode error are terminal
+  and never retried — that precedence is in `SessionOverlay`.
+
+### The design choice that matters
+
+Reconnect is a **clean rebuild**, not an in-place re-open. A Compose nonce
+(`reconnectNonce`) keys both the `SessionController` (`remember(host,
+sessionName, reconnectNonce)`) and the `SurfaceView` (`key(reconnectNonce) {
+AndroidView … }`). Bumping it disposes the old controller (its tested
+`close()`) and builds a fresh one against a fresh `SurfaceView`, reusing the
+exact `open()`/`close()` lifecycle a first attach uses. This was deliberate:
+
+- `MediaClient` is single-use — its packet `Channel` closes permanently in
+  `endStream()`, so the same instance cannot re-open. A fresh client sidesteps
+  that entirely.
+- The `SurfaceView`'s holder callback binds to one controller; an
+  already-created holder never re-fires `surfaceCreated` for a callback added
+  later. So a controller swap **without** a new view would render nothing.
+  Recreating the view via `key()` re-runs the factory against the new
+  controller and rewires it. (There's a comment on the `key()` block saying
+  exactly this — don't "optimise" the view recreation away.)
+
+The retry orchestration lives in Compose `LaunchedEffect`s, not in the
+controller, so the delicate `SessionController` concurrency (decoder
+lifecycle, `lock` ordering, job cancellation) is untouched — the whole reason
+the rebuild approach was chosen over teaching the controller to reconnect.
+
+Server side, `crates/navetted/src/media.rs`'s `attach` assigns a fresh
+`client_id` and replays codec config + latest keyframe to every new
+attachment (its `reconnect_starts_with_config_and_latest_keyframe` test), so
+a retry that lands while the session is alive resumes the picture with no
+decoder-side special-casing — the replayed `StreamConfig` flows through the
+same gate/decoder bootstrap a first attach does.
+
+### Verified on device (Pixel 10 Pro Fold, live Firefox session)
+
+- **Auto-recovery**: video live → wifi off ~8s → socket failed within
+  seconds → "Connecting…"/"Reconnecting…" overlay → wifi back → video resumed
+  **with no interaction**.
+- **Exhaustion + manual**: a longer outage burned all five retries against the
+  down network → "Reconnect" button appeared → after wifi returned, tapping
+  it rebuilt and resumed the video.
+- No `MediaClient` "media server reported" rejection in either run; the
+  gesture happy path is unaffected (verified live before the drop test).
+
+CI (`assembleDebug testDebugUnitTest lintDebug`) green throughout; the
+reconnect logic is Compose-level and verified on device rather than
+unit-tested, consistent with the rest of `SessionController`.

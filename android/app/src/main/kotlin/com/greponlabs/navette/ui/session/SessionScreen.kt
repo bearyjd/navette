@@ -30,6 +30,8 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -43,6 +45,7 @@ import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.greponlabs.navette.media.DecoderEvent
@@ -77,6 +80,24 @@ import kotlinx.coroutines.launch
  * turns a drag into one message rather than a stream the server must absorb.
  */
 private const val RESIZE_DEBOUNCE_MS = 150L
+
+/**
+ * How many times a dropped media socket is retried before the screen gives up
+ * and offers a manual reconnect. The server replays codec config and the
+ * latest keyframe to every fresh attachment
+ * (`crates/navetted/src/media.rs`'s `attach`, and its
+ * `reconnect_starts_with_config_and_latest_keyframe` test), so a retry that
+ * lands while the session is still alive resumes the picture on its own.
+ */
+private const val MAX_RECONNECT_ATTEMPTS = 5
+
+/**
+ * Base delay between retries; multiplied by the attempt number for a linear
+ * backoff (1s, 2s, ...). Short enough that a brief tailnet blip recovers
+ * without the user noticing much, bounded so a dead host is given up on in a
+ * few seconds rather than hammered.
+ */
+private const val RECONNECT_BASE_DELAY_MS = 1_000L
 
 /** What the screen renders. */
 private data class SessionUiState(
@@ -115,8 +136,17 @@ fun SessionScreen(
     host: String,
     onLeave: () -> Unit,
 ) {
+    // A reconnect is a clean rebuild: bumping the nonce recreates the
+    // controller (and, below, the SurfaceView it drives) from scratch, so
+    // every attempt reuses the exact open()/close() lifecycle a first attach
+    // does rather than teaching the controller to re-open a torn-down socket.
+    // The counters survive the rebuild -- they are keyed on the session, not
+    // the nonce -- so the retry budget is spent across attempts, not reset by
+    // each one.
+    var reconnectNonce by remember(host, sessionName) { mutableIntStateOf(0) }
+    var reconnectAttempt by remember(host, sessionName) { mutableIntStateOf(0) }
     val controller =
-        remember(host, sessionName) { SessionController(mediaWebSocketUrl(host, sessionName)) }
+        remember(host, sessionName, reconnectNonce) { SessionController(mediaWebSocketUrl(host, sessionName)) }
     val state by controller.state.collectAsState()
     val focusRequester = remember { FocusRequester() }
 
@@ -129,6 +159,32 @@ fun SessionScreen(
 
     LaunchedEffect(controller) { focusRequester.requestFocus() }
 
+    // A working connection clears the retry budget, so a later, unrelated drop
+    // gets the full set of attempts again rather than inheriting an old count.
+    LaunchedEffect(state.connection) {
+        if (state.connection is ConnectionState.Connected) reconnectAttempt = 0
+    }
+
+    // A dropped socket that is neither a deliberate leave (the screen is gone
+    // then, so this effect is too) nor the guest window closing (terminal, no
+    // point retrying) is retried on a linear backoff until the budget runs
+    // out. Keyed on the controller so it starts fresh for each rebuilt one.
+    val connectionDropped =
+        state.connection is ConnectionState.Failed || state.connection is ConnectionState.Disconnected
+    LaunchedEffect(controller, connectionDropped, state.streamEnded) {
+        if (connectionDropped && !state.streamEnded && reconnectAttempt < MAX_RECONNECT_ATTEMPTS) {
+            reconnectAttempt += 1
+            delay(RECONNECT_BASE_DELAY_MS * reconnectAttempt)
+            reconnectNonce += 1
+        }
+    }
+
+    val reconnecting = connectionDropped && !state.streamEnded && reconnectAttempt < MAX_RECONNECT_ATTEMPTS
+    val onReconnect = {
+        reconnectAttempt = 0
+        reconnectNonce += 1
+    }
+
     Box(
         modifier =
             Modifier
@@ -138,7 +194,14 @@ fun SessionScreen(
                 .focusable()
                 .onKeyEvent { event -> controller.onKeyEvent(event.nativeKeyEvent) },
     ) {
-        AndroidView(
+        // Rebuilt whenever the reconnect nonce changes: a fresh SurfaceView
+        // re-runs the factory below against the freshly-remembered controller,
+        // which is what wires that controller's surface callback -- an
+        // already-created holder never re-fires surfaceCreated for a callback
+        // added later, so a controller swap without a new view would render
+        // nothing.
+        key(reconnectNonce) {
+            AndroidView(
             // Touch is wired via View.setOnTouchListener on the raw
             // SurfaceView, not a Compose pointerInput modifier. This was
             // tried first because AndroidView always installs an internal
@@ -183,11 +246,19 @@ fun SessionScreen(
                 Modifier
                     .fillMaxSize()
                     .onSizeChanged { size -> controller.onSurfaceResized(size.width, size.height) },
-        )
+            )
+        }
 
         ImeLayer(controller = controller, surfaceFocus = focusRequester)
 
-        SessionOverlay(state = state, onLeave = onLeave)
+        SessionOverlay(
+            state = state,
+            reconnecting = reconnecting,
+            reconnectAttempt = reconnectAttempt,
+            maxAttempts = MAX_RECONNECT_ATTEMPTS,
+            onReconnect = onReconnect,
+            onLeave = onLeave,
+        )
     }
 }
 
@@ -696,41 +767,68 @@ private class SessionController(mediaUrl: String) {
     }
 }
 
-/** Connection and error states drawn over the video. */
+/**
+ * Connection and error states drawn over the video.
+ *
+ * Precedence matters: a terminal state ([SessionUiState.decodeError], or the
+ * guest window closing) wins over a reconnect, because retrying a stream that
+ * is genuinely gone would loop forever. A [reconnecting] drop shows progress
+ * and spends the retry budget silently; only once that budget is exhausted
+ * does the screen fall back to a manual [onReconnect].
+ */
 @Composable
-private fun SessionOverlay(state: SessionUiState, onLeave: () -> Unit) {
-    val message =
+private fun SessionOverlay(
+    state: SessionUiState,
+    reconnecting: Boolean,
+    reconnectAttempt: Int,
+    maxAttempts: Int,
+    onReconnect: () -> Unit,
+    onLeave: () -> Unit,
+) {
+    val terminal =
         when {
             state.decodeError != null -> state.decodeError
             state.streamEnded -> "The session's window closed."
-            state.connection is ConnectionState.Failed -> "Disconnected: ${state.connection.reason}"
-            state.connection is ConnectionState.Disconnected -> "Disconnected."
-            state.connection is ConnectionState.Connecting -> null
-            state.contentSize == null -> null
-            else -> return
+            else -> null
         }
+
+    // Nothing to draw once the stream is live: connected, a frame decoded, and
+    // no terminal error. Everything else needs an overlay of some kind.
+    if (terminal == null && state.connection is ConnectionState.Connected && state.contentSize != null) return
 
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            if (message == null) {
-                CircularProgressIndicator()
-                Text(
-                    text = "Waiting for the first frame...",
-                    color = Color.White,
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-            } else {
-                Text(
-                    text = message,
-                    color = Color.White,
-                    style = MaterialTheme.typography.bodyLarge,
-                    modifier = Modifier.padding(horizontal = 24.dp),
-                )
-                Button(onClick = onLeave) { Text("Back to sessions") }
+            when {
+                terminal != null -> {
+                    OverlayText(terminal, MaterialTheme.typography.bodyLarge)
+                    Button(onClick = onLeave) { Text("Back to sessions") }
+                }
+                reconnecting -> {
+                    CircularProgressIndicator()
+                    OverlayText("Reconnecting... ($reconnectAttempt/$maxAttempts)", MaterialTheme.typography.bodyMedium)
+                    TextButton(onClick = onLeave) { Text("Back to sessions", color = Color.White) }
+                }
+                state.connection is ConnectionState.Failed || state.connection is ConnectionState.Disconnected -> {
+                    val reason = (state.connection as? ConnectionState.Failed)?.reason ?: "connection lost"
+                    OverlayText("Disconnected: $reason", MaterialTheme.typography.bodyLarge)
+                    Button(onClick = onReconnect) { Text("Reconnect") }
+                    TextButton(onClick = onLeave) { Text("Back to sessions", color = Color.White) }
+                }
+                else -> {
+                    CircularProgressIndicator()
+                    val label =
+                        if (state.connection is ConnectionState.Connecting) "Connecting..." else "Waiting for the first frame..."
+                    OverlayText(label, MaterialTheme.typography.bodyMedium)
+                }
             }
         }
     }
+}
+
+@Composable
+private fun OverlayText(text: String, style: TextStyle) {
+    Text(text = text, color = Color.White, style = style, modifier = Modifier.padding(horizontal = 24.dp))
 }

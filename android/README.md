@@ -66,6 +66,20 @@ format are untouched, which is why this slice changed no Rust at all, and
 also why zooming past 1:1 is soft: the frames are the same size as before
 and the GPU upscales them.
 
+### Reconnect
+
+A dropped media socket no longer strands the session on a dead screen. The
+socket is pinged every 5s, so a silently-dropped tailnet route surfaces as a
+failure within seconds; the screen then shows "Reconnecting..." and retries
+up to five times on a linear backoff (1s, 2s, ...). Each retry is a clean
+rebuild -- a fresh controller and `SurfaceView` via a Compose nonce, reusing
+the same lifecycle a first attach uses rather than re-opening a torn-down
+socket -- and the server replays codec config and the latest keyframe to
+every new attachment (`crates/navetted/src/media.rs`), so a retry that lands
+while the session is still alive resumes the picture on its own. If the
+budget runs out, a manual "Reconnect" button takes over. The guest window
+closing (a real `StreamEnd`) is terminal and is never retried.
+
 ## Verified
 
 - `./gradlew clean assembleDebug testDebugUnitTest lintDebug` -- clean.
@@ -107,6 +121,13 @@ and the GPU upscales them.
     Session" button.
   - Two-finger tap opened Firefox's own right-click context menu at the tap
     point, app staying foreground.
+- **Reconnect, on the same device.** With the video live, the phone's wifi
+  was dropped: the socket failed within seconds, the screen showed
+  "Connecting.../Reconnecting...", and after wifi returned the video resumed
+  **on its own** with no interaction. Separately, a longer outage exhausted
+  the retry budget, surfaced the manual "Reconnect" button, and a tap on it
+  rebuilt the connection and resumed the video. No bridge rejections either
+  time.
 
 ## Not verified
 
@@ -134,18 +155,19 @@ Not yet exercised with real fingers (injection covered the logic; a human
 should still sanity-check feel): pinch/pan/scroll smoothness under a real
 hand, and that no stray click reaches the guest when a pinch starts.
 
-## An observed robustness gap (not a gesture-slice regression)
+## Known robustness notes
 
-The media connection has no auto-reconnect (a documented choice for this
-slice), so any time the `MainActivity` is recreated -- moving the app
-between the fold's inner and cover displays does this, since a display
-change is not in the activity's `configChanges` -- the socket drops and the
-screen shows "Disconnected", requiring a manual back-and-re-attach. In
-normal single-display use this does not arise, but it makes reconnect UX
-(roadmap Phase 1) the natural next slice. Relatedly, when the app dies
-without cleanly closing its media socket, re-attaching to the same session
-can briefly fail until the stale attachment is released host-side; starting
-a fresh session clears it immediately.
+- The media socket now auto-reconnects (see Reconnect above), so a dropped
+  link recovers on its own. A `MainActivity` recreation -- which moving the
+  app between the fold's inner and cover displays forces, since a display
+  change is not in the activity's `configChanges` -- still tears the whole
+  screen down and back up rather than reconnecting in place; that is a
+  heavier event than a socket drop and is not what reconnect targets. It does
+  not arise in normal single-display use.
+- When the app dies without cleanly closing its media socket, the stale
+  attachment is released host-side on the socket's own close; a fresh attach
+  gets a new `client_id` regardless (multiple attachments per session are
+  supported), so this is at most a brief transient, not a stuck slot.
 
 ## Known limitations
 
