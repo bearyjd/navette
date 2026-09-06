@@ -7,10 +7,10 @@ decode onto a `SurfaceView` with touch, hardware-keyboard and on-screen-IME
 input forwarded back over the media socket.
 
 Deliberately still out: clipboard sync, multi-window (a session's non-primary
-streams are ignored), long-press-as-right-click, pinch-zoom, auto-reconnect,
-and portrait support -- the session screen is landscape-locked, because
-`MediaInput::ViewportResize` is server-validated to a desktop-shaped
-`320..3840` x `240..2160` that a phone's portrait size fails outright.
+streams are ignored), middle-click, auto-reconnect, and portrait support --
+the session screen is landscape-locked, because `MediaInput::ViewportResize`
+is server-validated to a desktop-shaped `320..3840` x `240..2160` that a
+phone's portrait size fails outright.
 
 ## What's here
 
@@ -40,10 +40,31 @@ and portrait support -- the session screen is landscape-locked, because
   Drawer, Session). Navigation Compose was considered and left out: with a
   back-stack no deeper than session-to-drawer, a third branch is simpler than
   a nav graph plus a dependency. Revisit at a fourth screen.
-- `ui/session/` -- `SessionScreen` plus the pure input mapping it uses:
+- `ui/session/` -- `SessionScreen` plus the pure logic it uses:
   `InputMapper` (touch/keys/IME text to `MediaInput`, viewport clamping,
-  touch rescaling) and `KeycodeMap` (Android keycodes and printable ASCII to
-  raw Linux evdev codes, transcribed from `linux/input-event-codes.h`).
+  touch rescaling, scroll units), `KeycodeMap` (Android keycodes and
+  printable ASCII to raw Linux evdev codes, transcribed from
+  `linux/input-event-codes.h`), `GestureInterpreter` (the multi-touch state
+  machine, as a pure `(state, event) -> (state, effects)` step) and
+  `ViewTransform` (the client-side zoom/pan model and its maths).
+
+### Gestures
+
+| Fingers | Gesture | Effect |
+|---|---|---|
+| 1 | tap | left click |
+| 1 | drag | pointer drag (button held) |
+| 2 | pinch | zoom the view, 1x to 4x, anchored to the fingers |
+| 2 | drag, zoomed in | pan the view |
+| 2 | drag, at 1x | scroll the guest (`MediaInput::PointerAxis`) |
+| 2 | quick, still tap | right click at the first finger |
+
+One finger always drives the guest pointer; two always drive the view or
+the guest's scroll wheel. Zoom is entirely client-side -- a scale and
+translate on the `SurfaceView`. The guest window, the encoder and the wire
+format are untouched, which is why this slice changed no Rust at all, and
+also why zooming past 1:1 is soft: the frames are the same size as before
+and the GPU upscales them.
 
 ## Verified
 
@@ -52,32 +73,94 @@ and portrait support -- the session screen is landscape-locked, because
   (subprotocol negotiation, `list_apps`, `list_sessions`, and an error
   envelope for a `kill` on a nonexistent session) -- not just static
   fixtures.
+- On a real device (Pixel 9 Pro Fold, Android 17, against a live `navetted`
+  with a Firefox session -- see `docs/HANDOFF.md`): the connect, drawer and
+  attach flow; `MediaCodec` decode of the real VA-API stream; landscape lock
+  and its release; the disconnected state when `navetted` dies mid-session;
+  the on-screen keyboard toggle; and, after the `client_id`-as-`ULong` fix,
+  one-finger tap and drag landing where they should in the guest.
+- On the same device, the two assumptions the gesture slice is built on,
+  each measured before anything was built on it: a tap at screen `x=2400`
+  under a static 2x view scale arrived at the touch listener as `x=1200`, so
+  touch coordinates are inverse-mapped through the view transform by the
+  framework; and the video layer genuinely follows a `SurfaceView`
+  scale+translate (the picture was magnified, the Compose overlay was not),
+  so no `TextureView` fallback is needed.
+- **Every gesture, on a Pixel 10 Pro Fold (Android 17), against a live
+  Firefox session** -- driven by synthetic multi-touch through
+  `/dev/uinput` (`adb shell uinput -`), since `adb shell input` has no
+  multi-pointer form. To give the virtual touchscreen a live viewport to
+  bind to, the fold was forced open (`adb shell cmd device_state state 2`)
+  so the rotation-stable 2076x2152 inner display was the active default;
+  the virtual panel was sized to it so device coordinates map 1:1 to screen
+  pixels. Confirmed by screenshot at each step, with no `MediaClient`
+  rejection at any point:
+  - One-finger tap navigated a link (fast-tap path); one-finger drag
+    selected text.
+  - Pinch zoomed in to ~2.4x, anchored to the focal point; pinch back out
+    snapped to exactly fit-to-screen with the pan reset.
+  - Two-finger drag while zoomed panned, clamped to the content edges.
+  - Two-finger drag at 1:1 scrolled the guest, content following the fingers
+    (correct direction). Magnitude is on the fast side -- ~400px of travel
+    scrolled a full page -- but usable; `SCROLL_UNITS_PER_PIXEL` is the knob.
+  - Clicking while zoomed 2.16x landed precisely on Firefox's "Restore
+    Session" button.
+  - Two-finger tap opened Firefox's own right-click context menu at the tap
+    point, app staying foreground.
 
 ## Not verified
 
-No on-device or emulator run, for either slice: no AVD/emulator binary is
-available in the environment this was built in (SDK, `adb` and `sdkmanager`
-are present; `emulator` is not).
+No AVD/emulator binary is available in the environment this was built in
+(SDK, `adb` and `sdkmanager` are present; `emulator` is not).
 
-For the session screen that gap covers real behaviour, not just polish --
-`MediaCodec` decode, `Surface` lifecycle, touch placement, and IME commit
-handling have no JVM-testable surface at all. What *is* unit-tested is the
-logic underneath them: the wire protocol, `StreamGate`, `AnnexB`,
-`InputMapper`/`KeycodeMap`, and `MediaClient` against a `MockWebServer`.
-Still needing a physical device:
+What *is* unit-tested is the logic underneath the screen: the wire
+protocol, `StreamGate`, `AnnexB`, `InputMapper`/`KeycodeMap`,
+`GestureInterpreter`, `ViewTransform`, and `MediaClient` against a
+`MockWebServer`.
 
-- Video renders and updates live, and survives a stream reconfigure.
-- Tap and drag land in the right place in the guest.
-- A hardware keyboard types correctly (letters, Shift, punctuation, Enter,
-  Backspace, arrows).
+Still open from the session-screen slice:
+
+- A physical Bluetooth/USB keyboard as such, plus Enter and the arrow keys.
+  (adb-injected key events, which take the same `onKeyEvent` path, covered
+  letters, Shift, `,` `!`, space and Backspace -- see Verified.)
 - The on-screen keyboard types correctly, including an autocomplete-triggered
   replacement.
-- Killing `navetted` while attached shows a disconnected state, not a hang.
-- Leaving the session returns to the drawer with the session still running,
-  and the app is no longer landscape-locked afterwards.
+- A live resize while attached, and surviving a stream reconfigure.
 - Rapid session entry and exit stays responsive: `surfaceDestroyed` can block
   briefly on a codec start in progress, which is a deliberate trade against
   rendering into a released `Surface`.
+
+Not yet exercised with real fingers (injection covered the logic; a human
+should still sanity-check feel): pinch/pan/scroll smoothness under a real
+hand, and that no stray click reaches the guest when a pinch starts.
+
+## An observed robustness gap (not a gesture-slice regression)
+
+The media connection has no auto-reconnect (a documented choice for this
+slice), so any time the `MainActivity` is recreated -- moving the app
+between the fold's inner and cover displays does this, since a display
+change is not in the activity's `configChanges` -- the socket drops and the
+screen shows "Disconnected", requiring a manual back-and-re-attach. In
+normal single-display use this does not arise, but it makes reconnect UX
+(roadmap Phase 1) the natural next slice. Relatedly, when the app dies
+without cleanly closing its media socket, re-attaching to the same session
+can briefly fail until the stale attachment is released host-side; starting
+a fresh session clears it immediately.
+
+## Known limitations
+
+- **Zoom past 1:1 is soft.** It is a client-side upscale of the frames the
+  bridge already sends. Sharp zoom would need a crop/render-region protocol
+  message and encoder work, and was deliberately not built.
+- **The guest cannot be scrolled while zoomed in** -- pinch back to 1:1
+  first. The two-finger drag mode is latched from the zoom level when the
+  second finger lands (zoomed: pan; 1:1: scroll) and never changes
+  mid-gesture. The intended fix, deferred: let a pan that hits the content
+  edge in one axis start scrolling the guest in that axis.
+- **A left press is sent 60ms after the finger lands, not immediately**
+  (`PRESS_ARM_MS`). That is what lets a second finger cancel it, so a pinch
+  no longer begins with a stray left click; a drag therefore starts a frame
+  or two later than it used to. A tap shorter than the window still clicks.
 
 ## Building
 
@@ -105,5 +188,15 @@ machine-specific -- not checked in).
   anyway; the Rust `StreamRouter` this mirrors also rebuilds rather than
   resizing in place. Cost is a black flash on resize, against a server-side
   reconfigure that already costs hundreds of milliseconds.
+- **The gesture interpreter works in screen space, and the zoom transform is
+  applied to the `SurfaceView` synchronously from the touch path** -- not
+  through Compose state and an `AndroidView` `update` lambda. The framework
+  inverse-maps every touch through the view's matrix before the listener
+  sees it (measured, see Verified), so the controller lifts each pointer back
+  into screen space using the transform it believes is applied. The two must
+  be the same matrix at that instant; a transform that landed a frame later
+  via recomposition would have every pinch step read the fingers through a
+  stale one. In local space, a finger that has not moved would appear to
+  move whenever the zoom changed under it -- a feedback loop.
 - Package `com.greponlabs.navette`, per `docs/prp/PRP-plan.md`'s stated org
   (Grepon Labs LLC).

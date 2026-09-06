@@ -1514,3 +1514,133 @@ process bound to `100.111.143.67:9417` with debug logging may still be
 running on this machine from this session (`ps aux | grep navetted`) with
 a `phonetest` session (Firefox) still attached to it — check before
 starting a second one.
+
+## M3 slice 3: touch gestures and pinch-to-zoom -- implemented, CI-green, single-touch verified on device, multi-touch needs fingers (2026-09-06)
+
+**Uncommitted, on `feat/android-session-screen`** (which is itself still
+unpushed with the three slice-2 commits). Nine files: `GestureInterpreter.kt`,
+`ViewTransform.kt` and their tests are new; `SessionScreen.kt`,
+`InputMapper.kt`, `MediaProtocol.kt`, `InputMapperTest.kt` and
+`android/README.md` are changed. **No Rust changed** -- that is a defining
+property of the design, not an accident; `git diff --stat master...HEAD --
+crates/` is empty and should stay empty for this slice.
+
+### What it is
+
+Pinch to zoom the video 1x-4x, anchored to the fingers; two-finger drag pans
+when zoomed and scrolls the guest at 1:1; two-finger quick-still tap is a
+right-click. One finger still drives the guest pointer exactly as before,
+except the left press is now sent 60ms after the finger lands
+(`PRESS_ARM_MS`) so a second finger can cancel it -- previously every pinch
+began with a stray left click at the first finger. A tap shorter than 60ms
+still clicks (the press goes out with the release). Zoom is purely
+client-side: a scale+translate on the `SurfaceView`, the guest window never
+resizes, the frames are upscaled by the GPU and so are soft past 1:1.
+Gesture table and known limitations are in `android/README.md`.
+
+Decisions taken with the user before building, each ruling out a plausible
+alternative: local zoom over ctrl+scroll forwarding or a crop/render-region
+protocol; one finger = pointer over drag-to-pan or trackpad mode; arming
+delay over accepting the stray click; two-finger tap over an overlay toggle.
+One taken while planning: the two-finger drag mode is **latched at the
+second finger's landing from the zoom level at that instant** and never
+changes mid-gesture -- so the guest cannot be scrolled while zoomed in.
+The intended fix (a pan that hits the content edge in one axis starts
+scrolling that axis) is deferred and named in the README.
+
+### The two things measured on the device before anything was built
+
+Both on the Pixel 9 Pro Fold, Android 17, against the live `navetted` +
+Firefox `phonetest` session from slice 2 (both daemons were still running):
+
+1. **Touch coordinates arrive inverse-mapped through the view transform.**
+   With a throwaway static `scaleX = scaleY = 2f` on the `SurfaceView`, a
+   tap at screen `(2400, 1060)` on the 2424x1080 landscape surface reached
+   the touch listener as `event.x = 1200.0`. This is what dictates the
+   architecture below.
+2. **The video layer follows a `SurfaceView` scale/translate.** The
+   screenshot showed the picture magnified 2x (toolbar and page text cut off
+   mid-word at the right edge -- impossible at 1:1) while the Compose
+   `Keyboard` overlay stayed normal size. So no `TextureView` fallback.
+
+### Why the interpreter works in screen space and the transform is applied synchronously
+
+Because of measurement 1, gesture maths in local (view) space would see a
+stationary finger *move* whenever the zoom changed under it -- a feedback
+loop during every pinch. So `SessionController.onTouchEvent` lifts each
+pointer to screen space via `ViewTransform.localToScreen` using the
+transform it believes is applied, and the interpreter works there. That
+transform and the view's real matrix must be identical at that instant.
+The plan had the transform flow through a `StateFlow` to an `AndroidView`
+`update` lambda; that lands a frame later via recomposition, so every pinch
+step would read the fingers through a stale matrix. The controller instead
+holds the `SurfaceView` (bound in the factory, like `surfaceCallback`) and
+sets scale/translation directly from the touch path. If someone "tidies"
+this back into Compose state, the pinch will drift.
+
+### Scroll: the plan's constant was wrong, and why
+
+The plan reasoned "one wheel notch per 60px". The actual sink: the bridge
+forwards `PointerAxis` as `AxisScroll.absolute` tagged
+`AxisSource::Continuous` (`crates/navette-bridge/src/input.rs:132-145`) and
+wprsd applies that verbatim as the `wl_pointer.axis` value
+(`../wprs/src/server/client_handlers.rs:239-240`). For a continuous source
+Wayland defines that value in surface-local pixels, so the natural ratio is
+`1.0` (content follows the finger), negated because Wayland's positive axis
+means "scroll down". `InputMapper.SCROLL_UNITS_PER_PIXEL` and the sign in
+`scrollUnits` are the two things to tune if a real guest disagrees --
+neither has been checked against one yet.
+
+Two facts worth keeping beside this: `PointerButton` and `PointerAxis` are
+both dispatched by the bridge at `Point { x: 0.0, y: 0.0 }` (`input.rs:121`,
+`input.rs:139`) and only `PointerMotion` sets pointer focus
+(`input.rs:81-90`). Every button and axis effect the interpreter emits is
+therefore preceded by a motion. Break that pairing and input vanishes with
+no error -- the same signature as the `8cc011b` u64 bug.
+
+### Verification status
+
+- `./gradlew --console=plain assembleDebug testDebugUnitTest lintDebug` --
+  the exact CI command -- green. 156 unit tests (109 → 156; 28 interpreter,
+  13 transform, 6 mapper, all first-run green). Lint: 0 errors, 21
+  warnings, all pre-existing (checked by stashing).
+- **Single-touch verified on a Pixel 10 Pro Fold** (Android 17, fresh
+  install, the real build -- the Pixel 9 Pro Fold used for the Task 1
+  measurements went away mid-session and still has the probe build with a
+  static 2x scale on it; reinstall there before judging anything). Driven
+  entirely with `adb shell input`, screenshots as evidence: attaches at a
+  clean 1:1; a bare `input tap` on a link navigated (fast-tap path,
+  press-with-release); a 351px/400ms `input swipe` across a sentence
+  selected it starting ~53px in -- **that offset is the 60ms arming delay,
+  visible** and worth knowing about if a drag ever "starts late"; adb key
+  events after those gestures typed letters, Shift, `,` `!`, space and
+  Backspace correctly. No `MediaClient` "media server reported" warning at
+  any point, i.e. the bridge rejected nothing.
+- **Multi-touch not verified.** `adb shell input` has no pinch. Pinch, pan,
+  scroll, two-finger tap, click-while-zoomed, rotate-while-zoomed, and
+  leave-mid-drag are the open items in `android/README.md` → Not verified.
+  The two Task 1 assumptions were measured on the Pixel 9, not the Pixel
+  10; both are AOSP framework behaviour and unlikely to differ, but if a
+  pinch does nothing on the Pixel 10, re-run the probe (a static
+  `scaleX = scaleY = 2f` on the `SurfaceView` plus a logcat line in
+  `onTouchEvent`) before suspecting the interpreter.
+- Driving the app via adb, for whoever does that: `adb shell uiautomator
+  dump` sees Compose text nodes; on the cover display the host field is at
+  about `(400, 1296)` and Connect at `(211, 1467)` in portrait, and the
+  `phonetest` row at `(300, 500)` on the drawer. `adb exec-out screencap -p`
+  gave an unparseable PNG on this device (multi-display); `adb shell
+  screencap -p /sdcard/x.png` + `adb pull` works. The slice-2 note about
+  filtering logcat by tag (`MediaClient`), not package, still applies; a
+  bridge rejection shows up there as `media server reported: ...`.
+
+### Not done
+
+- Code review. Slice 2's pattern (independent `code-reviewer` +
+  `security-reviewer`, three rounds, real bugs found in each of the first
+  two) has not been run on this slice.
+- Commit. Not asked for; the tree is left ready.
+- Of the three slice-2 on-device items, the hardware-keyboard one is mostly
+  closed by the adb key-event run above (same `onKeyEvent` path; Enter,
+  arrows and an actual Bluetooth keyboard remain); IME autocomplete and live
+  resize are still open, and now sit under a second slice of changes to the
+  same file.

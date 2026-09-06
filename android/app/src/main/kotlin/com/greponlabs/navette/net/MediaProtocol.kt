@@ -62,6 +62,9 @@ const val MAX_LAYOUTS: Int = 16
 /** Evdev `BTN_LEFT`, per `/usr/include/linux/input-event-codes.h`. */
 const val BTN_LEFT: Int = 0x110
 
+/** Evdev `BTN_RIGHT`, per `/usr/include/linux/input-event-codes.h`. */
+const val BTN_RIGHT: Int = 0x111
+
 /** Inclusive evdev button range the bridge accepts (`BTN_LEFT`..`BTN_TASK` and spare). */
 const val BUTTON_MIN: Int = 0x110
 const val BUTTON_MAX: Int = 0x11f

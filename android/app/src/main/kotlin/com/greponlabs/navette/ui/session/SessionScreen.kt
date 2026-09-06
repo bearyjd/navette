@@ -9,6 +9,7 @@ import android.view.MotionEvent
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.view.View
 import androidx.compose.foundation.background
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Arrangement
@@ -49,6 +50,8 @@ import com.greponlabs.navette.media.H264Decoder
 import com.greponlabs.navette.media.PrimaryStream
 import com.greponlabs.navette.media.StreamGate
 import com.greponlabs.navette.media.StreamGateEvent
+import com.greponlabs.navette.net.BTN_LEFT
+import com.greponlabs.navette.net.BTN_RIGHT
 import com.greponlabs.navette.net.ConnectionState
 import com.greponlabs.navette.net.MediaClient
 import com.greponlabs.navette.net.MediaInput
@@ -159,6 +162,21 @@ fun SessionScreen(
                 SurfaceView(context).apply {
                     holder.addCallback(controller.surfaceCallback)
                     setOnTouchListener { _, event -> controller.onTouchEvent(event) }
+                    // Zoom and pan are a scale+translate on this view, applied
+                    // by the controller synchronously from the touch path --
+                    // not through Compose state and this AndroidView's
+                    // `update` lambda. The framework inverse-maps every touch
+                    // through the view's matrix before it reaches the listener
+                    // (verified on device: a tap at screen x=2400 under a 2x
+                    // scale arrived as x=1200), and the controller lifts it
+                    // back into screen space using the transform it believes
+                    // is applied. Those two must be the same matrix, and a
+                    // transform that lands a frame later via recomposition
+                    // would make every pinch step read the fingers through a
+                    // stale one. Only the view's transform changes when
+                    // zooming; its layout size never does, so no resize is
+                    // reported and the guest window keeps its dimensions.
+                    controller.bindView(this)
                 }
             },
             modifier =
@@ -291,8 +309,36 @@ private class SessionController(mediaUrl: String) {
     private var packetsJob: Job? = null
     private var resizeJob: Job? = null
 
+    // Gesture state. All main-thread only: the touch listener, the surface
+    // callbacks, and `scope` (Main.immediate) are the only writers. pressJob
+    // must stay on that dispatcher -- moving it to Default would turn
+    // leftPressed into a data race.
+    private var view: View? = null
+    private var transform = ViewTransform()
+    private var gestureState: GestureState = GestureState.Idle
+    private var pressJob: Job? = null
+    private var leftPressed = false
+
     private val _state = MutableStateFlow(SessionUiState())
     val state: StateFlow<SessionUiState> = _state.asStateFlow()
+
+    /** The view zoom and pan are applied to; see the `AndroidView` factory for why it is held directly. */
+    fun bindView(target: View) {
+        view = target
+        // The transform maths pivot at the top-left corner; the View default
+        // is the centre, which would make a zoom drift away from the fingers.
+        target.pivotX = 0f
+        target.pivotY = 0f
+        applyTransform()
+    }
+
+    private fun applyTransform() {
+        val target = view ?: return
+        target.scaleX = transform.zoom.toFloat()
+        target.scaleY = transform.zoom.toFloat()
+        target.translationX = transform.offsetX.toFloat()
+        target.translationY = transform.offsetY.toFloat()
+    }
 
     fun open() {
         connectionJob?.cancel()
@@ -319,6 +365,12 @@ private class SessionController(mediaUrl: String) {
     }
 
     fun close() {
+        // A screen left mid-drag must not strand a held button in the guest.
+        pressJob?.cancel()
+        if (leftPressed) sendButton(BTN_LEFT, pressed = false)
+        leftPressed = false
+        gestureState = GestureState.Idle
+        view = null
         resizeJob?.cancel()
         packetsJob?.cancel()
         connectionJob?.cancel()
@@ -461,6 +513,9 @@ private class SessionController(mediaUrl: String) {
 
     fun onSurfaceResized(width: Int, height: Int) {
         synchronized(lock) { surfaceSize = width to height }
+        // A rotation or a fold must not leave the view panned off the content.
+        transform = transform.clampedTo(width, height)
+        applyTransform()
         resizeJob?.cancel()
         resizeJob =
             scope.launch {
@@ -472,23 +527,103 @@ private class SessionController(mediaUrl: String) {
 
     /**
      * A raw `View.OnTouchListener` callback, not a Compose gesture -- see
-     * the comment on the `AndroidView` call site for why. Single-pointer
-     * only (index 0): matches this slice's scope (tap/drag, no multi-touch)
-     * and is what the Compose gesture code this replaces also tracked.
-     * Returns `true` (event consumed) for every action this handles, so the
-     * View system does not also try its own default touch handling on it.
+     * the comment on the `AndroidView` call site for why. Reduces the
+     * `MotionEvent` to a [TouchEvent], steps [GestureInterpreter], and
+     * applies whatever it asks for. Returns `true` (event consumed) for every
+     * action the interpreter knows, so the View system does not also try its
+     * own default touch handling on it.
+     *
+     * Pointers are lifted into screen space first. The framework has already
+     * inverse-mapped them through the view's transform, so while a pinch is
+     * changing that transform, the local coordinates of a finger that has not
+     * moved would change under it -- a feedback loop. Screen space is where
+     * the fingers physically are, and stays put.
      */
     fun onTouchEvent(event: MotionEvent): Boolean {
-        when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                sendMotion(event.x, event.y)
-                sendButton(pressed = true)
+        val action = touchAction(event.actionMasked) ?: return false
+        val pointers =
+            List(event.pointerCount) { index ->
+                val (x, y) = transform.localToScreen(event.getX(index), event.getY(index))
+                TouchPointer(event.getPointerId(index), x.toFloat(), y.toFloat())
             }
-            MotionEvent.ACTION_MOVE -> sendMotion(event.x, event.y)
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> sendButton(pressed = false)
-            else -> return false
-        }
+        val step =
+            GestureInterpreter.step(
+                gestureState,
+                TouchEvent(
+                    action = action,
+                    actionPointerId = event.getPointerId(event.actionIndex),
+                    pointers = pointers,
+                    eventTimeMs = event.eventTime,
+                    zoomed = transform.isZoomed,
+                ),
+            )
+        gestureState = step.state
+        for (effect in step.effects) applyEffect(effect)
         return true
+    }
+
+    private fun touchAction(actionMasked: Int): TouchAction? =
+        when (actionMasked) {
+            MotionEvent.ACTION_DOWN -> TouchAction.Down
+            MotionEvent.ACTION_MOVE -> TouchAction.Move
+            MotionEvent.ACTION_UP -> TouchAction.Up
+            MotionEvent.ACTION_POINTER_DOWN -> TouchAction.PointerDown
+            MotionEvent.ACTION_POINTER_UP -> TouchAction.PointerUp
+            MotionEvent.ACTION_CANCEL -> TouchAction.Cancel
+            else -> null
+        }
+
+    private fun applyEffect(effect: GestureEffect) {
+        when (effect) {
+            is GestureEffect.Motion -> {
+                val (x, y) = transform.screenToLocal(effect.x, effect.y) ?: return
+                sendMotion(x.toFloat(), y.toFloat())
+            }
+            GestureEffect.ArmLeftPress -> {
+                pressJob?.cancel()
+                pressJob =
+                    scope.launch {
+                        delay(PRESS_ARM_MS)
+                        sendButton(BTN_LEFT, pressed = true)
+                        leftPressed = true
+                    }
+            }
+            GestureEffect.CancelLeftPress -> {
+                pressJob?.cancel()
+                if (leftPressed) sendButton(BTN_LEFT, pressed = false)
+                leftPressed = false
+            }
+            // The fast-tap rule: a tap shorter than PRESS_ARM_MS reaches here
+            // with its press never sent, and must still click.
+            GestureEffect.EndLeftPress -> {
+                pressJob?.cancel()
+                if (!leftPressed) sendButton(BTN_LEFT, pressed = true)
+                sendButton(BTN_LEFT, pressed = false)
+                leftPressed = false
+            }
+            GestureEffect.RightClick -> {
+                sendButton(BTN_RIGHT, pressed = true)
+                sendButton(BTN_RIGHT, pressed = false)
+            }
+            is GestureEffect.Zoom -> {
+                val (width, height) = synchronized(lock) { surfaceSize } ?: return
+                transform =
+                    transform.zoomedAbout(
+                        effect.scaleFactor,
+                        effect.focalX.toDouble(),
+                        effect.focalY.toDouble(),
+                        width,
+                        height,
+                    )
+                applyTransform()
+            }
+            is GestureEffect.Pan -> {
+                val (width, height) = synchronized(lock) { surfaceSize } ?: return
+                transform = transform.pannedBy(effect.dx.toDouble(), effect.dy.toDouble(), width, height)
+                applyTransform()
+            }
+            is GestureEffect.Scroll -> sendScroll(effect.dx, effect.dy)
+        }
     }
 
     /** Returns whether the key was consumed; an unmapped one is left to the system. */
@@ -538,9 +673,26 @@ private class SessionController(mediaUrl: String) {
         client.sendInput(InputMapper.pointerMotion(stream.clientId, stream.surfaceId, mappedX, mappedY))
     }
 
-    private fun sendButton(pressed: Boolean) {
+    private fun sendButton(button: Int, pressed: Boolean) {
         val stream = gate.primary ?: return
-        client.sendInput(InputMapper.pointerButton(stream.clientId, stream.surfaceId, pressed))
+        client.sendInput(InputMapper.pointerButton(stream.clientId, stream.surfaceId, button, pressed))
+    }
+
+    /**
+     * Only ever reached at 1:1 (a two-finger drag while zoomed pans instead),
+     * where screen and content pixels coincide, so the finger delta needs no
+     * rescaling before it becomes a guest scroll delta.
+     */
+    private fun sendScroll(dx: Float, dy: Float) {
+        val stream = gate.primary ?: return
+        client.sendInput(
+            InputMapper.pointerAxis(
+                stream.clientId,
+                stream.surfaceId,
+                InputMapper.scrollUnits(dx),
+                InputMapper.scrollUnits(dy),
+            ),
+        )
     }
 }
 

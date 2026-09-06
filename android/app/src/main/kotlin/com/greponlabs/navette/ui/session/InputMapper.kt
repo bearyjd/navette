@@ -31,16 +31,62 @@ object InputMapper {
         MediaInput.PointerMotion(clientId = clientId.toULong(), surfaceId = surfaceId.toULong(), x = x, y = y)
 
     /**
-     * Button is always `BTN_LEFT`: this slice maps a tap to a left click and
-     * has no right-click gesture (long-press-as-right-click is deferred).
+     * [button] is a raw evdev `BTN_*` code, forwarded to the guest unchanged.
+     * This client sends two: [BTN_LEFT] for a one-finger tap and [BTN_RIGHT]
+     * for a two-finger tap. Anything outside `0x110..0x11f` is refused by
+     * `MediaInput.validate()` before it reaches the wire, mirroring
+     * `media.rs:298-300`.
+     *
+     * The bridge dispatches a button at `Point { x: 0.0, y: 0.0 }`
+     * (`crates/navette-bridge/src/input.rs:119-123`) -- position comes from
+     * the most recent [pointerMotion], so one must always precede this.
      */
-    fun pointerButton(clientId: Long, surfaceId: Long, pressed: Boolean): MediaInput.PointerButton =
+    fun pointerButton(clientId: Long, surfaceId: Long, button: Int, pressed: Boolean): MediaInput.PointerButton =
         MediaInput.PointerButton(
             clientId = clientId.toULong(),
             surfaceId = surfaceId.toULong(),
-            button = BTN_LEFT,
+            button = button,
             pressed = pressed,
         )
+
+    /**
+     * A scroll delta in the guest's own surface-local pixels; see
+     * [scrollUnits] for where that unit comes from. Like [pointerButton],
+     * dispatched by the bridge at the position of the most recent motion
+     * (`input.rs:137-145`), and `PointerAxis` never sets pointer focus on its
+     * own (`input.rs:81-90` does that for motion only), so a motion must
+     * have preceded it.
+     */
+    fun pointerAxis(clientId: Long, surfaceId: Long, horizontal: Double, vertical: Double): MediaInput.PointerAxis =
+        MediaInput.PointerAxis(
+            clientId = clientId.toULong(),
+            surfaceId = surfaceId.toULong(),
+            horizontal = horizontal,
+            vertical = vertical,
+        )
+
+    /**
+     * Guest scroll pixels per pixel of finger travel.
+     *
+     * The bridge forwards `horizontal`/`vertical` straight through as
+     * `AxisScroll.absolute` tagged `AxisSource::Continuous`
+     * (`crates/navette-bridge/src/input.rs:132-145`), and wprsd applies that
+     * as the `wl_pointer.axis` value verbatim. For a continuous source Wayland
+     * defines that value in surface-local pixels, so one pixel of finger
+     * travel is one pixel of scroll and the natural ratio is `1.0` -- the
+     * content follows the finger, as it does in every native touch UI. Held
+     * as a constant because it is the one number to tune if a real guest
+     * scrolls too fast or too slowly.
+     */
+    const val SCROLL_UNITS_PER_PIXEL: Double = 1.0
+
+    /**
+     * Turns finger travel into a scroll delta. Negated: Wayland's positive
+     * axis means "scroll down/right" (reveal lower or further-right content),
+     * which is what a finger moving *up* or *left* asks for when the content
+     * follows it.
+     */
+    fun scrollUnits(fingerDelta: Float): Double = -fingerDelta * SCROLL_UNITS_PER_PIXEL
 
     fun keyboardKey(
         clientId: Long,

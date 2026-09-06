@@ -2,11 +2,14 @@ package com.greponlabs.navette.ui.session
 
 import android.view.KeyEvent
 import com.greponlabs.navette.net.BTN_LEFT
+import com.greponlabs.navette.net.BTN_RIGHT
 import com.greponlabs.navette.net.MAX_VIEWPORT_HEIGHT
 import com.greponlabs.navette.net.MAX_VIEWPORT_WIDTH
 import com.greponlabs.navette.net.MIN_VIEWPORT_HEIGHT
 import com.greponlabs.navette.net.MIN_VIEWPORT_WIDTH
+import com.greponlabs.navette.net.InputValidationError
 import com.greponlabs.navette.net.MediaInput
+import com.greponlabs.navette.net.mediaJson
 import com.greponlabs.navette.net.validate
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -205,12 +208,75 @@ class InputMapperTest {
 
     @Test
     fun `a tap maps to a left button press and release`() {
-        val pressed = InputMapper.pointerButton(CLIENT_ID, SURFACE_ID, pressed = true)
+        val pressed = InputMapper.pointerButton(CLIENT_ID, SURFACE_ID, BTN_LEFT, pressed = true)
 
         assertEquals(BTN_LEFT, pressed.button)
         assertTrue(pressed.pressed)
         assertNull(pressed.validate())
-        assertTrue(!InputMapper.pointerButton(CLIENT_ID, SURFACE_ID, pressed = false).pressed)
+        assertTrue(!InputMapper.pointerButton(CLIENT_ID, SURFACE_ID, BTN_LEFT, pressed = false).pressed)
+    }
+
+    /**
+     * Literals transcribed from `/usr/include/linux/input-event-codes.h`,
+     * for the same reason the keycode tests use them.
+     */
+    @Test
+    fun `left and right buttons are the evdev BTN codes and pass the bridge's bound`() {
+        assertEquals(0x110, InputMapper.pointerButton(CLIENT_ID, SURFACE_ID, BTN_LEFT, pressed = true).button)
+        assertEquals(0x111, InputMapper.pointerButton(CLIENT_ID, SURFACE_ID, BTN_RIGHT, pressed = true).button)
+        for (button in listOf(BTN_LEFT, BTN_RIGHT)) {
+            for (pressed in listOf(true, false)) {
+                assertNull(InputMapper.pointerButton(CLIENT_ID, SURFACE_ID, button, pressed).validate())
+            }
+        }
+    }
+
+    @Test
+    fun `pointer axis carries the surface identity and passes validation`() {
+        val axis = InputMapper.pointerAxis(CLIENT_ID, SURFACE_ID, 1.5, -2.5)
+
+        assertEquals(MediaInput.PointerAxis(CLIENT_ID.toULong(), SURFACE_ID.toULong(), 1.5, -2.5), axis)
+        assertNull(axis.validate())
+    }
+
+    /**
+     * The 8cc011b regression, pinned for the new sender too: a `client_id`
+     * above `Long.MAX_VALUE` must serialise as a positive decimal or the
+     * bridge's `u64` field rejects it and the scroll silently does nothing.
+     */
+    @Test
+    fun `pointer axis serialises a client id above Long MAX_VALUE as an unsigned decimal`() {
+        // The value from the real session that surfaced the original bug.
+        val huge = java.lang.Long.parseUnsignedLong("15272202610726850855")
+        val axis = InputMapper.pointerAxis(huge, SURFACE_ID, 0.0, 1.0)
+
+        val json = mediaJson.encodeToString(MediaInput.serializer(), axis)
+        assertTrue(json, json.contains("\"client_id\":15272202610726850855"))
+        assertTrue(json, !json.contains("-"))
+    }
+
+    @Test
+    fun `non-finite scroll is refused before the wire`() {
+        assertEquals(
+            InputValidationError.NonFiniteCoordinate,
+            InputMapper.pointerAxis(CLIENT_ID, SURFACE_ID, Double.NaN, 0.0).validate(),
+        )
+        assertEquals(
+            InputValidationError.NonFiniteCoordinate,
+            InputMapper.pointerAxis(CLIENT_ID, SURFACE_ID, 0.0, Double.POSITIVE_INFINITY).validate(),
+        )
+    }
+
+    /**
+     * One pixel of finger travel is one pixel of guest scroll, negated: a
+     * finger moving up (negative delta) asks for content further down, which
+     * is Wayland's positive axis direction.
+     */
+    @Test
+    fun `scroll units follow the finger one to one and invert the sign`() {
+        assertEquals(-60.0, InputMapper.scrollUnits(60f), 1e-9)
+        assertEquals(60.0, InputMapper.scrollUnits(-60f), 1e-9)
+        assertEquals(0.0, InputMapper.scrollUnits(0f), 1e-9)
     }
 
     @Test
