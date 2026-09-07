@@ -1851,6 +1851,44 @@ releases it server-side.
   reason the retry loop exists) via a small `logDropped` helper both
   branches tail-call.
 
-166 unit tests, CI green, no Rust touched. Not yet re-verified on a real
-device -- the phone was in the user's own hands for something unrelated
-when this landed; do that before calling the MVP fully closed.
+166 unit tests, CI green, no Rust touched.
+
+### The IME-focus fix, first attempt, measured wrong on device (2026-09-07)
+
+On-device re-verification of the fix above found it incomplete. Test: raise
+the on-screen keyboard, drop wifi for 8s, restore it, watch the reconnect.
+
+**What happened on the first build:** the video came back on its own
+(correct), the "Hide keyboard" label stayed put (`imeRaised` correctly
+survived, as designed) -- but the on-screen keyboard itself had vanished,
+and `adb shell input text` afterward navigated the guest to a different
+page instead of landing silently in the hidden field.
+`uiautomator dump`'s focused node confirmed it: the full-screen surface
+`Box`, not the hidden `BasicTextField`.
+
+**Why "decline to steal focus" wasn't enough.** The fix only skipped
+`focusRequester.requestFocus()` while `imeRaised`. But the `AndroidView`
+holding the `SurfaceView` is itself recreated on every reconnect
+(`key(reconnectNonce)`), and the platform's own focus-search assigns that
+freshly-attached View native focus regardless of what Compose's
+`FocusRequester` bookkeeping says. Nothing in the app requested that focus
+move -- the view recreation did it as a side effect. Declining to make our
+own request left the field wide open to it.
+
+**The actual fix:** `fieldFocus` (previously private to `ImeLayer`) is
+hoisted to `SessionScreen` alongside `imeRaised`, and the reconnect effect
+now *actively* asserts the correct target every time it reruns --
+`fieldFocus.requestFocus()` + `keyboard?.show()` when raised, the surface's
+`focusRequester.requestFocus()` otherwise -- rather than merely omitting
+the wrong one.
+
+**Re-verified on the Pixel 10, same recipe:** keyboard visible throughout
+the wifi-drop-and-restore cycle this time; `adb shell input text` after
+reconnecting landed silently (no guest navigation, page unchanged); the
+"Hide keyboard"/"Keyboard" toggle still flips cleanly afterward. 166 tests,
+CI green, no Rust touched.
+
+This is the shape of bug that only shows up by actually reconnecting on a
+real device with the keyboard up -- neither the unit tests (pure Kotlin,
+no Android View focus system) nor the independent code review caught it;
+only driving the exact user action did.

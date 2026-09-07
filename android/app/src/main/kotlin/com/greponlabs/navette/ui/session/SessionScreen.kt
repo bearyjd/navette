@@ -129,6 +129,11 @@ fun SessionScreen(
         }
     val state by controller.state.collectAsState()
     val focusRequester = remember { FocusRequester() }
+    // Not owned by ImeLayer: the reconnect-safe effect below needs to
+    // re-assert this focus target itself, not merely decline to steal it --
+    // see that effect's comment for why "decline" alone was not enough.
+    val fieldFocus = remember { FocusRequester() }
+    val keyboard = LocalSoftwareKeyboardController.current
     val lifecycleOwner = LocalLifecycleOwner.current
     // Keyed on the session, not the nonce, like the retry counters above: a
     // reconnect must not silently drop the user out of the on-screen
@@ -142,11 +147,28 @@ fun SessionScreen(
         onDispose { controller.close() }
     }
 
-    // Skipped while the IME is raised: a reconnect rebuilds this effect (it is
-    // keyed on the controller), and requesting the surface's focus here would
-    // silently pull focus off the hidden text field mid-reconnect, dropping
-    // the soft keyboard without the user asking for it.
-    LaunchedEffect(controller) { if (!imeRaised) focusRequester.requestFocus() }
+    // Re-asserts whichever focus target is correct, every time this effect
+    // reruns (keyed on the controller, so every reconnect). Merely skipping
+    // the surface-focus request while the IME is raised was tried first and
+    // measured wrong on a real device: the AndroidView holding the SurfaceView
+    // is recreated on reconnect (`key(reconnectNonce)` below), and the
+    // platform's own focus-search assigns that freshly attached View native
+    // focus regardless of what Compose's FocusRequester state says -- the
+    // hidden IME field lost real input focus even though `imeRaised` (and the
+    // "Hide keyboard" label) correctly stayed true. Confirmed via
+    // `dumpsys uiautomator`: the focused node was the surface's Box, and
+    // adb-injected text was landing in the guest as hardware keys instead of
+    // the IME delta path. Actively requesting the field's focus (and
+    // re-showing the keyboard, since a view regaining focus does not raise it
+    // on its own) closes that gap instead of merely not making it worse.
+    LaunchedEffect(controller) {
+        if (imeRaised) {
+            fieldFocus.requestFocus()
+            keyboard?.show()
+        } else {
+            focusRequester.requestFocus()
+        }
+    }
 
     // The retry budget refills only once the stream is genuinely live -- a
     // frame decoded -- not on the socket opening. A server that accepts the
@@ -266,6 +288,7 @@ fun SessionScreen(
         ImeLayer(
             controller = controller,
             surfaceFocus = focusRequester,
+            fieldFocus = fieldFocus,
             imeRaised = imeRaised,
             onImeRaisedChange = { imeRaised = it },
         )
@@ -299,19 +322,22 @@ fun SessionScreen(
  * video surface holds it a hardware keyboard works. Handing focus back to
  * [surfaceFocus] on dismissal is what restores the hardware path.
  *
- * [imeRaised] is hoisted to the caller rather than owned here: a reconnect's
- * own focus-restoring effect needs to know whether the IME is up so it does
- * not silently steal focus back from a raised keyboard mid-reconnect.
+ * [imeRaised] and [fieldFocus] are hoisted to the caller rather than owned
+ * here: a reconnect's own focus-restoring effect needs both -- whether the
+ * IME is up, and the exact [FocusRequester] to point back at -- to actively
+ * re-assert the field's focus after every rebuild, not merely decline to
+ * steal it (see that effect's comment for why the weaker form measured wrong
+ * on a real device).
  */
 @Composable
 private fun BoxScope.ImeLayer(
     controller: SessionController,
     surfaceFocus: FocusRequester,
+    fieldFocus: FocusRequester,
     imeRaised: Boolean,
     onImeRaisedChange: (Boolean) -> Unit,
 ) {
     var typed by remember { mutableStateOf("") }
-    val fieldFocus = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
 
     BasicTextField(
