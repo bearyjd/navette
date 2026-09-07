@@ -1,5 +1,6 @@
 package com.greponlabs.navette.ui.session
 
+import kotlin.math.abs
 import kotlin.math.hypot
 
 /**
@@ -19,8 +20,20 @@ const val TAP_TIMEOUT_MS: Long = 250L
 /** How far the fingers may drift before a two-finger touch stops being a tap. */
 const val TAP_SLOP_PX: Float = 24f
 
-/** Fractional change in finger spacing before a two-finger touch starts zooming. */
+/**
+ * Fractional change in finger spacing before a two-finger touch starts
+ * zooming. Relative, so a wide pinch and a narrow one feel the same.
+ */
 const val PINCH_SLOP_RATIO: Double = 0.05
+
+/**
+ * Absolute change in finger spacing before a two-finger touch starts zooming,
+ * required *as well as* [PINCH_SLOP_RATIO]. A relative threshold alone has
+ * no floor: fingers 40px apart would latch a pinch on 2px of spacing change,
+ * which is inside ordinary digitizer jitter -- and a latched pinch silently
+ * cancels the right-click a two-finger tap was about to produce.
+ */
+const val PINCH_SLOP_PX: Float = 8f
 
 /** One finger, as this screen sees it: an identity and a screen-space position. */
 data class TouchPointer(val id: Int, val x: Float, val y: Float)
@@ -196,7 +209,13 @@ object GestureInterpreter {
     private fun beginTwoPointer(state: GestureState.OnePointer, event: TouchEvent): GestureStep {
         val first = event.pointers.firstOrNull { it.id == state.id }
         val second = event.pointers.firstOrNull { it.id == event.actionPointerId && it.id != state.id }
-        if (first == null || second == null) return GestureStep(state, emptyList())
+        // A second finger whose partner is not in the event means the stream
+        // this screen is tracking has diverged from Android's. Keeping the
+        // phantom OnePointer would let its eventual Up send press+release at
+        // a stale position; suppress until every finger lifts instead.
+        if (first == null || second == null) {
+            return GestureStep(GestureState.Suppressed, listOf(GestureEffect.CancelLeftPress))
+        }
         val distance = distance(first, second)
         val focalX = (first.x + second.x) / 2f
         val focalY = (first.y + second.y) / 2f
@@ -228,11 +247,17 @@ object GestureInterpreter {
         val focalY = (a.y + b.y) / 2f
         val effects = mutableListOf<GestureEffect>()
 
-        // Zoom: nothing until the spacing has clearly changed, then the
-        // accumulated ratio so the first step lands where the fingers are,
-        // then per-move ratios. lastDistance tracks every move regardless.
-        val pinching =
-            state.pinching || (state.startDistance > 0f && kotlin.math.abs(distance / state.startDistance - 1.0) > PINCH_SLOP_RATIO)
+        // Zoom: nothing until the spacing has clearly changed -- by an absolute
+        // amount and, when there is a starting spacing to compare against, by
+        // a fraction of it -- then the accumulated ratio so the first step
+        // lands where the fingers are, then per-move ratios. lastDistance
+        // tracks every move regardless. Fingers that landed on the same point
+        // have no starting spacing; they latch on the absolute floor alone and
+        // take the first non-zero spacing as their reference.
+        val spacingChanged =
+            abs(distance - state.startDistance) > PINCH_SLOP_PX &&
+                (state.startDistance <= 0f || abs(distance / state.startDistance - 1.0) > PINCH_SLOP_RATIO)
+        val pinching = state.pinching || spacingChanged
         if (pinching) {
             val reference = if (state.pinching) state.lastDistance else state.startDistance
             if (reference > 0f && distance > 0f && distance != reference) {

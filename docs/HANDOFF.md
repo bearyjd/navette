@@ -1731,3 +1731,106 @@ force-stops; only `adb shell cmd device_state state reset` clears it
 to confirm). The pointer-location debug overlay (`settings put system
 pointer_location 1`) is similarly sticky. **Reset both before handing the
 phone back.** Neither is a bug in the app.
+
+## "The front screen doesn't work": root-caused and fixed (2026-09-06, late)
+
+Reported against the Pixel 10 Pro Fold: the cover screen worked for other
+apps but navette, when in focus there, "did not work." Three things looked
+like that in sequence, and only the last one was the app's:
+
+1. **My `cmd device_state state 2` override** (see the gotcha above) kept the
+   inner display active with the phone folded, so the cover was simply off.
+   Cleared; not the app.
+2. **This phone's fold behaviour raises a dismissible keyguard on fold**
+   (`PowerManagerService: Showing dismissible keyguard` in logcat) --
+   "swipe up to continue." Same on a real fold, regardless of
+   `fold_lock_behavior_setting` (which is a *System* key, not Secure; and the
+   Pixel 9 that "works" has it at default too). Not the app either -- and not
+   the difference between the phones.
+3. **The app, after the fold → keyguard → swipe cycle, showed
+   "Disconnected: failed to connect to … after 10000ms" with a manual
+   Reconnect button.** Reproduced by emulating the fold with a live session
+   (`state 0`, wait, `state reset`, `wm dismiss-keyguard`). Root cause: the
+   reconnect loop kept retrying while the app was stopped behind the keyguard
+   with its network restricted, burning all five attempts on 10s connect
+   timeouts, so the screen the user swiped back to was already dead.
+
+Fix (commit after this note): the retry loop runs inside
+`repeatOnLifecycle(STARTED)`, so it pauses while the screen is hidden, and the
+budget resets on every return to the foreground and on every decoded frame.
+The policy is a pure `ReconnectPolicy` with tests.
+
+**Verified on the Pixel 10, three consecutive runs of the same cycle** (attach
+on the cover → emulated unfold → fold back → keyguard for 20s → dismiss →
+navette to front): the session screen came back with live video every time,
+no manual button, same PID throughout, no `Detach` sent (host
+`client_count` unchanged). The preserved log of the third run shows the
+mechanism: nothing while hidden; on resume `decoder started at 2204x2128`
+(the rebuild, with the server replaying the inner-display config) and two
+seconds later `2416x1132` (the live resize to the cover). The same build
+also survived 15s backgrounded behind another app.
+
+**One observation not explained:** the very first cycle on this build --
+immediately after `adb install -r` had killed and restarted the process --
+came back on the *Connect* screen with the host still filled, no error text,
+and no session. Host filled means the same ViewModel; no error means the
+control socket closed cleanly (`Disconnected`, not `Failed`); no session
+means `activeSession` was cleared. Only `connect()` or `leaveSession()` do
+that, and neither had an obvious trigger. It did not reproduce in three
+further attempts, including one with the identical task ordering (another
+app in front, then `am start -n`, which does *not* create a second activity
+instance -- checked via `dumpsys activity activities`). The log for that run
+was lost to my own `logcat -c`. If it recurs: keep the log, check
+`navette ls`'s client count before/after (a `Detach` decrements it), and
+`dumpsys activity activities` for a second `Hist` entry.
+
+Unfold with a live session, incidentally, is a **live resize**, not a
+reconnect: the activity survives (`configChanges` covers it), the decoder
+restarts at the new size (2204x2128 seen in logcat), no socket drop. That
+closes slice 2's open "live resize" item.
+
+### Review findings on slices 3/3b, and what was done
+
+An independent `code-reviewer` pass (after the on-device verification --
+which is why these survived it) found 3 HIGH, 5 MEDIUM, 4 LOW. All HIGHs and
+the MEDIUMs that were real bugs are fixed in the same commit:
+
+- **HIGH -- stale snapshot double-charged the retry budget.** `collectAsState`
+  keeps the dead controller's last value for a frame after the nonce swap, so
+  a snapshot-keyed effect saw "still dropped" against the new controller and
+  charged a second attempt per drop (5 became ~3), and could tear down a
+  manual reconnect a second later. Fixed by having the effect wait on
+  `controller.state.first { dropped }` -- the controller's own flow. That in
+  turn required `SessionController.open()` to call `connect()` *before*
+  launching the state collector, or the client's initial `Disconnected` would
+  be published and read as a drop.
+- **HIGH -- budget reset on socket-open meant a flapping link retried
+  forever.** Reset now happens on `contentSize != null` (a decoded frame).
+- **HIGH -- a button or axis could reach the wire with no preceding motion**
+  (a tap during the 60ms arming window while the stream was still
+  bootstrapping: motion dropped at `gate.primary == null`, press sent 60ms
+  later once the config landed -- a click at the guest's top-left).
+  `sendButton`/`sendScroll` are now gated on a motion having been delivered
+  to the *same* surface (`motionSentTo`).
+- **MEDIUM -- relative-only pinch slop swallowed right-clicks.** Fingers 40px
+  apart latched a pinch on 2px of jitter, and a latched pinch cancels the
+  two-finger-tap right-click. Added an absolute floor (`PINCH_SLOP_PX = 8f`)
+  required alongside the ratio, plus a jittery-tap test that fails without it.
+- **MEDIUM -- zoom/pan reset on every reconnect.** Hoisted into a
+  `ViewTransformHolder` the screen owns and lends to each controller.
+- **MEDIUM -- `fcb2747`'s message claimed an overlay change it did not make.**
+  The rebuild's Connecting phase now genuinely reads "Reconnecting… (n/5)";
+  the overlay moved to `SessionOverlay.kt`.
+- **MEDIUM -- a 0x0 surface size could be stored.** Rejected at
+  `onSurfaceResized`.
+- **MEDIUM -- an `OkHttpClient` per reconnect, never shut down.** `close()`
+  now shuts the dispatcher executor and evicts the pool.
+- LOW, fixed: fingers landing on the same point could never pinch; a phantom
+  tracked finger could click at a stale position. LOW, not fixed: a reconnect
+  re-requests focus and so drops a raised IME; `sendInput`'s return is
+  unchecked.
+
+Also from that review, kept as evidence: the controller's thread-confinement
+holds for every new field; a mid-drag reconnect does not strand `BTN_LEFT`
+in the guest, because `MediaAttachment::drop` → `InputState::disconnect`
+releases it server-side.

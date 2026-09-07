@@ -365,6 +365,76 @@ class GestureInterpreterTest {
         assertEquals(listOf(GestureEffect.Pan(50f, 30f)), fingers.drain())
     }
 
+    /**
+     * A real touchscreen emits several moves during a 100ms two-finger tap,
+     * each with a pixel or two of jitter. With fingers close together that
+     * jitter is a large *fraction* of the spacing, so a relative-only pinch
+     * threshold would latch a pinch and silently swallow the right-click.
+     */
+    @Test
+    fun `a jittery two-finger tap with close fingers still right-clicks`() {
+        val fingers = Fingers().zoomed(false).down(FINGER_A, 100f, 100f)
+        fingers.pointerDown(FINGER_B, p(FINGER_A, 100f, 100f), p(FINGER_B, 140f, 100f))
+        fingers.drain()
+
+        // Spacing wobbles 40 -> 42 -> 38 -> 41: up to 5% relative, 2px absolute.
+        fingers.after(20).move(p(FINGER_A, 99f, 101f), p(FINGER_B, 141f, 100f))
+        fingers.after(20).move(p(FINGER_A, 101f, 100f), p(FINGER_B, 139f, 101f))
+        fingers.after(20).move(p(FINGER_A, 100f, 99f), p(FINGER_B, 141f, 100f))
+        assertEquals(emptyList<GestureEffect>(), fingers.drain().filterIsInstance<GestureEffect.Zoom>())
+
+        fingers.after(20).pointerUp(FINGER_B, p(FINGER_A, 100f, 99f), p(FINGER_B, 141f, 100f))
+
+        assertEquals(listOf(GestureEffect.Motion(100f, 100f), GestureEffect.RightClick), fingers.drain())
+    }
+
+    @Test
+    fun `a genuine pinch with close fingers still zooms`() {
+        val fingers = Fingers().zoomed(false).down(FINGER_A, 100f, 100f)
+        fingers.pointerDown(FINGER_B, p(FINGER_A, 100f, 100f), p(FINGER_B, 140f, 100f))
+        fingers.drain()
+
+        // 40px -> 60px: 20px absolute, 50% relative -- unmistakably a pinch.
+        fingers.move(p(FINGER_A, 90f, 100f), p(FINGER_B, 150f, 100f))
+
+        val zoom = fingers.drain().filterIsInstance<GestureEffect.Zoom>().single()
+        assertEquals(1.5, zoom.scaleFactor, 1e-6)
+    }
+
+    @Test
+    fun `fingers that land on the same point can still start a pinch`() {
+        val fingers = Fingers().zoomed(false).down(FINGER_A, 100f, 100f)
+        fingers.pointerDown(FINGER_B, p(FINGER_A, 100f, 100f), p(FINGER_B, 100f, 100f))
+        fingers.drain()
+
+        // First spread: latches, but there is no starting spacing to make a
+        // ratio from, so no zoom yet.
+        fingers.move(p(FINGER_A, 90f, 100f), p(FINGER_B, 110f, 100f))
+        assertEquals(emptyList<GestureEffect>(), fingers.drain().filterIsInstance<GestureEffect.Zoom>())
+
+        // Second spread: 20px -> 40px against the first non-zero spacing.
+        fingers.move(p(FINGER_A, 80f, 100f), p(FINGER_B, 120f, 100f))
+        val zoom = fingers.drain().filterIsInstance<GestureEffect.Zoom>().single()
+        assertEquals(2.0, zoom.scaleFactor, 1e-6)
+    }
+
+    @Test
+    fun `a second finger whose partner is missing suppresses the gesture instead of leaving a phantom`() {
+        val fingers = Fingers().down(FINGER_A, 10f, 20f)
+        fingers.drain()
+
+        // Android reports a second finger, but the first is not in the event.
+        fingers.pointerDown(FINGER_B, p(FINGER_B, 300f, 100f))
+
+        assertEquals(listOf(GestureEffect.CancelLeftPress), fingers.drain())
+        assertSame(GestureState.Suppressed, fingers.state)
+
+        // The eventual lift must not click at a stale position.
+        fingers.up(FINGER_B, 300f, 100f)
+        assertEquals(emptyList<GestureEffect>(), fingers.drain())
+        assertSame(GestureState.Idle, fingers.state)
+    }
+
     @Test
     fun `events without a preceding down are ignored while idle`() {
         val fingers = Fingers()

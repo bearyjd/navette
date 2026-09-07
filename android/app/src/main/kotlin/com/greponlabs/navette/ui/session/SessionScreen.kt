@@ -1,9 +1,5 @@
 package com.greponlabs.navette.ui.session
 
-import android.app.Activity
-import android.content.Context
-import android.content.ContextWrapper
-import android.content.pm.ActivityInfo
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.Surface
@@ -12,17 +8,12 @@ import android.view.SurfaceView
 import android.view.View
 import androidx.compose.foundation.background
 import androidx.compose.foundation.focusable
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.material3.Button
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -43,11 +34,12 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import com.greponlabs.navette.media.DecoderEvent
 import com.greponlabs.navette.media.H264Decoder
 import com.greponlabs.navette.media.PrimaryStream
@@ -69,6 +61,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
@@ -81,26 +74,8 @@ import kotlinx.coroutines.launch
  */
 private const val RESIZE_DEBOUNCE_MS = 150L
 
-/**
- * How many times a dropped media socket is retried before the screen gives up
- * and offers a manual reconnect. The server replays codec config and the
- * latest keyframe to every fresh attachment
- * (`crates/navetted/src/media.rs`'s `attach`, and its
- * `reconnect_starts_with_config_and_latest_keyframe` test), so a retry that
- * lands while the session is still alive resumes the picture on its own.
- */
-private const val MAX_RECONNECT_ATTEMPTS = 5
-
-/**
- * Base delay between retries; multiplied by the attempt number for a linear
- * backoff (1s, 2s, ...). Short enough that a brief tailnet blip recovers
- * without the user noticing much, bounded so a dead host is given up on in a
- * few seconds rather than hammered.
- */
-private const val RECONNECT_BASE_DELAY_MS = 1_000L
-
 /** What the screen renders. */
-private data class SessionUiState(
+internal data class SessionUiState(
     // Connecting, not Disconnected: the controller opens the socket from a
     // DisposableEffect, which runs after the first composition, so a
     // Disconnected default would flash a "Disconnected" overlay on entry
@@ -145,10 +120,16 @@ fun SessionScreen(
     // each one.
     var reconnectNonce by remember(host, sessionName) { mutableIntStateOf(0) }
     var reconnectAttempt by remember(host, sessionName) { mutableIntStateOf(0) }
+    // Zoom and pan outlive a rebuild too: a retry the user never noticed must
+    // not snap a zoomed, panned view back to the corner.
+    val transformHolder = remember(host, sessionName) { ViewTransformHolder() }
     val controller =
-        remember(host, sessionName, reconnectNonce) { SessionController(mediaWebSocketUrl(host, sessionName)) }
+        remember(host, sessionName, reconnectNonce) {
+            SessionController(mediaWebSocketUrl(host, sessionName), transformHolder)
+        }
     val state by controller.state.collectAsState()
     val focusRequester = remember { FocusRequester() }
+    val lifecycleOwner = LocalLifecycleOwner.current
 
     LockLandscapeWhileAttached()
 
@@ -159,27 +140,52 @@ fun SessionScreen(
 
     LaunchedEffect(controller) { focusRequester.requestFocus() }
 
-    // A working connection clears the retry budget, so a later, unrelated drop
-    // gets the full set of attempts again rather than inheriting an old count.
-    LaunchedEffect(state.connection) {
-        if (state.connection is ConnectionState.Connected) reconnectAttempt = 0
+    // The retry budget refills only once the stream is genuinely live -- a
+    // frame decoded -- not on the socket opening. A server that accepts the
+    // socket and closes it straight away (session gone, upgrade refused
+    // downstream) would otherwise satisfy an open-based reset on every
+    // attempt and be retried forever.
+    LaunchedEffect(controller) {
+        controller.state.first { it.contentSize != null }
+        reconnectAttempt = 0
     }
 
-    // A dropped socket that is neither a deliberate leave (the screen is gone
-    // then, so this effect is too) nor the guest window closing (terminal, no
-    // point retrying) is retried on a linear backoff until the budget runs
-    // out. Keyed on the controller so it starts fresh for each rebuilt one.
-    val connectionDropped =
-        state.connection is ConnectionState.Failed || state.connection is ConnectionState.Disconnected
-    LaunchedEffect(controller, connectionDropped, state.streamEnded) {
-        if (connectionDropped && !state.streamEnded && reconnectAttempt < MAX_RECONNECT_ATTEMPTS) {
-            reconnectAttempt += 1
-            delay(RECONNECT_BASE_DELAY_MS * reconnectAttempt)
-            reconnectNonce += 1
+    // ...and whenever the screen comes back into the foreground. Retries spent
+    // while it was hidden -- behind the keyguard a fold raises, with the app's
+    // network restricted -- must not count against what happens once the user
+    // can see it again. This is what turns "fold, swipe, dead Disconnected
+    // screen" into "fold, swipe, picture back".
+    LaunchedEffect(lifecycleOwner) {
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) { reconnectAttempt = 0 }
+    }
+
+    // The retry itself. Two things about its shape are load-bearing. It reads
+    // the controller's own flow rather than the recomposed `state` snapshot:
+    // collectAsState keeps the dead controller's last value for a frame after
+    // a swap, long enough for a snapshot-keyed effect to see "still dropped"
+    // against the new controller and charge a second attempt for one drop.
+    // And it runs only while STARTED, so it pauses behind the keyguard instead
+    // of burning the budget on a network it cannot reach, and starts fresh --
+    // against whatever the controller's state is by then -- when the screen
+    // is visible again. Keyed on the controller so each rebuilt one waits for
+    // its own drop.
+    LaunchedEffect(controller, lifecycleOwner) {
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            val dropped =
+                controller.state.first {
+                    ReconnectPolicy.isDropped(it.connection) || it.streamEnded || it.decodeError != null
+                }
+            if (ReconnectPolicy.shouldRetry(reconnectAttempt, dropped.streamEnded, dropped.decodeError)) {
+                reconnectAttempt += 1
+                delay(ReconnectPolicy.delayMs(reconnectAttempt))
+                reconnectNonce += 1
+            }
         }
     }
 
-    val reconnecting = connectionDropped && !state.streamEnded && reconnectAttempt < MAX_RECONNECT_ATTEMPTS
+    val reconnecting =
+        ReconnectPolicy.isDropped(state.connection) &&
+            ReconnectPolicy.shouldRetry(reconnectAttempt, state.streamEnded, state.decodeError)
     val onReconnect = {
         reconnectAttempt = 0
         reconnectNonce += 1
@@ -263,39 +269,6 @@ fun SessionScreen(
 }
 
 /**
- * Sets landscape on entry and unlocks orientation on exit.
- *
- * Restores `UNSPECIFIED` rather than whatever `requestedOrientation` held on
- * entry: nothing else in this app sets it, and reading it back to restore it
- * is precisely what breaks if the Activity is ever recreated mid-lock -- the
- * captured "previous" would be the lock this effect just applied, leaving the
- * whole app landscape-locked for the rest of the process. `MainActivity`
- * declares `configChanges` so that recreation does not happen; this makes the
- * restore correct even if it did.
- *
- * The Activity is found by walking the `ContextWrapper` chain rather than
- * casting `LocalContext.current`: today's host is `MainActivity` calling
- * `setContent` directly, but a hard cast that starts crashing if that ever
- * changes is the worst failure mode for a screen with no automated coverage.
- */
-@Composable
-private fun LockLandscapeWhileAttached() {
-    val context = LocalContext.current
-    DisposableEffect(context) {
-        val activity = context.findActivity()
-        activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-        onDispose { activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED }
-    }
-}
-
-private tailrec fun Context.findActivity(): Activity? =
-    when (this) {
-        is Activity -> this
-        is ContextWrapper -> baseContext.findActivity()
-        else -> null
-    }
-
-/**
  * The on-screen-keyboard path: an off-screen text field that reports what the
  * IME commits, plus the toggle that raises it.
  *
@@ -354,7 +327,7 @@ private fun BoxScope.ImeLayer(controller: SessionController, surfaceFocus: Focus
  * down and recreating a `MediaCodec` per recomposition would be a black
  * flash per frame of UI state change.
  */
-private class SessionController(mediaUrl: String) {
+private class SessionController(mediaUrl: String, private val transformHolder: ViewTransformHolder) {
     private val client = MediaClient(mediaUrl)
     private val gate = StreamGate()
     private val scope = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
@@ -385,10 +358,29 @@ private class SessionController(mediaUrl: String) {
     // must stay on that dispatcher -- moving it to Default would turn
     // leftPressed into a data race.
     private var view: View? = null
-    private var transform = ViewTransform()
+    private var transform: ViewTransform
+        get() = transformHolder.value
+        set(value) {
+            transformHolder.value = value
+        }
     private var gestureState: GestureState = GestureState.Idle
     private var pressJob: Job? = null
     private var leftPressed = false
+
+    /**
+     * The surface the most recent successfully-sent motion was addressed to.
+     *
+     * The bridge dispatches a button or axis at the pointer's *current*
+     * position (`crates/navette-bridge/src/input.rs:119-145`), and only a
+     * motion establishes pointer focus (`input.rs:81-90`). So a button that
+     * goes out before any motion has reached its surface is a click at the
+     * guest's top-left corner. That is reachable: a tap during the arming
+     * window while the stream is still bootstrapping has its motion dropped
+     * at `gate.primary == null`, and if the config lands inside those 60ms the
+     * press would otherwise go out alone. Buttons and axes are gated on this
+     * matching the stream they are about to be sent to.
+     */
+    private var motionSentTo: Long? = null
 
     private val _state = MutableStateFlow(SessionUiState())
     val state: StateFlow<SessionUiState> = _state.asStateFlow()
@@ -414,10 +406,6 @@ private class SessionController(mediaUrl: String) {
     fun open() {
         connectionJob?.cancel()
         packetsJob?.cancel()
-        connectionJob =
-            scope.launch {
-                client.connectionState.collect { connection -> _state.update { it.copy(connection = connection) } }
-            }
         // Deliberately NOT on the main dispatcher. This loop calls
         // MediaCodec.configure()+start() on a stream bootstrap, which costs
         // tens to hundreds of milliseconds; on Main that is a visible stall,
@@ -432,7 +420,18 @@ private class SessionController(mediaUrl: String) {
                     route(packet)
                 }
             }
+        // connect() before the state collector, not after. The client's flow
+        // starts at Disconnected; connect() moves it to Connecting
+        // synchronously. Collecting first, on Main.immediate, would publish
+        // that initial Disconnected into _state -- and the session screen's
+        // retry waits on this flow for exactly that value, so the order here
+        // is what keeps a fresh attach from being mistaken for a drop. Packets
+        // that arrive before the collector runs sit in the client's queue.
         client.connect()
+        connectionJob =
+            scope.launch {
+                client.connectionState.collect { connection -> _state.update { it.copy(connection = connection) } }
+            }
     }
 
     fun close() {
@@ -583,6 +582,11 @@ private class SessionController(mediaUrl: String) {
         }
 
     fun onSurfaceResized(width: Int, height: Int) {
+        // A view can report 0x0 mid-layout, and during a reconnect's view
+        // swap. Storing it would make sendMotion drop motions while buttons
+        // kept firing; never store it, so the null-guards downstream stay
+        // defence in depth rather than load-bearing.
+        if (width <= 0 || height <= 0) return
         synchronized(lock) { surfaceSize = width to height }
         // A rotation or a fold must not leave the view panned off the content.
         transform = transform.clampedTo(width, height)
@@ -741,21 +745,27 @@ private class SessionController(mediaUrl: String) {
         val (contentWidth, contentHeight) = _state.value.contentSize ?: (surfaceWidth to surfaceHeight)
         val (mappedX, mappedY) =
             InputMapper.rescaleToContent(x, y, surfaceWidth, surfaceHeight, contentWidth, contentHeight) ?: return
-        client.sendInput(InputMapper.pointerMotion(stream.clientId, stream.surfaceId, mappedX, mappedY))
+        if (client.sendInput(InputMapper.pointerMotion(stream.clientId, stream.surfaceId, mappedX, mappedY))) {
+            motionSentTo = stream.surfaceId
+        }
     }
 
+    /** Refused, not repositioned, when no motion has reached [stream]: see [motionSentTo]. */
     private fun sendButton(button: Int, pressed: Boolean) {
         val stream = gate.primary ?: return
+        if (motionSentTo != stream.surfaceId) return
         client.sendInput(InputMapper.pointerButton(stream.clientId, stream.surfaceId, button, pressed))
     }
 
     /**
      * Only ever reached at 1:1 (a two-finger drag while zoomed pans instead),
      * where screen and content pixels coincide, so the finger delta needs no
-     * rescaling before it becomes a guest scroll delta.
+     * rescaling before it becomes a guest scroll delta. Gated like
+     * [sendButton]: an axis is delivered at the pointer's position too.
      */
     private fun sendScroll(dx: Float, dy: Float) {
         val stream = gate.primary ?: return
+        if (motionSentTo != stream.surfaceId) return
         client.sendInput(
             InputMapper.pointerAxis(
                 stream.clientId,
@@ -767,68 +777,3 @@ private class SessionController(mediaUrl: String) {
     }
 }
 
-/**
- * Connection and error states drawn over the video.
- *
- * Precedence matters: a terminal state ([SessionUiState.decodeError], or the
- * guest window closing) wins over a reconnect, because retrying a stream that
- * is genuinely gone would loop forever. A [reconnecting] drop shows progress
- * and spends the retry budget silently; only once that budget is exhausted
- * does the screen fall back to a manual [onReconnect].
- */
-@Composable
-private fun SessionOverlay(
-    state: SessionUiState,
-    reconnecting: Boolean,
-    reconnectAttempt: Int,
-    maxAttempts: Int,
-    onReconnect: () -> Unit,
-    onLeave: () -> Unit,
-) {
-    val terminal =
-        when {
-            state.decodeError != null -> state.decodeError
-            state.streamEnded -> "The session's window closed."
-            else -> null
-        }
-
-    // Nothing to draw once the stream is live: connected, a frame decoded, and
-    // no terminal error. Everything else needs an overlay of some kind.
-    if (terminal == null && state.connection is ConnectionState.Connected && state.contentSize != null) return
-
-    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(16.dp),
-        ) {
-            when {
-                terminal != null -> {
-                    OverlayText(terminal, MaterialTheme.typography.bodyLarge)
-                    Button(onClick = onLeave) { Text("Back to sessions") }
-                }
-                reconnecting -> {
-                    CircularProgressIndicator()
-                    OverlayText("Connection lost -- reconnecting...", MaterialTheme.typography.bodyMedium)
-                    TextButton(onClick = onLeave) { Text("Back to sessions", color = Color.White) }
-                }
-                state.connection is ConnectionState.Failed || state.connection is ConnectionState.Disconnected -> {
-                    val reason = (state.connection as? ConnectionState.Failed)?.reason ?: "connection lost"
-                    OverlayText("Disconnected: $reason", MaterialTheme.typography.bodyLarge)
-                    Button(onClick = onReconnect) { Text("Reconnect") }
-                    TextButton(onClick = onLeave) { Text("Back to sessions", color = Color.White) }
-                }
-                else -> {
-                    CircularProgressIndicator()
-                    val label =
-                        if (state.connection is ConnectionState.Connecting) "Connecting..." else "Waiting for the first frame..."
-                    OverlayText(label, MaterialTheme.typography.bodyMedium)
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun OverlayText(text: String, style: TextStyle) {
-    Text(text = text, color = Color.White, style = style, modifier = Modifier.padding(horizontal = 24.dp))
-}

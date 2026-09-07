@@ -94,3 +94,16 @@ data class ViewTransform(
         return ((x - offsetX) / zoom) to ((y - offsetY) / zoom)
     }
 }
+
+/**
+ * The current [ViewTransform], owned by the session screen and lent to each
+ * controller it builds, so zoom and pan survive a reconnect's rebuild.
+ *
+ * A plain holder rather than Compose snapshot state on purpose: it is written
+ * on every touch event of a pinch, and nothing in composition needs to react
+ * to it -- the controller applies it to the view directly. Main-thread only,
+ * like everything else on the touch path.
+ */
+class ViewTransformHolder {
+    var value: ViewTransform = ViewTransform()
+}

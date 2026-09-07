@@ -173,6 +173,14 @@ class MediaClient(private val webSocketUrl: String) {
         webSocket = null
         _connectionState.value = ConnectionState.Disconnected
         endStream()
+        // This client is single-use and owns its OkHttpClient; a reconnect
+        // builds a new one. Release this one's dispatcher threads and pooled
+        // connections now rather than leaving them to OkHttp's 60s / 5min idle
+        // reclaim to accumulate across retries. The WebSocket's own writer
+        // runs on OkHttp's task runner, not this executor, so the close frame
+        // above still goes out.
+        httpClient.dispatcher.executorService.shutdown()
+        httpClient.connectionPool.evictAll()
     }
 
     /**

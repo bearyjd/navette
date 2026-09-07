@@ -76,9 +76,24 @@ rebuild -- a fresh controller and `SurfaceView` via a Compose nonce, reusing
 the same lifecycle a first attach uses rather than re-opening a torn-down
 socket -- and the server replays codec config and the latest keyframe to
 every new attachment (`crates/navetted/src/media.rs`), so a retry that lands
-while the session is still alive resumes the picture on its own. If the
-budget runs out, a manual "Reconnect" button takes over. The guest window
-closing (a real `StreamEnd`) is terminal and is never retried.
+while the session is still alive resumes the picture on its own. Zoom and pan
+survive the rebuild. If the budget runs out, a manual "Reconnect" button
+takes over. The guest window closing (a real `StreamEnd`) and a decoder
+failure are terminal and never retried automatically.
+
+The rules live in `ReconnectPolicy` (pure, unit-tested); the screen owns the
+counters. Two of its properties are worth knowing because each was a real bug
+once:
+
+- **The retry loop runs only while the screen is in the foreground**
+  (`repeatOnLifecycle(STARTED)`), and the budget refills every time it
+  returns there. Folding the phone raises the keyguard and stops the app with
+  its network restricted; a loop that kept retrying behind it burned every
+  attempt on 10s connect timeouts, so swiping back landed on a dead
+  "Disconnected" screen. Now it pauses, and reconnects fresh on resume.
+- **The budget refills on a decoded frame, not on the socket opening.** A
+  server that accepts the socket and closes it at once would satisfy an
+  open-based reset on every attempt and be retried forever.
 
 ## Verified
 
@@ -128,6 +143,14 @@ closing (a real `StreamEnd`) is terminal and is never retried.
   the retry budget, surfaced the manual "Reconnect" button, and a tap on it
   rebuilt the connection and resumed the video. No bridge rejections either
   time.
+- **Fold cycle, on the same device, three consecutive runs.** Attached on the
+  cover display, then unfolded (a live resize -- the decoder restarted at
+  the inner display's size with no socket drop), folded back (the fold raises
+  a keyguard and stops the app; the socket dies behind it), and swiped back
+  in: the video returned on its own every time, with no manual button, and
+  the decoder followed with a second live resize back to the cover's size.
+  Before the lifecycle-aware retry loop this exact cycle ended on a dead
+  "Disconnected: failed to connect ... after 10000ms" screen.
 
 ## Not verified
 
@@ -145,8 +168,9 @@ Still open from the session-screen slice:
   (adb-injected key events, which take the same `onKeyEvent` path, covered
   letters, Shift, `,` `!`, space and Backspace -- see Verified.)
 - The on-screen keyboard types correctly, including an autocomplete-triggered
-  replacement.
-- A live resize while attached, and surviving a stream reconfigure.
+  replacement. (A live resize while attached, and surviving the stream
+  reconfigure it causes, is now covered: unfolding the Pixel 10 mid-session
+  is exactly that, and it works -- see Verified.)
 - Rapid session entry and exit stays responsive: `surfaceDestroyed` can block
   briefly on a codec start in progress, which is a deliberate trade against
   rendering into a released `Surface`.
