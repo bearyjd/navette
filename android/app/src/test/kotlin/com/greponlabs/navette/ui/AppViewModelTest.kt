@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
@@ -194,32 +195,135 @@ class AppViewModelTest {
             assertEquals("no such app", viewModel.state.value.snackbarMessage)
         }
 
-    @Test
-    fun `attaching a running session confirms success without a session screen yet`() =
-        runTest {
-            viewModel.onEvent(AppEvent.HostChanged("tower"))
-            viewModel.onEvent(AppEvent.Connect)
-            fake.responseFor = { Response(1, ResponseOutcome.Ok(ResponseResult.Sessions(emptyList()))) }
-            fake.emit(ConnectionState.Connected)
-            testScheduler.advanceUntilIdle()
+    /** Connects and drains the post-Connect refresh, leaving the drawer showing. */
+    private fun TestScope.connectAndSettle() {
+        viewModel.onEvent(AppEvent.HostChanged("tower"))
+        viewModel.onEvent(AppEvent.Connect)
+        fake.responseFor = { Response(1, ResponseOutcome.Ok(ResponseResult.Sessions(emptyList()))) }
+        fake.emit(ConnectionState.Connected)
+        testScheduler.advanceUntilIdle()
+    }
 
-            fake.responseFor = { command ->
-                when (command) {
-                    is RequestCommand.Attach ->
-                        Response(
-                            4,
-                            ResponseOutcome.Ok(
-                                ResponseResult.AttachResult(AttachInfo("work", "/run/user/1000/x.sock")),
-                            ),
-                        )
-                    else -> error("unexpected command: $command")
-                }
+    private fun attachSucceeds() {
+        fake.responseFor = { command ->
+            when (command) {
+                is RequestCommand.Attach ->
+                    Response(
+                        4,
+                        ResponseOutcome.Ok(
+                            ResponseResult.AttachResult(AttachInfo("work", "/run/user/1000/x.sock")),
+                        ),
+                    )
+                else -> Response(5, ResponseOutcome.Ok(ResponseResult.Ack))
             }
+        }
+    }
+
+    @Test
+    fun `attaching a running session navigates to it`() =
+        runTest {
+            connectAndSettle()
+            attachSucceeds()
+
             viewModel.onEvent(AppEvent.AttachSession("work"))
             testScheduler.advanceUntilIdle()
 
+            assertEquals("work", viewModel.state.value.activeSession)
+            // Navigation is the confirmation; there is no snackbar for success.
+            assertEquals(null, viewModel.state.value.snackbarMessage)
+        }
+
+    @Test
+    fun `an attach the server rejects stays on the drawer and shows why`() =
+        runTest {
+            connectAndSettle()
+            fake.responseFor = { command ->
+                when (command) {
+                    is RequestCommand.Attach ->
+                        Response(4, ResponseOutcome.Error(ApiError(ErrorCode.NOT_FOUND, "no such session")))
+                    else -> error("unexpected command: $command")
+                }
+            }
+
+            viewModel.onEvent(AppEvent.AttachSession("ghost"))
+            testScheduler.advanceUntilIdle()
+
+            assertEquals(null, viewModel.state.value.activeSession)
+            assertEquals("no such session", viewModel.state.value.snackbarMessage)
+        }
+
+    @Test
+    fun `leaving a session clears it and detaches rather than killing it`() =
+        runTest {
+            connectAndSettle()
+            attachSucceeds()
+            viewModel.onEvent(AppEvent.AttachSession("work"))
+            testScheduler.advanceUntilIdle()
+            fake.calls.clear()
+
+            viewModel.onEvent(AppEvent.LeaveSession)
+            // The state flip is synchronous: leaving must not wait on the call.
+            assertEquals(null, viewModel.state.value.activeSession)
+            testScheduler.advanceUntilIdle()
+
             assertTrue(
-                viewModel.state.value.snackbarMessage.orEmpty().contains("work"),
+                "expected a Detach, got ${fake.calls}",
+                fake.calls.contains(RequestCommand.Detach("work")),
+            )
+            assertTrue(
+                "Detach must never escalate to Kill",
+                fake.calls.none { it is RequestCommand.Kill },
+            )
+        }
+
+    @Test
+    fun `a failing detach still leaves the session screen`() =
+        runTest {
+            connectAndSettle()
+            attachSucceeds()
+            viewModel.onEvent(AppEvent.AttachSession("work"))
+            testScheduler.advanceUntilIdle()
+
+            fake.responseFor = { error("navetted went away mid-detach") }
+            viewModel.onEvent(AppEvent.LeaveSession)
+            testScheduler.advanceUntilIdle()
+
+            assertEquals(
+                "a failed detach must not strand the user on a dead session screen",
+                null,
+                viewModel.state.value.activeSession,
+            )
+        }
+
+    @Test
+    fun `leaving when no session is active is a no-op`() =
+        runTest {
+            connectAndSettle()
+            fake.calls.clear()
+
+            viewModel.onEvent(AppEvent.LeaveSession)
+            testScheduler.advanceUntilIdle()
+
+            assertEquals(null, viewModel.state.value.activeSession)
+            assertTrue("nothing should have been sent", fake.calls.isEmpty())
+        }
+
+    @Test
+    fun `reconnecting leaves any active session behind`() =
+        runTest {
+            connectAndSettle()
+            attachSucceeds()
+            viewModel.onEvent(AppEvent.AttachSession("work"))
+            testScheduler.advanceUntilIdle()
+            assertEquals("work", viewModel.state.value.activeSession)
+
+            viewModel.onEvent(AppEvent.Connect)
+            testScheduler.advanceUntilIdle()
+
+            assertEquals(
+                "a new connection must not keep the previous one's session screen up",
+                null,
+                viewModel.state.value.activeSession,
             )
         }
 }

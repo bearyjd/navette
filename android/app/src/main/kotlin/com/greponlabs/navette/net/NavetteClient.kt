@@ -176,15 +176,28 @@ class NavetteClient(private val webSocketUrl: String) : NavetteApi {
 }
 
 /**
- * Builds the control-channel WebSocket URL for [host]:[port]. A bare IPv6
- * literal (e.g. a Tailscale address like `fd7a:115c:a1e0::1`) is
- * bracket-wrapped so the authority is unambiguous -- hostnames and IPv4
+ * Bracket-wraps a bare IPv6 literal (e.g. a Tailscale address like
+ * `fd7a:115c:a1e0::1`) so the authority is unambiguous -- hostnames and IPv4
  * addresses, which never contain more than one colon, pass through
  * unchanged. This can't validate every malformed [host] (one that already
- * smuggles in a port, for instance); [NavetteClient.connect] guards
- * against building an invalid [Request] from whatever comes out of here.
+ * smuggles in a port, for instance); [NavetteClient.connect] and
+ * [MediaClient.connect] both guard against building an invalid [Request]
+ * from whatever comes out of here.
  */
-fun controlWebSocketUrl(host: String, port: Int = 9417): String {
-    val authorityHost = if (host.count { it == ':' } >= 2 && !host.startsWith("[")) "[$host]" else host
-    return "ws://$authorityHost:$port$CONTROL_WEBSOCKET_PATH"
-}
+internal fun formatAuthorityHost(host: String): String =
+    if (host.count { it == ':' } >= 2 && !host.startsWith("[")) "[$host]" else host
+
+/** Builds the control-channel WebSocket URL for [host]:[port]. */
+fun controlWebSocketUrl(host: String, port: Int = 9417): String =
+    "ws://${formatAuthorityHost(host)}:$port$CONTROL_WEBSOCKET_PATH"
+
+/**
+ * Builds the media-channel WebSocket URL for [session] on [host]:[port].
+ *
+ * [session] is deliberately not percent-encoded: `navetted` validates every
+ * session name against `[a-z0-9_-]{1,64}` before one can exist
+ * (`validate_session_name`, `crates/navetted/src/registry.rs:267-281`), so
+ * the only names that can reach here are already URL-path-safe.
+ */
+fun mediaWebSocketUrl(host: String, session: String, port: Int = 9417): String =
+    "ws://${formatAuthorityHost(host)}:$port/v1/sessions/$session/media"

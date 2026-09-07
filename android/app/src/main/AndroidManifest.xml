@@ -12,8 +12,19 @@
         android:theme="@style/Theme.Navette"
         android:supportsRtl="true">
 
+        <!--
+            configChanges keeps the session screen's landscape lock from
+            recreating this Activity. Without it, SessionScreen's
+            requestedOrientation = LANDSCAPE (entered from portrait) tears the
+            Activity down and rebuilds it, which reopens the media socket on
+            every session entry and makes the orientation restore capture an
+            already-landscape value, permanently landscape-locking the whole
+            app. Handling these configs here means entering and leaving the
+            session screen never recreates anything.
+        -->
         <activity
             android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|screenLayout"
             android:exported="true"
             android:theme="@style/Theme.Navette">
             <intent-filter>

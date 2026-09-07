@@ -1411,3 +1411,484 @@ As of 2026-08-29 the remaining work is:
 
    the one the roadmap treats as the real product moment — everything
    before it is proving the plumbing works.
+
+## M3 slice 2: the session screen — implemented, on-device-verified, one real bug found and fixed (2026-09-06)
+
+**Branch `feat/android-session-screen`, two commits, not pushed:** `7d089f1`
+(the slice itself — MediaCodec decode, input, resize) and `8cc011b` (a real
+bug found during on-device testing, see below). `git log --oneline -2` on
+that branch shows both. Base was `master` @ `8448fa6` (PR #16, the drawer
+slice).
+
+### How this slice was built
+
+Planned via `/prp-plan` (written to
+`.claude/PRPs/plans/completed/android-session-screen.plan.md`), implemented
+via `/prp-implement`, then carried through **three rounds** of independent
+`code-reviewer` + `security-reviewer` passes before being called
+merge-ready. Worth knowing if this pattern gets reused: rounds 1-2 each
+found real HIGH-severity bugs that the *previous* round's own fix had
+introduced (an IME backspace/typing divergence; a landscape-lock bug that
+recreated the Activity; a receive-path memory bound with no byte budget;
+then, fixing that, a data race the dispatcher change introduced; then a
+byte-budget bypass on the "must never drop this" packet path). Round 3
+broke that pattern — the implementer's own whole-system audit caught its
+own bug (a semaphore-permit leak) before review did, which the reviewer
+read as real evidence the surface had stabilized, not just a clean pass.
+109 unit tests by the end of that process (up from 16 at the drawer slice),
+`./gradlew clean assembleDebug testDebugUnitTest lintDebug` — the exact CI
+command — green throughout.
+
+**What was never verified until this session: does any of it actually work
+on a real device.** No AVD/emulator exists in this environment (still
+true — the drawer slice's own README already said so), so Tasks 8-10
+(`H264Decoder`, `SessionScreen`, the touch/keyboard input path) had zero
+on-device coverage until a phone was actually plugged in.
+
+### On-device verification, this session (Pixel 9 Pro Fold, Android 17)
+
+Stood up real end-to-end test infrastructure on this machine to make that
+possible: cloned and built `wprsd`/`wprsc`/`xwayland-xdg-shell` fresh at
+`../wprs` (sibling to this repo, pinned rev `5763d746` matching
+`crates/navette-bridge/Cargo.toml`), built this repo's own
+`navetted`/`navette` fresh (**do not use `~/.local/bin/navetted`** — that's
+an unrelated binary of the same name, a "Claude Code" pairing daemon, not
+this project's daemon; a real naming collision on this machine that cost a
+few minutes to notice), and ran a live Firefox session against it.
+
+**Confirmed working, for the first time, on real hardware:**
+- The full connect → drawer → attach flow against a live `navetted`.
+- **MediaCodec H.264 decode against the real VA-API-encoded stream** — the
+  plan's own flagged highest-risk item (`csd-0`/`csd-1` handling) — works
+  correctly, first try.
+- Landscape lock engages and correctly releases back to portrait on leave.
+- "Disconnected: connection failed" renders correctly when `navetted` dies
+  mid-session (killed it outright to check) — a clean state, not a hang.
+- The on-screen "Keyboard" toggle raises the real IME correctly.
+
+**Found one real bug, root-caused and fixed (`8cc011b`):** touch and
+keyboard input reached the wire correctly the whole time, but the bridge
+silently rejected every single input event for this session. Root cause:
+`MediaInput`'s `client_id`/`surface_id` are genuine unsigned 64-bit wire
+values that can exceed `Long.MAX_VALUE` (a real session's `client_id` was
+`15272202610726850855`) — Kotlin's `Long` serializes that as a *negative*
+JSON decimal, and the bridge's `serde` deserializer correctly refuses a
+`-` sign for a `u64` field. No crash, no client-visible error: input just
+did nothing. Fixed by changing those fields to `ULong` (kotlinx.serialization
+encodes it as the correct unsigned decimal). Full root-cause writeup,
+including two false leads chased first (a Compose `AndroidView` touch-interop
+theory that turned out not to be the actual cause, and why `tcpdump`
+couldn't have proven anything about outgoing WebSocket frames — RFC 6455
+masks client frames — plus why `adb shell input tap` is invisible to
+`getevent`) is in this session's `/investigate` transcript and logged as
+gstack learnings (`kotlinx-serialization-long-as-u64`,
+`tcpdump-websocket-client-frames-masked`, `adb-input-tap-bypasses-evdev`,
+`logcat-filter-by-tag-not-package`) if picking this back up.
+
+**Verified live after the fix**: tapping a page element opened a genuine
+new browser session (page navigated to Firefox's own start page — real
+proof of a real click, not a coincidence); dragging moved the pointer
+(confirmed via Firefox's own link-hover status-bar text tracking the drag
+in real time); the bridge's `invalid_input` rejection is gone from the
+logs entirely.
+
+### What's still not verified
+
+Only ran out of session time, not blocked on anything: hardware Bluetooth/USB
+keyboard typing, on-screen IME with an actual autocomplete-triggered
+replacement, and a live resize (rotating/resizing while attached). None of
+these have known issues — they're just untested. The plan's Manual
+Validation checklist in `android/README.md` has the full list.
+
+### Environment note for whoever picks this up
+
+If you want to re-run any of this: `wprsd`/`wprsc`/`xwayland-xdg-shell`
+binaries live at `../wprs/target/release/` (relative to this repo) — put
+that dir on `PATH` before starting `navetted`. Start it with
+`--bind <tailnet-ip>:9417 --allow-remote` (loopback-only default can't
+reach a phone). `RUST_LOG="info,navetted=debug,navette_bridge=debug"` is
+worth it — it's what surfaced the `invalid_input` rejections once logcat
+was filtered correctly (by the `MediaClient` TAG, *not* by grepping for the
+app's package name — Android log lines don't contain it). A `navetted`
+process bound to `100.111.143.67:9417` with debug logging may still be
+running on this machine from this session (`ps aux | grep navetted`) with
+a `phonetest` session (Firefox) still attached to it — check before
+starting a second one.
+
+## M3 slice 3: touch gestures and pinch-to-zoom -- implemented, CI-green, single-touch verified on device, multi-touch needs fingers (2026-09-06)
+
+**Uncommitted, on `feat/android-session-screen`** (which is itself still
+unpushed with the three slice-2 commits). Nine files: `GestureInterpreter.kt`,
+`ViewTransform.kt` and their tests are new; `SessionScreen.kt`,
+`InputMapper.kt`, `MediaProtocol.kt`, `InputMapperTest.kt` and
+`android/README.md` are changed. **No Rust changed** -- that is a defining
+property of the design, not an accident; `git diff --stat master...HEAD --
+crates/` is empty and should stay empty for this slice.
+
+### What it is
+
+Pinch to zoom the video 1x-4x, anchored to the fingers; two-finger drag pans
+when zoomed and scrolls the guest at 1:1; two-finger quick-still tap is a
+right-click. One finger still drives the guest pointer exactly as before,
+except the left press is now sent 60ms after the finger lands
+(`PRESS_ARM_MS`) so a second finger can cancel it -- previously every pinch
+began with a stray left click at the first finger. A tap shorter than 60ms
+still clicks (the press goes out with the release). Zoom is purely
+client-side: a scale+translate on the `SurfaceView`, the guest window never
+resizes, the frames are upscaled by the GPU and so are soft past 1:1.
+Gesture table and known limitations are in `android/README.md`.
+
+Decisions taken with the user before building, each ruling out a plausible
+alternative: local zoom over ctrl+scroll forwarding or a crop/render-region
+protocol; one finger = pointer over drag-to-pan or trackpad mode; arming
+delay over accepting the stray click; two-finger tap over an overlay toggle.
+One taken while planning: the two-finger drag mode is **latched at the
+second finger's landing from the zoom level at that instant** and never
+changes mid-gesture -- so the guest cannot be scrolled while zoomed in.
+The intended fix (a pan that hits the content edge in one axis starts
+scrolling that axis) is deferred and named in the README.
+
+### The two things measured on the device before anything was built
+
+Both on the Pixel 9 Pro Fold, Android 17, against the live `navetted` +
+Firefox `phonetest` session from slice 2 (both daemons were still running):
+
+1. **Touch coordinates arrive inverse-mapped through the view transform.**
+   With a throwaway static `scaleX = scaleY = 2f` on the `SurfaceView`, a
+   tap at screen `(2400, 1060)` on the 2424x1080 landscape surface reached
+   the touch listener as `event.x = 1200.0`. This is what dictates the
+   architecture below.
+2. **The video layer follows a `SurfaceView` scale/translate.** The
+   screenshot showed the picture magnified 2x (toolbar and page text cut off
+   mid-word at the right edge -- impossible at 1:1) while the Compose
+   `Keyboard` overlay stayed normal size. So no `TextureView` fallback.
+
+### Why the interpreter works in screen space and the transform is applied synchronously
+
+Because of measurement 1, gesture maths in local (view) space would see a
+stationary finger *move* whenever the zoom changed under it -- a feedback
+loop during every pinch. So `SessionController.onTouchEvent` lifts each
+pointer to screen space via `ViewTransform.localToScreen` using the
+transform it believes is applied, and the interpreter works there. That
+transform and the view's real matrix must be identical at that instant.
+The plan had the transform flow through a `StateFlow` to an `AndroidView`
+`update` lambda; that lands a frame later via recomposition, so every pinch
+step would read the fingers through a stale matrix. The controller instead
+holds the `SurfaceView` (bound in the factory, like `surfaceCallback`) and
+sets scale/translation directly from the touch path. If someone "tidies"
+this back into Compose state, the pinch will drift.
+
+### Scroll: the plan's constant was wrong, and why
+
+The plan reasoned "one wheel notch per 60px". The actual sink: the bridge
+forwards `PointerAxis` as `AxisScroll.absolute` tagged
+`AxisSource::Continuous` (`crates/navette-bridge/src/input.rs:132-145`) and
+wprsd applies that verbatim as the `wl_pointer.axis` value
+(`../wprs/src/server/client_handlers.rs:239-240`). For a continuous source
+Wayland defines that value in surface-local pixels, so the natural ratio is
+`1.0` (content follows the finger), negated because Wayland's positive axis
+means "scroll down". `InputMapper.SCROLL_UNITS_PER_PIXEL` and the sign in
+`scrollUnits` are the two things to tune if a real guest disagrees --
+neither has been checked against one yet.
+
+Two facts worth keeping beside this: `PointerButton` and `PointerAxis` are
+both dispatched by the bridge at `Point { x: 0.0, y: 0.0 }` (`input.rs:121`,
+`input.rs:139`) and only `PointerMotion` sets pointer focus
+(`input.rs:81-90`). Every button and axis effect the interpreter emits is
+therefore preceded by a motion. Break that pairing and input vanishes with
+no error -- the same signature as the `8cc011b` u64 bug.
+
+### Verification status
+
+- `./gradlew --console=plain assembleDebug testDebugUnitTest lintDebug` --
+  the exact CI command -- green. 156 unit tests (109 → 156; 28 interpreter,
+  13 transform, 6 mapper, all first-run green). Lint: 0 errors, 21
+  warnings, all pre-existing (checked by stashing).
+- **Single-touch verified on a Pixel 10 Pro Fold** (Android 17, fresh
+  install, the real build -- the Pixel 9 Pro Fold used for the Task 1
+  measurements went away mid-session and still has the probe build with a
+  static 2x scale on it; reinstall there before judging anything). Driven
+  entirely with `adb shell input`, screenshots as evidence: attaches at a
+  clean 1:1; a bare `input tap` on a link navigated (fast-tap path,
+  press-with-release); a 351px/400ms `input swipe` across a sentence
+  selected it starting ~53px in -- **that offset is the 60ms arming delay,
+  visible** and worth knowing about if a drag ever "starts late"; adb key
+  events after those gestures typed letters, Shift, `,` `!`, space and
+  Backspace correctly. No `MediaClient` "media server reported" warning at
+  any point, i.e. the bridge rejected nothing.
+- **Multi-touch not verified.** `adb shell input` has no pinch. Pinch, pan,
+  scroll, two-finger tap, click-while-zoomed, rotate-while-zoomed, and
+  leave-mid-drag are the open items in `android/README.md` → Not verified.
+  The two Task 1 assumptions were measured on the Pixel 9, not the Pixel
+  10; both are AOSP framework behaviour and unlikely to differ, but if a
+  pinch does nothing on the Pixel 10, re-run the probe (a static
+  `scaleX = scaleY = 2f` on the `SurfaceView` plus a logcat line in
+  `onTouchEvent`) before suspecting the interpreter.
+- Driving the app via adb, for whoever does that: `adb shell uiautomator
+  dump` sees Compose text nodes; on the cover display the host field is at
+  about `(400, 1296)` and Connect at `(211, 1467)` in portrait, and the
+  `phonetest` row at `(300, 500)` on the drawer. `adb exec-out screencap -p`
+  gave an unparseable PNG on this device (multi-display); `adb shell
+  screencap -p /sdcard/x.png` + `adb pull` works. The slice-2 note about
+  filtering logcat by tag (`MediaClient`), not package, still applies; a
+  bridge rejection shows up there as `media server reported: ...`.
+
+### Not done
+
+- Code review. Slice 2's pattern (independent `code-reviewer` +
+  `security-reviewer`, three rounds, real bugs found in each of the first
+  two) has not been run on this slice.
+- Commit. Not asked for; the tree is left ready.
+- Of the three slice-2 on-device items, the hardware-keyboard one is mostly
+  closed by the adb key-event run above (same `onKeyEvent` path; Enter,
+  arrows and an actual Bluetooth keyboard remain); IME autocomplete and live
+  resize are still open, and now sit under a second slice of changes to the
+  same file.
+
+## M3 slice 3b: media auto-reconnect — implemented and on-device-verified (2026-09-06)
+
+Same session as the gesture slice, committed on `feat/android-session-screen`
+after it. Purely client-side (Android); **no Rust changed** — the server
+already supported reconnect.
+
+### Why it exists
+
+Testing the gestures surfaced it repeatedly: any media-socket drop stranded
+the session on a dead "Disconnected" screen with only "Back to sessions".
+On a phone over a tailnet that is a real, frequent failure. The roadmap
+(Phase 1) already lists reconnect UX; this is it.
+
+### What it does
+
+- The media socket is pinged every 5s (`MediaClient.PING_INTERVAL_SECONDS`,
+  down from a keepalive-only 20s), so a silently-dropped link — a dead
+  tailnet route stops delivering frames without closing the TCP socket —
+  surfaces as an OkHttp failure within ~5-10s instead of up to 40s.
+- On that failure the session screen retries up to
+  `MAX_RECONNECT_ATTEMPTS` (5) times on a linear backoff
+  (`RECONNECT_BASE_DELAY_MS` × attempt: 1s, 2s, …), showing
+  "Reconnecting…"/"Connecting…". A working connection resets the budget.
+- Exhausting the budget falls back to a manual "Reconnect" button.
+- A real `StreamEnd` (guest window closed) and a decode error are terminal
+  and never retried — that precedence is in `SessionOverlay`.
+
+### The design choice that matters
+
+Reconnect is a **clean rebuild**, not an in-place re-open. A Compose nonce
+(`reconnectNonce`) keys both the `SessionController` (`remember(host,
+sessionName, reconnectNonce)`) and the `SurfaceView` (`key(reconnectNonce) {
+AndroidView … }`). Bumping it disposes the old controller (its tested
+`close()`) and builds a fresh one against a fresh `SurfaceView`, reusing the
+exact `open()`/`close()` lifecycle a first attach uses. This was deliberate:
+
+- `MediaClient` is single-use — its packet `Channel` closes permanently in
+  `endStream()`, so the same instance cannot re-open. A fresh client sidesteps
+  that entirely.
+- The `SurfaceView`'s holder callback binds to one controller; an
+  already-created holder never re-fires `surfaceCreated` for a callback added
+  later. So a controller swap **without** a new view would render nothing.
+  Recreating the view via `key()` re-runs the factory against the new
+  controller and rewires it. (There's a comment on the `key()` block saying
+  exactly this — don't "optimise" the view recreation away.)
+
+The retry orchestration lives in Compose `LaunchedEffect`s, not in the
+controller, so the delicate `SessionController` concurrency (decoder
+lifecycle, `lock` ordering, job cancellation) is untouched — the whole reason
+the rebuild approach was chosen over teaching the controller to reconnect.
+
+Server side, `crates/navetted/src/media.rs`'s `attach` assigns a fresh
+`client_id` and replays codec config + latest keyframe to every new
+attachment (its `reconnect_starts_with_config_and_latest_keyframe` test), so
+a retry that lands while the session is alive resumes the picture with no
+decoder-side special-casing — the replayed `StreamConfig` flows through the
+same gate/decoder bootstrap a first attach does.
+
+### Verified on device (Pixel 10 Pro Fold, live Firefox session)
+
+- **Auto-recovery**: video live → wifi off ~8s → socket failed within
+  seconds → "Connecting…"/"Reconnecting…" overlay → wifi back → video resumed
+  **with no interaction**.
+- **Exhaustion + manual**: a longer outage burned all five retries against the
+  down network → "Reconnect" button appeared → after wifi returned, tapping
+  it rebuilt and resumed the video.
+- No `MediaClient` "media server reported" rejection in either run; the
+  gesture happy path is unaffected (verified live before the drop test).
+
+CI (`assembleDebug testDebugUnitTest lintDebug`) green throughout; the
+reconnect logic is Compose-level and verified on device rather than
+unit-tested, consistent with the rest of `SessionController`.
+
+### Foldable gotcha: `cmd device_state state 2` disables the cover screen until reset
+
+To give the virtual uinput touchscreen a live viewport, this session forced
+the Pixel 10 Pro Fold's *emulated* device state to OPENED
+(`adb shell cmd device_state state 2`). That override makes the OS ignore the
+hinge: with the phone physically folded, the inner display stays the active
+default and **the cover screen stays off** -- which reads, from the outside,
+as "the front screen doesn't work." It survives app reinstalls and
+force-stops; only `adb shell cmd device_state state reset` clears it
+(`dumpsys device_state` shows `mOverrideState` / `Override Request active`
+to confirm). The pointer-location debug overlay (`settings put system
+pointer_location 1`) is similarly sticky. **Reset both before handing the
+phone back.** Neither is a bug in the app.
+
+## "The front screen doesn't work": root-caused and fixed (2026-09-06, late)
+
+Reported against the Pixel 10 Pro Fold: the cover screen worked for other
+apps but navette, when in focus there, "did not work." Three things looked
+like that in sequence, and only the last one was the app's:
+
+1. **My `cmd device_state state 2` override** (see the gotcha above) kept the
+   inner display active with the phone folded, so the cover was simply off.
+   Cleared; not the app.
+2. **This phone's fold behaviour raises a dismissible keyguard on fold**
+   (`PowerManagerService: Showing dismissible keyguard` in logcat) --
+   "swipe up to continue." Same on a real fold, regardless of
+   `fold_lock_behavior_setting` (which is a *System* key, not Secure; and the
+   Pixel 9 that "works" has it at default too). Not the app either -- and not
+   the difference between the phones.
+3. **The app, after the fold → keyguard → swipe cycle, showed
+   "Disconnected: failed to connect to … after 10000ms" with a manual
+   Reconnect button.** Reproduced by emulating the fold with a live session
+   (`state 0`, wait, `state reset`, `wm dismiss-keyguard`). Root cause: the
+   reconnect loop kept retrying while the app was stopped behind the keyguard
+   with its network restricted, burning all five attempts on 10s connect
+   timeouts, so the screen the user swiped back to was already dead.
+
+Fix (commit after this note): the retry loop runs inside
+`repeatOnLifecycle(STARTED)`, so it pauses while the screen is hidden, and the
+budget resets on every return to the foreground and on every decoded frame.
+The policy is a pure `ReconnectPolicy` with tests.
+
+**Verified on the Pixel 10, three consecutive runs of the same cycle** (attach
+on the cover → emulated unfold → fold back → keyguard for 20s → dismiss →
+navette to front): the session screen came back with live video every time,
+no manual button, same PID throughout, no `Detach` sent (host
+`client_count` unchanged). The preserved log of the third run shows the
+mechanism: nothing while hidden; on resume `decoder started at 2204x2128`
+(the rebuild, with the server replaying the inner-display config) and two
+seconds later `2416x1132` (the live resize to the cover). The same build
+also survived 15s backgrounded behind another app.
+
+**One observation not explained:** the very first cycle on this build --
+immediately after `adb install -r` had killed and restarted the process --
+came back on the *Connect* screen with the host still filled, no error text,
+and no session. Host filled means the same ViewModel; no error means the
+control socket closed cleanly (`Disconnected`, not `Failed`); no session
+means `activeSession` was cleared. Only `connect()` or `leaveSession()` do
+that, and neither had an obvious trigger. It did not reproduce in three
+further attempts, including one with the identical task ordering (another
+app in front, then `am start -n`, which does *not* create a second activity
+instance -- checked via `dumpsys activity activities`). The log for that run
+was lost to my own `logcat -c`. If it recurs: keep the log, check
+`navette ls`'s client count before/after (a `Detach` decrements it), and
+`dumpsys activity activities` for a second `Hist` entry.
+
+Unfold with a live session, incidentally, is a **live resize**, not a
+reconnect: the activity survives (`configChanges` covers it), the decoder
+restarts at the new size (2204x2128 seen in logcat), no socket drop. That
+closes slice 2's open "live resize" item.
+
+### Review findings on slices 3/3b, and what was done
+
+An independent `code-reviewer` pass (after the on-device verification --
+which is why these survived it) found 3 HIGH, 5 MEDIUM, 4 LOW. All HIGHs and
+the MEDIUMs that were real bugs are fixed in the same commit:
+
+- **HIGH -- stale snapshot double-charged the retry budget.** `collectAsState`
+  keeps the dead controller's last value for a frame after the nonce swap, so
+  a snapshot-keyed effect saw "still dropped" against the new controller and
+  charged a second attempt per drop (5 became ~3), and could tear down a
+  manual reconnect a second later. Fixed by having the effect wait on
+  `controller.state.first { dropped }` -- the controller's own flow. That in
+  turn required `SessionController.open()` to call `connect()` *before*
+  launching the state collector, or the client's initial `Disconnected` would
+  be published and read as a drop.
+- **HIGH -- budget reset on socket-open meant a flapping link retried
+  forever.** Reset now happens on `contentSize != null` (a decoded frame).
+- **HIGH -- a button or axis could reach the wire with no preceding motion**
+  (a tap during the 60ms arming window while the stream was still
+  bootstrapping: motion dropped at `gate.primary == null`, press sent 60ms
+  later once the config landed -- a click at the guest's top-left).
+  `sendButton`/`sendScroll` are now gated on a motion having been delivered
+  to the *same* surface (`motionSentTo`).
+- **MEDIUM -- relative-only pinch slop swallowed right-clicks.** Fingers 40px
+  apart latched a pinch on 2px of jitter, and a latched pinch cancels the
+  two-finger-tap right-click. Added an absolute floor (`PINCH_SLOP_PX = 8f`)
+  required alongside the ratio, plus a jittery-tap test that fails without it.
+- **MEDIUM -- zoom/pan reset on every reconnect.** Hoisted into a
+  `ViewTransformHolder` the screen owns and lends to each controller.
+- **MEDIUM -- `fcb2747`'s message claimed an overlay change it did not make.**
+  The rebuild's Connecting phase now genuinely reads "Reconnecting… (n/5)";
+  the overlay moved to `SessionOverlay.kt`.
+- **MEDIUM -- a 0x0 surface size could be stored.** Rejected at
+  `onSurfaceResized`.
+- **MEDIUM -- an `OkHttpClient` per reconnect, never shut down.** `close()`
+  now shuts the dispatcher executor and evicts the pool.
+- LOW, fixed: fingers landing on the same point could never pinch; a phantom
+  tracked finger could click at a stale position.
+
+Also from that review, kept as evidence: the controller's thread-confinement
+holds for every new field; a mid-drag reconnect does not strand `BTN_LEFT`
+in the guest, because `MediaAttachment::drop` → `InputState::disconnect`
+releases it server-side.
+
+### The last two LOWs, closed (2026-09-07)
+
+- **A reconnect re-requested focus and so silently dropped a raised IME.**
+  `LaunchedEffect(controller) { focusRequester.requestFocus() }` is keyed on
+  the controller and so re-runs on every rebuild, pulling focus off the
+  hidden IME text field regardless of whether the on-screen keyboard was up.
+  `imeRaised` -- previously local to `ImeLayer` -- is now hoisted to
+  `SessionScreen` (keyed on `(host, sessionName)`, so it survives a
+  reconnect the same way the retry counters and `ViewTransformHolder` do),
+  and the effect skips the surface-focus request while it is `true`.
+- **`MediaClient.sendInput`'s `Boolean` return was discarded at every call
+  site.** Rather than annotate a dozen call sites, the one place that
+  actually swallows a failure silently -- `webSocket == null` or
+  `WebSocket.send` itself declining -- now logs at debug (not warn: a
+  dropped send during a known-bad connection is expected, it's the entire
+  reason the retry loop exists) via a small `logDropped` helper both
+  branches tail-call.
+
+166 unit tests, CI green, no Rust touched.
+
+### The IME-focus fix, first attempt, measured wrong on device (2026-09-07)
+
+On-device re-verification of the fix above found it incomplete. Test: raise
+the on-screen keyboard, drop wifi for 8s, restore it, watch the reconnect.
+
+**What happened on the first build:** the video came back on its own
+(correct), the "Hide keyboard" label stayed put (`imeRaised` correctly
+survived, as designed) -- but the on-screen keyboard itself had vanished,
+and `adb shell input text` afterward navigated the guest to a different
+page instead of landing silently in the hidden field.
+`uiautomator dump`'s focused node confirmed it: the full-screen surface
+`Box`, not the hidden `BasicTextField`.
+
+**Why "decline to steal focus" wasn't enough.** The fix only skipped
+`focusRequester.requestFocus()` while `imeRaised`. But the `AndroidView`
+holding the `SurfaceView` is itself recreated on every reconnect
+(`key(reconnectNonce)`), and the platform's own focus-search assigns that
+freshly-attached View native focus regardless of what Compose's
+`FocusRequester` bookkeeping says. Nothing in the app requested that focus
+move -- the view recreation did it as a side effect. Declining to make our
+own request left the field wide open to it.
+
+**The actual fix:** `fieldFocus` (previously private to `ImeLayer`) is
+hoisted to `SessionScreen` alongside `imeRaised`, and the reconnect effect
+now *actively* asserts the correct target every time it reruns --
+`fieldFocus.requestFocus()` + `keyboard?.show()` when raised, the surface's
+`focusRequester.requestFocus()` otherwise -- rather than merely omitting
+the wrong one.
+
+**Re-verified on the Pixel 10, same recipe:** keyboard visible throughout
+the wifi-drop-and-restore cycle this time; `adb shell input text` after
+reconnecting landed silently (no guest navigation, page unchanged); the
+"Hide keyboard"/"Keyboard" toggle still flips cleanly afterward. 166 tests,
+CI green, no Rust touched.
+
+This is the shape of bug that only shows up by actually reconnecting on a
+real device with the keyboard up -- neither the unit tests (pure Kotlin,
+no Android View focus system) nor the independent code review caught it;
+only driving the exact user action did.
