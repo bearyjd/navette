@@ -1892,3 +1892,57 @@ This is the shape of bug that only shows up by actually reconnecting on a
 real device with the keyboard up -- neither the unit tests (pure Kotlin,
 no Android View focus system) nor the independent code review caught it;
 only driving the exact user action did.
+
+## M3 (session screen) merged to master — PR #17 (2026-09-07)
+
+**`master` is at `e2c4642`.** PR #17 squash-merged the whole session-screen
+arc: slice 2 (decode + input, `7d089f1`/`8cc011b`), slice 3 (gestures,
+`b12c1e2`), slice 3b (reconnect, `10cab7d` onward), and the fixes that came
+out of an independent code review plus two rounds of on-device
+re-verification (`34be57c`, `eecc9d0`, `e078816`) — full story in the
+sections above. All 3 CI checks (`android`, `rust`, `viewer-display`) green
+on the PR itself, not just locally. `feat/android-session-screen` is
+deleted, both remotely and locally (`gh pr merge --delete-branch`).
+
+**Per `docs/ROADMAP.md`'s Phase 1 ("Phone attach — the demo")**: encoder
+bridge, drawer, session screen, resize-follows-viewport, and reconnect UX
+are now all done. What's left in Phase 1: **performance HUD**
+(fps/bitrate/latency overlay), the rest of the **input-completeness pass**
+(keyboard layouts beyond US-QWERTY, IME autocomplete still unverified), and
+**PIN-on-attach**. Phase 2 (clipboard, file transfer, wake-on-LAN, multi-host
+registry) hasn't been started.
+
+### Still open, honestly, from the test plan in #17
+- Hardware Bluetooth/USB keyboard as an actual physical device (adb-injected
+  key events cover the same `onKeyEvent` code path and are verified; a real
+  keyboard itself is not).
+- On-screen IME autocomplete-triggered replacement.
+
+### Environment, as left
+- `navetted` (pid varies per run) and `wprsd` for a session named **`mvp`**
+  (Firefox) are both running on this machine, bound to
+  `100.111.143.67:9417`. `mvp` currently shows 2 attachments in
+  `navette ls` — stale from testing, harmless, will clear on its own when
+  those sockets time out or the app is closed.
+- **Pixel 10 Pro Fold** has the fully-merged build installed and was the
+  device all the reconnect/IME re-verification ran against.
+- **Pixel 9 Pro Fold** still has an old **probe build** from slice 3's Task 1
+  measurement (a static 2x `SurfaceView` scale + a debug logcat line) —
+  reinstall the real APK before using it for anything real.
+- No lingering `device_state` overrides or debug `settings` on either
+  phone; both were explicitly reset after use (see the fold-override
+  gotcha above).
+- Unrelated: the Pixel 10 has a third-party app, `com.ventouxlabs.bascule`
+  ("Bascule" / VitalForge scale), with an "Always-on foreground fallback"
+  service that periodically brings itself to the foreground on its own.
+  Nothing to do with navette — if the phone unexpectedly shows Bascule
+  instead of whatever you left running, that's why.
+
+### Where to look
+- `docs/HANDOFF.md` (this file) for the full session-by-session history,
+  including two root-caused bugs (`invalid_input` u64 signedness; the
+  fold/keyguard reconnect-budget exhaustion) and the two-pass IME-focus fix
+  that only revealed itself on a real device.
+- `android/README.md` for the current Verified/Not-verified/Known-limitations
+  split, kept in sync with every slice.
+- PR #17 on GitHub for the itemized commit-by-commit story and CI links.
