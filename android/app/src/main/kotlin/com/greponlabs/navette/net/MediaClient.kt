@@ -148,8 +148,21 @@ class MediaClient(private val webSocketUrl: String) {
             Log.w(TAG, "refusing to send out-of-range input: $invalid")
             return false
         }
-        val socket = webSocket ?: return false
-        return socket.send(mediaJson.encodeToString(MediaInput.serializer(), input))
+        val socket = webSocket ?: return logDropped(input, "no socket")
+        return socket.send(mediaJson.encodeToString(MediaInput.serializer(), input)) ||
+            logDropped(input, "socket declined the frame")
+    }
+
+    /**
+     * Debug, not warn: every caller already treats a dropped send as
+     * unsurprising during a known-bad connection (the entire reason
+     * [SessionController] retries), so this is a breadcrumb for whoever
+     * investigates a specific missing input next, not an operational alert.
+     * Always returns `false`, so callers can tail-call it as their failure path.
+     */
+    private fun logDropped(input: MediaInput, reason: String): Boolean {
+        Log.d(TAG, "dropped $input: $reason")
+        return false
     }
 
     /**

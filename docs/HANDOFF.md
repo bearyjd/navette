@@ -1826,11 +1826,31 @@ the MEDIUMs that were real bugs are fixed in the same commit:
 - **MEDIUM -- an `OkHttpClient` per reconnect, never shut down.** `close()`
   now shuts the dispatcher executor and evicts the pool.
 - LOW, fixed: fingers landing on the same point could never pinch; a phantom
-  tracked finger could click at a stale position. LOW, not fixed: a reconnect
-  re-requests focus and so drops a raised IME; `sendInput`'s return is
-  unchecked.
+  tracked finger could click at a stale position.
 
 Also from that review, kept as evidence: the controller's thread-confinement
 holds for every new field; a mid-drag reconnect does not strand `BTN_LEFT`
 in the guest, because `MediaAttachment::drop` → `InputState::disconnect`
 releases it server-side.
+
+### The last two LOWs, closed (2026-09-07)
+
+- **A reconnect re-requested focus and so silently dropped a raised IME.**
+  `LaunchedEffect(controller) { focusRequester.requestFocus() }` is keyed on
+  the controller and so re-runs on every rebuild, pulling focus off the
+  hidden IME text field regardless of whether the on-screen keyboard was up.
+  `imeRaised` -- previously local to `ImeLayer` -- is now hoisted to
+  `SessionScreen` (keyed on `(host, sessionName)`, so it survives a
+  reconnect the same way the retry counters and `ViewTransformHolder` do),
+  and the effect skips the surface-focus request while it is `true`.
+- **`MediaClient.sendInput`'s `Boolean` return was discarded at every call
+  site.** Rather than annotate a dozen call sites, the one place that
+  actually swallows a failure silently -- `webSocket == null` or
+  `WebSocket.send` itself declining -- now logs at debug (not warn: a
+  dropped send during a known-bad connection is expected, it's the entire
+  reason the retry loop exists) via a small `logDropped` helper both
+  branches tail-call.
+
+166 unit tests, CI green, no Rust touched. Not yet re-verified on a real
+device -- the phone was in the user's own hands for something unrelated
+when this landed; do that before calling the MVP fully closed.

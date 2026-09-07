@@ -130,6 +130,10 @@ fun SessionScreen(
     val state by controller.state.collectAsState()
     val focusRequester = remember { FocusRequester() }
     val lifecycleOwner = LocalLifecycleOwner.current
+    // Keyed on the session, not the nonce, like the retry counters above: a
+    // reconnect must not silently drop the user out of the on-screen
+    // keyboard they had raised.
+    var imeRaised by remember(host, sessionName) { mutableStateOf(false) }
 
     LockLandscapeWhileAttached()
 
@@ -138,7 +142,11 @@ fun SessionScreen(
         onDispose { controller.close() }
     }
 
-    LaunchedEffect(controller) { focusRequester.requestFocus() }
+    // Skipped while the IME is raised: a reconnect rebuilds this effect (it is
+    // keyed on the controller), and requesting the surface's focus here would
+    // silently pull focus off the hidden text field mid-reconnect, dropping
+    // the soft keyboard without the user asking for it.
+    LaunchedEffect(controller) { if (!imeRaised) focusRequester.requestFocus() }
 
     // The retry budget refills only once the stream is genuinely live -- a
     // frame decoded -- not on the socket opening. A server that accepts the
@@ -255,7 +263,12 @@ fun SessionScreen(
             )
         }
 
-        ImeLayer(controller = controller, surfaceFocus = focusRequester)
+        ImeLayer(
+            controller = controller,
+            surfaceFocus = focusRequester,
+            imeRaised = imeRaised,
+            onImeRaisedChange = { imeRaised = it },
+        )
 
         SessionOverlay(
             state = state,
@@ -285,11 +298,19 @@ fun SessionScreen(
  * field holds it the soft keyboard is up and consuming keys, and while the
  * video surface holds it a hardware keyboard works. Handing focus back to
  * [surfaceFocus] on dismissal is what restores the hardware path.
+ *
+ * [imeRaised] is hoisted to the caller rather than owned here: a reconnect's
+ * own focus-restoring effect needs to know whether the IME is up so it does
+ * not silently steal focus back from a raised keyboard mid-reconnect.
  */
 @Composable
-private fun BoxScope.ImeLayer(controller: SessionController, surfaceFocus: FocusRequester) {
+private fun BoxScope.ImeLayer(
+    controller: SessionController,
+    surfaceFocus: FocusRequester,
+    imeRaised: Boolean,
+    onImeRaisedChange: (Boolean) -> Unit,
+) {
     var typed by remember { mutableStateOf("") }
-    var imeRaised by remember { mutableStateOf(false) }
     val fieldFocus = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
 
@@ -304,8 +325,9 @@ private fun BoxScope.ImeLayer(controller: SessionController, surfaceFocus: Focus
 
     TextButton(
         onClick = {
-            imeRaised = !imeRaised
-            if (imeRaised) {
+            val raised = !imeRaised
+            onImeRaisedChange(raised)
+            if (raised) {
                 fieldFocus.requestFocus()
                 keyboard?.show()
             } else {
