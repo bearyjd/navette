@@ -1717,3 +1717,17 @@ same gate/decoder bootstrap a first attach does.
 CI (`assembleDebug testDebugUnitTest lintDebug`) green throughout; the
 reconnect logic is Compose-level and verified on device rather than
 unit-tested, consistent with the rest of `SessionController`.
+
+### Foldable gotcha: `cmd device_state state 2` disables the cover screen until reset
+
+To give the virtual uinput touchscreen a live viewport, this session forced
+the Pixel 10 Pro Fold's *emulated* device state to OPENED
+(`adb shell cmd device_state state 2`). That override makes the OS ignore the
+hinge: with the phone physically folded, the inner display stays the active
+default and **the cover screen stays off** -- which reads, from the outside,
+as "the front screen doesn't work." It survives app reinstalls and
+force-stops; only `adb shell cmd device_state state reset` clears it
+(`dumpsys device_state` shows `mOverrideState` / `Override Request active`
+to confirm). The pointer-location debug overlay (`settings put system
+pointer_location 1`) is similarly sticky. **Reset both before handing the
+phone back.** Neither is a bug in the app.

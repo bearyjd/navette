@@ -808,7 +808,7 @@ private fun SessionOverlay(
                 }
                 reconnecting -> {
                     CircularProgressIndicator()
-                    OverlayText("Reconnecting... ($reconnectAttempt/$maxAttempts)", MaterialTheme.typography.bodyMedium)
+                    OverlayText("Connection lost -- reconnecting...", MaterialTheme.typography.bodyMedium)
                     TextButton(onClick = onLeave) { Text("Back to sessions", color = Color.White) }
                 }
                 state.connection is ConnectionState.Failed || state.connection is ConnectionState.Disconnected -> {
