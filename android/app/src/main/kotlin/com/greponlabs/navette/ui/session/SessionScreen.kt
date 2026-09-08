@@ -553,10 +553,10 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
      * picks it back up.
      */
     private fun startDecoder(stream: PrimaryStream) {
-        // Stop the outgoing decoder before publishing a successor. If both
-        // happened in one window, surfaceDestroyed could capture the new
-        // instance -- which holds nothing yet -- and return while the old
-        // codec was still live on the Surface.
+        // Window 1: stop the outgoing decoder before publishing a successor.
+        // If both happened in one window, surfaceDestroyed could capture the
+        // new instance -- which holds nothing yet -- and return while the
+        // old codec was still live on the Surface.
         val stopping = synchronized(lock) { decoder.also { decoder = null } }
         // Outside the lock: stop() calls MediaCodec.release(), and the
         // codec's callback thread may be blocked on this very lock inside
@@ -569,14 +569,22 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
         // raise an event before the assignment below, because nothing has
         // called start() yet.
         var created: H264Decoder? = null
+        var superseded: H264Decoder? = null
+        // Window 2: publish. `superseded` catches anything a racing
+        // startDecoder published in the gap between the two windows --
+        // without it that instance would be overwritten unstopped,
+        // unreachable through the field, and leak its codec and
+        // HandlerThread.
         val fresh =
             synchronized(lock) {
                 val target = surface ?: return
                 val instance = H264Decoder(target) { event -> created?.let { onDecoderEvent(it, event) } }
                 created = instance
+                superseded = decoder
                 decoder = instance
                 instance
             }
+        superseded?.stop()
         _state.update { it.copy(streamEnded = false, decodeError = null, contentSize = null) }
         // Started outside the lock. configure()+start() costs tens to hundreds
         // of milliseconds, and holding the lock across it would block
