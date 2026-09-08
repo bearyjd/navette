@@ -1246,7 +1246,7 @@ internal fun SessionHudOverlay(sample: HudSample?, visible: Boolean) {
 In `SessionScreen`, beside where `imeRaised` is hoisted — and keyed the same way, so a reconnect rebuild does not reset it:
 
 ```kotlin
-    var hudVisible by rememberSaveable(host, sessionName) { mutableStateOf(false) }
+    var hudVisible by remember(host, sessionName) { mutableStateOf(false) }
 ```
 
 Wire the controller's callback in the same `DisposableEffect`/`LaunchedEffect` that already binds the controller:
@@ -1261,7 +1261,7 @@ and render it inside the same `Box` that hosts `SessionOverlay`, **after** the `
         SessionHudOverlay(sample = state.hud, visible = hudVisible)
 ```
 
-Match the file's existing imports for `rememberSaveable`, `mutableStateOf`, `getValue` and `setValue`; `imeRaised` is the model to copy.
+`remember`, not `rememberSaveable` — the file keys `imeRaised` (:146) and `ViewTransformHolder` (:130) exactly this way, and the activity declares `configChanges` so a rotation or unfold never destroys it. Match the file's existing imports for `remember`, `mutableStateOf`, `getValue` and `setValue`; `imeRaised` is the model to copy.
 
 - [ ] **Step 3: Build and run the suite**
 
