@@ -278,6 +278,29 @@ class GestureInterpreterTest {
         assertSame(GestureState.Suppressed, fingers.state)
     }
 
+    // -- two-finger long-press (HUD toggle) ----------------------------------
+
+    @Test
+    fun `two still fingers held past the tap timeout toggle the hud`() {
+        val fingers = twoFingersDown(zoomed = false)
+
+        fingers.after(TAP_TIMEOUT_MS + 1).pointerUp(FINGER_B, p(FINGER_A, 100f, 100f), p(FINGER_B, 300f, 100f))
+
+        assertEquals(listOf<GestureEffect>(GestureEffect.ToggleHud), fingers.drain())
+        assertSame(GestureState.Suppressed, fingers.state)
+    }
+
+    @Test
+    fun `fingers that moved do not toggle the hud however long they were down`() {
+        val fingers = twoFingersDown(zoomed = false)
+        fingers.move(p(FINGER_A, 150f, 130f), p(FINGER_B, 350f, 130f))
+        fingers.drain()
+
+        fingers.after(TAP_TIMEOUT_MS + 1).pointerUp(FINGER_A, p(FINGER_A, 150f, 130f), p(FINGER_B, 350f, 130f))
+
+        assertEquals(emptyList<GestureEffect>(), fingers.drain())
+    }
+
     @Test
     fun `a moved two-finger touch is not a right-click`() {
         val fingers = twoFingersDown(zoomed = false)

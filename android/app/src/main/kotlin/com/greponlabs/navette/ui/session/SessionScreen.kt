@@ -430,6 +430,9 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
     private var pressJob: Job? = null
     private var leftPressed = false
 
+    /** Set by the screen, which owns whether the HUD is showing. */
+    var onToggleHud: (() -> Unit)? = null
+
     /**
      * The surface the most recent successfully-sent motion was addressed to.
      *
@@ -817,6 +820,7 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
                 applyTransform()
             }
             is GestureEffect.Scroll -> sendScroll(effect.dx, effect.dy)
+            GestureEffect.ToggleHud -> onToggleHud?.invoke()
         }
     }
 
