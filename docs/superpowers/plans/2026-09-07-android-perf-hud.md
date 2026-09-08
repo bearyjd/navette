@@ -767,7 +767,12 @@ class SessionHud {
      */
     private fun rate(total: Double, oldestMs: Long?, nowMs: Long): Double {
         if (oldestMs == null || total == 0.0) return 0.0
-        val elapsed = (nowMs - oldestMs).coerceAtLeast(1L)
+        val elapsed = nowMs - oldestMs
+        // Zero or negative span yields no rate at all, exactly as hud.rs:174-176
+        // does. Flooring the divisor at 1ms instead would turn a frame presented
+        // and sampled in the same millisecond -- routine at currentTimeMillis
+        // granularity -- into "FPS 1000.0" on the overlay.
+        if (elapsed <= 0L) return 0.0
         return total * 1000.0 / elapsed.toDouble()
     }
 }
