@@ -142,7 +142,9 @@ Add to `mod tests` in `crates/navetted/src/api.rs`. It mirrors `media_websocket_
 ```rust
 #[tokio::test]
 async fn media_websocket_answers_a_ping_without_troubling_the_bridge() {
-    let state = test_state();
+    let temp = TempDir::new().unwrap();
+    let state = test_state(&temp);
+    add_running_session(&state, "work");
     let mut input = state.media.register_session("work");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -186,7 +188,7 @@ async fn media_websocket_answers_a_ping_without_troubling_the_bridge() {
 }
 ```
 
-Note: this test attaches with no prior `publish`, so there is no bootstrap replay to read past before the pong. If the harness in this module requires a registered stream before attach, copy the two `state.media.publish(...)` calls from `media_websocket_replays_bootstrap_and_routes_validated_input` and drain the two replayed packets with `socket.next()` before sending the ping.
+The setup mirrors `media_websocket_replays_bootstrap_and_routes_validated_input` exactly — `test_state` takes a `&TempDir`, and `add_running_session` is what makes the attach succeed — but deliberately publishes nothing, so there is no bootstrap replay to read past and the pong is the first frame the client sees. `TempDir` is already imported in this test module.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -295,13 +297,16 @@ fun `an unknown server message is still rejected rather than guessed at`() {
     // MediaClient.onMessage relies on this failing, not throwing past its
     // runCatching -- it is what makes an old daemon's unknown reply a log
     // line instead of a crash.
-    assertFailsWith<SerializationException> {
+    assertThrows(SerializationException::class.java) {
         mediaJson.decodeFromString(MediaServerMessage.serializer(), """{"type":"nonsense"}""")
     }
 }
 ```
 
-Imports needed at the top of the file: `kotlinx.serialization.SerializationException`, `kotlin.test.assertFailsWith`, `kotlin.test.assertNull` (match whichever assertion library the file already uses; if it uses `org.junit.Assert`, use `org.junit.Assert.assertThrows` instead of `assertFailsWith`).
+**Assertions are `org.junit.Assert`, never `kotlin.test`.** All twelve existing
+test files in this module use JUnit's assertions and `kotlin.test` is not a
+declared `testImplementation` dependency. Imports to add: `org.junit.Assert.assertNull`,
+`org.junit.Assert.assertThrows`, and `kotlinx.serialization.SerializationException`.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -382,9 +387,9 @@ import com.greponlabs.navette.net.MediaFlags
 import com.greponlabs.navette.net.MediaHeader
 import com.greponlabs.navette.net.MediaKind
 import com.greponlabs.navette.net.MediaPacket
-import kotlin.test.assertEquals
-import kotlin.test.assertNull
-import kotlin.test.assertTrue
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SessionHudTest {
@@ -422,8 +427,11 @@ class SessionHudTest {
         val hud = SessionHud()
         hud.recordPacket(1000L, packet(sequence = 1, payload = 1000))
         hud.recordPacket(1500L, packet(kind = MediaKind.METRICS, sequence = 2, payload = 9_000_000))
-        // 1000 bytes = 8000 bits, over the window.
-        assertEquals(8000.0, hud.sample(1900L).bitrateBps, 1.0)
+        // 1000 bytes = 8000 bits. Sampled at exactly 1000ms after the only
+        // video packet, so the rate is over a full second and the expected
+        // value is exact: rates divide by elapsed-since-oldest, as hud.rs's
+        // own rate() does, not by the nominal window.
+        assertEquals(8000.0, hud.sample(2000L).bitrateBps, 1.0)
     }
 
     @Test
@@ -567,6 +575,7 @@ package com.greponlabs.navette.ui.session
 
 import com.greponlabs.navette.net.MediaKind
 import com.greponlabs.navette.net.MediaPacket
+import java.util.Locale
 
 /** Rolling window every rate in a [HudSample] is measured over. */
 const val HUD_WINDOW_MS: Long = 1000L
@@ -619,11 +628,16 @@ data class HudSample(
  * overlay is telling them apart.
  */
 fun HudSample.format(): String {
-    val dec = decodeMs?.let { String.format("%.1fMS", it) } ?: "--"
+    // Locale.ROOT throughout: the default locale renders a comma decimal
+    // separator across much of the world, which would put "29,9" on the
+    // overlay and make this function's output depend on the phone's region.
+    val dec = decodeMs?.let { String.format(Locale.ROOT, "%.1fMS", it) } ?: "--"
     val age = ageMs?.let { "${it}MS" } ?: "--"
     val rtt = rttMs?.let { "${it}MS" } ?: "--"
-    return "FPS ${String.format("%.1f", fps)}  KBPS ${String.format("%.0f", bitrateBps / 1000.0)}  " +
-        "DEC $dec  AGE $age  RTT $rtt  DROP $droppedPackets  DISC $discontinuities"
+    val rate = String.format(Locale.ROOT, "%.1f", fps)
+    val kbps = String.format(Locale.ROOT, "%.0f", bitrateBps / 1000.0)
+    return "FPS $rate  KBPS $kbps  DEC $dec  AGE $age  RTT $rtt  " +
+        "DROP $droppedPackets  DISC $discontinuities"
 }
 
 /**
@@ -944,13 +958,13 @@ In `onDecoderEvent`, replace the `is DecoderEvent.Presented -> Unit` placeholder
 
 - [ ] **Step 4: Drive the ping and publish a sample once a second**
 
-In `open()`, after `client.connect()`, and set the pong listener before connecting:
+Install the pong listener **before** `client.connect()` — `connect()` starts OkHttp's reader thread, so the listener must already be in place:
 
 ```kotlin
         client.onPong = { nonce -> synchronized(lock) { hud.recordPong(nonce, System.currentTimeMillis()) } }
 ```
 
-and after the connection collector is launched:
+Then, after the connection collector is launched:
 
 ```kotlin
         hudJob?.cancel()
@@ -1026,84 +1040,38 @@ See "Deviation from the spec" above for why this is two-fingered. A two-finger t
 
 - [ ] **Step 1: Write the failing tests**
 
-Add to `GestureInterpreterTest.kt`. Match the file's existing helpers for building a `TouchEvent`; the shapes below assume `TouchEvent(action, actionPointerId, pointers, eventTimeMs, zoomed)` as declared in `GestureInterpreter.kt:48-56`.
+Add to `GestureInterpreterTest.kt`, using the file's own `Fingers` DSL — `twoFingersDown`, `after`, `move`, `pointerUp`, `drain`, `p`, and the `FINGER_A`/`FINGER_B` constants. All 32 existing gesture tests use it; do not hand-roll `TouchEvent` construction.
+
+Only two tests are added. A third — "a quick two-finger tap is still a right-click, not a HUD toggle" — would be redundant: the existing `a quick still two-finger tap right-clicks at the first finger` (:262) asserts the **exact** effect list `[Motion, RightClick]`, which already fails if a toggle appears.
 
 ```kotlin
 @Test
 fun `two still fingers held past the tap timeout toggle the hud`() {
-    val down = TouchEvent(TouchAction.Down, 0, listOf(TouchPointer(0, 100f, 100f)), 0L, zoomed = false)
-    val first = GestureInterpreter.step(GestureState.Idle, down)
-    val second = GestureInterpreter.step(
-        first.state,
-        TouchEvent(
-            TouchAction.PointerDown, 1,
-            listOf(TouchPointer(0, 100f, 100f), TouchPointer(1, 200f, 100f)), 10L, zoomed = false,
-        ),
-    )
-    val lift = GestureInterpreter.step(
-        second.state,
-        TouchEvent(
-            TouchAction.PointerUp, 1,
-            listOf(TouchPointer(0, 100f, 100f), TouchPointer(1, 200f, 100f)),
-            10L + TAP_TIMEOUT_MS + 1, zoomed = false,
-        ),
-    )
-    assertTrue(lift.effects.contains(GestureEffect.ToggleHud), "expected a HUD toggle, got ${lift.effects}")
-    assertFalse(lift.effects.contains(GestureEffect.RightClick), "a long hold is not a right-click")
-}
+    val fingers = twoFingersDown(zoomed = false)
 
-@Test
-fun `a quick two-finger tap is still a right-click, not a hud toggle`() {
-    val down = TouchEvent(TouchAction.Down, 0, listOf(TouchPointer(0, 100f, 100f)), 0L, zoomed = false)
-    val first = GestureInterpreter.step(GestureState.Idle, down)
-    val second = GestureInterpreter.step(
-        first.state,
-        TouchEvent(
-            TouchAction.PointerDown, 1,
-            listOf(TouchPointer(0, 100f, 100f), TouchPointer(1, 200f, 100f)), 10L, zoomed = false,
-        ),
-    )
-    val lift = GestureInterpreter.step(
-        second.state,
-        TouchEvent(
-            TouchAction.PointerUp, 1,
-            listOf(TouchPointer(0, 100f, 100f), TouchPointer(1, 200f, 100f)), 100L, zoomed = false,
-        ),
-    )
-    assertTrue(lift.effects.contains(GestureEffect.RightClick))
-    assertFalse(lift.effects.contains(GestureEffect.ToggleHud))
+    fingers.after(TAP_TIMEOUT_MS + 1).pointerUp(FINGER_B, p(FINGER_A, 100f, 100f), p(FINGER_B, 300f, 100f))
+
+    assertEquals(listOf<GestureEffect>(GestureEffect.ToggleHud), fingers.drain())
+    assertSame(GestureState.Suppressed, fingers.state)
 }
 
 @Test
 fun `fingers that moved do not toggle the hud however long they were down`() {
-    val down = TouchEvent(TouchAction.Down, 0, listOf(TouchPointer(0, 100f, 100f)), 0L, zoomed = false)
-    val first = GestureInterpreter.step(GestureState.Idle, down)
-    var state = GestureInterpreter.step(
-        first.state,
-        TouchEvent(
-            TouchAction.PointerDown, 1,
-            listOf(TouchPointer(0, 100f, 100f), TouchPointer(1, 200f, 100f)), 10L, zoomed = false,
-        ),
-    ).state
-    // A clear drag, well past TAP_SLOP_PX.
-    state = GestureInterpreter.step(
-        state,
-        TouchEvent(
-            TouchAction.Move, 1,
-            listOf(TouchPointer(0, 300f, 100f), TouchPointer(1, 400f, 100f)), 200L, zoomed = false,
-        ),
-    ).state
-    val lift = GestureInterpreter.step(
-        state,
-        TouchEvent(
-            TouchAction.PointerUp, 1,
-            listOf(TouchPointer(0, 300f, 100f), TouchPointer(1, 400f, 100f)),
-            10L + TAP_TIMEOUT_MS + 1, zoomed = false,
-        ),
-    )
-    assertFalse(lift.effects.contains(GestureEffect.ToggleHud), "a drag is not a hold")
+    val fingers = twoFingersDown(zoomed = false)
+    fingers.move(p(FINGER_A, 150f, 130f), p(FINGER_B, 350f, 130f))
+    fingers.drain()
+
+    fingers.after(TAP_TIMEOUT_MS + 1).pointerUp(FINGER_A, p(FINGER_A, 150f, 130f), p(FINGER_B, 350f, 130f))
+
+    assertEquals(emptyList<GestureEffect>(), fingers.drain())
 }
 ```
+
+**The existing test at :272 is the boundary guard.** `a slow two-finger touch is
+not a right-click` holds for *exactly* `TAP_TIMEOUT_MS` and asserts no effects.
+The new condition is therefore strictly `held > TAP_TIMEOUT_MS` — strict on both
+sides, leaving the boundary instant inert. Do not "tidy" it to `>=`: that would
+silently rewrite a real existing assertion.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
