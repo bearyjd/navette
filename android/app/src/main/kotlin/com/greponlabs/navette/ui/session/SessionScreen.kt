@@ -405,6 +405,11 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
     private var surface: Surface? = null
     private var surfaceSize: Pair<Int, Int>? = null
 
+    // Bumped under `lock` by every startDecoder call. Window 2 refuses to
+    // publish for a superseded claim, so the NEWEST call wins rather than
+    // whichever happens to resume last -- see the check in startDecoder.
+    private var startGeneration: Long = 0
+
     // Tracked so each is cancelled before being replaced, matching
     // AppViewModel's connectionJob/refreshJob discipline: a StateFlow and a
     // Channel both outlive their producer, so a leaked collector here would
@@ -574,11 +579,26 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
      * picks it back up.
      */
     private fun startDecoder(stream: PrimaryStream) {
+        // Claim a generation before touching anything. A later call claims a
+        // higher one and both windows below stand down for the older claim,
+        // so the newest call wins rather than whichever resumes last. Without
+        // this, an older call resuming inside either window stops the newer
+        // decoder -- via the capture below, or via `superseded` -- and leaves
+        // the Surface showing a stale stream or nothing at all.
+        val generation = synchronized(lock) { ++startGeneration }
         // Window 1: stop the outgoing decoder before publishing a successor.
         // If both happened in one window, surfaceDestroyed could capture the
         // new instance -- which holds nothing yet -- and return while the
         // old codec was still live on the Surface.
-        val stopping = synchronized(lock) { decoder.also { decoder = null } }
+        val stopping =
+            synchronized(lock) {
+                // Stand down before touching `decoder` at all: a newer call
+                // may already have published and started its decoder, and
+                // capturing it here would stop it and leave the Surface with
+                // nothing until the next reconfigure.
+                if (generation != startGeneration) return
+                decoder.also { decoder = null }
+            }
         // Outside the lock: stop() calls MediaCodec.release(), and the
         // codec's callback thread may be blocked on this very lock inside
         // recordPresented.
@@ -595,9 +615,15 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
         // startDecoder published in the gap between the two windows --
         // without it that instance would be overwritten unstopped,
         // unreachable through the field, and leak its codec and
-        // HandlerThread.
+        // HandlerThread. The generation check below should make that
+        // unreachable -- every call that publishes held the highest claim, and
+        // a lower claim returns before publishing -- but it is kept because a
+        // future edit could break that invariant without anything noticing.
         val fresh =
             synchronized(lock) {
+                // A newer startDecoder has claimed the decoder; stand down
+                // rather than publish a stale stream over it.
+                if (generation != startGeneration) return
                 val target = surface ?: return
                 val instance = H264Decoder(target) { event -> created?.let { onDecoderEvent(it, event) } }
                 created = instance

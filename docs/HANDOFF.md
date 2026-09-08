@@ -2103,6 +2103,35 @@ tracked in is scratch and does not survive.
    its own `@Volatile`, not by `SessionController.lock`.
 7. **`SessionHud`'s zero-span `rate()` regression test pins `fps` but not
    `bitrateBps`**, though both go through the same function.
+8. **`startDecoder` last-writer-wins ordering race — found late, fixed, not
+   carried.** Listed here rather than silently closed because of how it was
+   found: an independent Codex review, run after this branch's own nine
+   reviews had all passed, spotted it. `startDecoder` is reachable from two
+   threads and has two lock windows with a gap between them; an older call
+   resuming inside either window would stop the newer decoder — via window
+   1's unconditional capture, or via window 2's `superseded` — and either
+   publish its own stale stream or leave the Surface with nothing until the
+   next reconfigure. Every call now claims a generation under `lock` before
+   touching anything, and both windows stand down for a superseded claim, so
+   the newest call wins rather than whichever resumes last. Both halves are
+   guarded; no residual window is known. Both checks sit inside existing lock
+   windows and move no boundary — the constraint that matters on this
+   function, where the two rounds that moved a boundary each traded one race
+   for another, and the two that only added a check inside an existing window
+   introduced nothing. The claim itself is a third, disjoint critical section:
+   a single `Long` increment, no call-out while held, no nesting with
+   `H264Decoder`'s own lock, and neither caller holds `lock` at the call site.
+   It also stops an older call from blanking `contentSize` after a newer
+   decoder has already reported its frame size — a second, smaller defect the
+   fix was not aimed at.
+
+   The `superseded` capture in window 2 is now provably unreachable (any call
+   that publishes held the highest claim, and a lower claim returns before
+   publishing) and is kept anyway, because a future edit could break that
+   invariant with nothing to notice. That redundancy is the argument for item
+   3 above rather than a defect on its own: confining `startDecoder` to one
+   thread would delete the generation counter and the `superseded` capture
+   both, and is still the shape this function wants.
 
 Two deliberate non-changes, so nobody "fixes" them later:
 
