@@ -244,6 +244,7 @@ impl InputState {
                 }
             }
             MediaInput::RequestKeyframe => {}
+            MediaInput::Ping { .. } => {}
         }
         Ok(())
     }
