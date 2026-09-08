@@ -1970,10 +1970,11 @@ tailnet at `100.111.143.67:9417`):**
 | fresh two-finger-long-press toggle | 21.3 | 24 | 27.0ms | 502ms | -- (stale pre-rebuild daemon, see below) | 0 | 3 |
 | idle, a few seconds later | 0.0 | 0 | 47.0ms | 5623ms | 34ms | 0 | 6 |
 | actively scrolling | 16.7 | 2746 | 29.0ms | 21ms | 63ms | 0 | 6 |
-| wifi dropped ~8s | 0.0 | 0 | -- | -- | -- (blank, not frozen) | 0 | 0 (fresh controller) |
-| wifi restored, auto-recovered | 0.0 | 0 | -- | -- | -- (mid-reconnect) | 0 | 0 |
+| wifi dropped ~8s (still blank a few seconds after wifi came back, too) | 0.0 | 0 | -- | -- | -- (blank, not frozen) | 0 | 0 (fresh controller) |
+| wifi restored, actually recovered | 0.0 | 0 | 58.0ms | 11556ms | 38ms | 0 | 2 |
 | after a forced live resize | 0.0 | 0 | 23.0ms | 15305ms | 33ms | 0 | 5 (+1, this resize) |
 | against the old (pre-ping) daemon | 0.0 | 0 | 22.0ms | 6366ms | -- (permanently blank) | 0 | 5 |
+| daemon swapped back to the new (ping-supporting) binary | 0.0 | 0 | 51.0ms | 14630ms | 43ms | 0 | 2 |
 
 `RTT` ranged 20-63ms across samples -- a plausible tailnet figure, never
 zero or blank during a healthy link. `DROP` read `0` within every
