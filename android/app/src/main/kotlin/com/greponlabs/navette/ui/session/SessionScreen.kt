@@ -553,28 +553,30 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
      * picks it back up.
      */
     private fun startDecoder(stream: PrimaryStream) {
+        // Stop the outgoing decoder before publishing a successor. If both
+        // happened in one window, surfaceDestroyed could capture the new
+        // instance -- which holds nothing yet -- and return while the old
+        // codec was still live on the Surface.
+        val stopping = synchronized(lock) { decoder.also { decoder = null } }
+        // Outside the lock: stop() calls MediaCodec.release(), and the
+        // codec's callback thread may be blocked on this very lock inside
+        // recordPresented.
+        stopping?.stop()
+
         // Captured by reference so the callback can name the instance it came
         // from. Without that, a failure raised by a decoder that has since
         // been replaced would tear down its successor instead. Nothing can
         // raise an event before the assignment below, because nothing has
         // called start() yet.
         var created: H264Decoder? = null
-        var stopping: H264Decoder? = null
         val fresh =
             synchronized(lock) {
                 val target = surface ?: return
-                stopping = decoder
                 val instance = H264Decoder(target) { event -> created?.let { onDecoderEvent(it, event) } }
                 created = instance
                 decoder = instance
                 instance
             }
-        // Outside the lock, same as stopDecoder: stop() calls
-        // MediaCodec.release(), and the codec's callback thread may be
-        // blocked on this very lock inside recordPresented. Run before
-        // fresh.start(stream) so the old and new codecs never both hold the
-        // Surface at once.
-        stopping?.stop()
         _state.update { it.copy(streamEnded = false, decodeError = null, contentSize = null) }
         // Started outside the lock. configure()+start() costs tens to hundreds
         // of milliseconds, and holding the lock across it would block
