@@ -1,8 +1,10 @@
 package com.greponlabs.navette.net
 
+import kotlinx.serialization.SerializationException
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -272,6 +274,34 @@ class MediaProtocolTest {
                 """{"type":"error","code":"invalid_input","message":"viewport out of range"}""",
             )
         assertEquals(MediaServerMessage.Error("invalid_input", "viewport out of range"), decoded)
+    }
+
+    @Test
+    fun `ping serialises exactly as the rust protocol expects`() {
+        val encoded = mediaJson.encodeToString(MediaInput.serializer(), MediaInput.Ping(42uL))
+        assertEquals("""{"type":"ping","nonce":42}""", encoded)
+    }
+
+    @Test
+    fun `a ping is always valid whatever its nonce`() {
+        assertNull(MediaInput.Ping(0uL).validate())
+        assertNull(MediaInput.Ping(ULong.MAX_VALUE).validate())
+    }
+
+    @Test
+    fun `pong parses from what navetted sends`() {
+        val decoded = mediaJson.decodeFromString(MediaServerMessage.serializer(), """{"type":"pong","nonce":7}""")
+        assertEquals(MediaServerMessage.Pong(7uL), decoded)
+    }
+
+    @Test
+    fun `an unknown server message is still rejected rather than guessed at`() {
+        // MediaClient.onMessage relies on this failing, not throwing past its
+        // runCatching -- it is what makes an old daemon's unknown reply a log
+        // line instead of a crash.
+        assertThrows(SerializationException::class.java) {
+            mediaJson.decodeFromString(MediaServerMessage.serializer(), """{"type":"nonsense"}""")
+        }
     }
 
     private fun writeUnsignedInt(bytes: ByteArray, offset: Int, value: Long) {
