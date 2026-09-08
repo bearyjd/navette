@@ -144,6 +144,9 @@ fun SessionScreen(
     // reconnect must not silently drop the user out of the on-screen
     // keyboard they had raised.
     var imeRaised by remember(host, sessionName) { mutableStateOf(false) }
+    // Keyed like imeRaised, not the nonce: a reconnect rebuild must not
+    // silently turn the HUD off while someone is watching it.
+    var hudVisible by remember(host, sessionName) { mutableStateOf(false) }
 
     LockLandscapeWhileAttached()
 
@@ -151,6 +154,8 @@ fun SessionScreen(
         controller.open()
         onDispose { controller.close() }
     }
+
+    LaunchedEffect(controller) { controller.onToggleHud = { hudVisible = !hudVisible } }
 
     // Re-asserts whichever focus target is correct, every time this effect
     // reruns (keyed on the controller, so every reconnect). Merely skipping
@@ -297,6 +302,8 @@ fun SessionScreen(
             imeRaised = imeRaised,
             onImeRaisedChange = { imeRaised = it },
         )
+
+        SessionHudOverlay(sample = state.hud, visible = hudVisible)
 
         SessionOverlay(
             state = state,
