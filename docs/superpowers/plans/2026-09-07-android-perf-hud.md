@@ -1323,6 +1323,11 @@ Against the `mvp` session on `100.111.143.67:9417` (see the handoff's "Environme
 5. Turn wifi off for ~8 seconds: `AGE` climbs while the reconnect runs, and `RTT` blanks rather than freezing at its last value.
 6. `DROP` reads 0 across an ordinary attach — the three-packet baseline is doing its job.
 7. Rotate/unfold to force a resize: `DISC` increments.
+8. **Enter and leave the session repeatedly (10+ times) while frames are flowing.**
+   This is the reproduction for the lock hazard fixed in Task 6's fix round: the
+   codec callback thread takes the controller lock once per frame, and teardown
+   used to hold that same lock across `MediaCodec.release()`. A hang or ANR on
+   leaving a session means the hoist regressed. It should be unremarkable.
 
 - [ ] **Step 4: Verify the old-daemon path, which is the one that is only reasoned about so far**
 
