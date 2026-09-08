@@ -74,6 +74,9 @@ import kotlinx.coroutines.launch
  */
 private const val RESIZE_DEBOUNCE_MS = 150L
 
+/** How often the HUD pings and republishes. One second, matching [HUD_WINDOW_MS]. */
+private const val HUD_SAMPLE_INTERVAL_MS: Long = 1000L
+
 /** What the screen renders. */
 internal data class SessionUiState(
     // Connecting, not Disconnected: the controller opens the socket from a
@@ -85,6 +88,8 @@ internal data class SessionUiState(
     val decodeError: String? = null,
     /** The size of the frame currently on the surface, or `null` before the first one. */
     val contentSize: Pair<Int, Int>? = null,
+    /** The latest metrics sample, or `null` before the first one. */
+    val hud: HudSample? = null,
 )
 
 /**
@@ -401,6 +406,13 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
     private var packetsJob: Job? = null
     private var resizeJob: Job? = null
 
+    // Confined to the packet loop's dispatcher and the decoder callback, the
+    // same two writers `decoder` already has -- so it takes `lock` for the
+    // same reason and in the same order.
+    private val hud = SessionHud()
+    private var hudJob: Job? = null
+    private var pingNonce: ULong = 0uL
+
     // Gesture state. All main-thread only: the touch listener, the surface
     // callbacks, and `scope` (Main.immediate) are the only writers. pressJob
     // must stay on that dispatcher -- moving it to Default would turn
@@ -468,6 +480,9 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
                     route(packet)
                 }
             }
+        // Installed before connect(), not after: connect() starts OkHttp's
+        // reader thread, and that thread is what delivers pongs.
+        client.onPong = { nonce -> synchronized(lock) { hud.recordPong(nonce, System.currentTimeMillis()) } }
         // connect() before the state collector, not after. The client's flow
         // starts at Disconnected; connect() moves it to Connecting
         // synchronously. Collecting first, on Main.immediate, would publish
@@ -479,6 +494,21 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
         connectionJob =
             scope.launch {
                 client.connectionState.collect { connection -> _state.update { it.copy(connection = connection) } }
+            }
+        hudJob?.cancel()
+        hudJob =
+            scope.launch {
+                while (true) {
+                    val nonce = ++pingNonce
+                    synchronized(lock) { hud.recordPing(nonce, System.currentTimeMillis()) }
+                    client.sendPing(nonce)
+                    // Sampling after the ping rather than before means the
+                    // reading on screen is at most one interval behind the
+                    // link, not two.
+                    delay(HUD_SAMPLE_INTERVAL_MS)
+                    val sample = synchronized(lock) { hud.sample(System.currentTimeMillis()) }
+                    _state.update { it.copy(hud = sample) }
+                }
             }
     }
 
@@ -492,6 +522,8 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
         resizeJob?.cancel()
         packetsJob?.cancel()
         connectionJob?.cancel()
+        hudJob?.cancel()
+        client.onPong = null
         stopDecoder(expected = null)
         synchronized(lock) { surface = null }
         client.close()
@@ -499,10 +531,14 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
     }
 
     private fun route(packet: MediaPacket) {
+        synchronized(lock) { hud.recordPacket(System.currentTimeMillis(), packet) }
         when (val event = gate.handle(packet)) {
             is StreamGateEvent.Bootstrap -> startDecoder(event.stream)
             is StreamGateEvent.Reconfigure -> startDecoder(event.stream)
-            is StreamGateEvent.Video -> synchronized(lock) { decoder }?.feed(event.accessUnit, event.timestampUs)
+            is StreamGateEvent.Video -> {
+                synchronized(lock) { hud.recordFed(event.timestampUs, System.currentTimeMillis()) }
+                synchronized(lock) { decoder }?.feed(event.accessUnit, event.timestampUs)
+            }
             StreamGateEvent.Ended -> _state.update { it.copy(streamEnded = true) }
             null -> Unit
         }
@@ -571,7 +607,8 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
                 if (!isCurrent(source)) return
                 _state.update { it.copy(contentSize = event.width to event.height, decodeError = null) }
             }
-            is DecoderEvent.Presented -> Unit
+            is DecoderEvent.Presented ->
+                synchronized(lock) { hud.recordPresented(event.timestampUs, System.currentTimeMillis()) }
             // Through requestKeyframe(), not sendInput(), so the decoder's
             // drops share the client's once-until-one-arrives gate rather than
             // asking per dropped access unit.

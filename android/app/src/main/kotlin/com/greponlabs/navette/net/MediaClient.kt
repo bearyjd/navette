@@ -317,6 +317,16 @@ class MediaClient(private val webSocketUrl: String) {
         }
     }
 
+    /** Sends one ping. The caller owns the nonce, so it can time the answer. */
+    fun sendPing(nonce: ULong) = sendInput(MediaInput.Ping(nonce))
+
+    /**
+     * Told about each pong, so a caller can time it against its own ping.
+     * Set before [connect]; called on OkHttp's reader thread.
+     */
+    @Volatile
+    var onPong: ((ULong) -> Unit)? = null
+
     private val listener =
         object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: OkHttpResponse) {
@@ -353,11 +363,17 @@ class MediaClient(private val webSocketUrl: String) {
 
             override fun onMessage(webSocket: WebSocket, text: String) {
                 // The bridge reports protocol problems as JSON text; they are
-                // informational and must not take the connection down.
+                // informational and must not take the connection down. An
+                // unparseable body includes an old daemon's reply to a message
+                // it does not know -- a ping, for one -- which is exactly why
+                // this logs rather than fails.
                 val reported =
                     runCatching { mediaJson.decodeFromString(MediaServerMessage.serializer(), text) }
                         .getOrNull()
-                Log.w(TAG, "media server reported: ${reported ?: text}")
+                when (reported) {
+                    is MediaServerMessage.Pong -> onPong?.invoke(reported.nonce)
+                    is MediaServerMessage.Error, null -> Log.w(TAG, "media server reported: ${reported ?: text}")
+                }
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: OkHttpResponse?) {
