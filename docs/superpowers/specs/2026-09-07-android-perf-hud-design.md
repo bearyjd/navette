@@ -114,12 +114,22 @@ has been sent is discarded, not attributed to the wrong send.
 
 ## Toggle
 
-Off by default. Long-press on the video toggles it — confirmed unclaimed:
-no long-press handling exists in `GestureInterpreter.kt` or
-`SessionScreen.kt`. Two-finger tap remains right-click, single tap remains
-left-click, and pinch remains zoom; long-press must not fire during a pinch
-or drag. Visible in release builds, because the interesting numbers come from
-a real link, not a debug one.
+Off by default, toggled by a **two-finger** long-press: both fingers still,
+held past `TAP_TIMEOUT_MS`, then lifted.
+
+Two-fingered rather than one because a one-finger long-press cannot work here.
+`GestureInterpreter` arms the left press at `PRESS_ARM_MS` (60ms) and the
+controller sends it, so a one-finger hold would click the guest before any
+long-press threshold elapsed; deferring the press to a long-press timeout
+would cost input latency on every tap to buy a debug affordance. A two-finger
+still hold is genuinely free — too slow to be the right-click tap, too still
+to be a pinch, so it currently produces no effect at all — and the second
+finger's arrival already cancels the left press, so nothing reaches the guest.
+
+Two-finger tap remains right-click, single tap remains left-click, pinch
+remains zoom; the toggle must not fire after a drag or a pinch. Visible in
+release builds, because the interesting numbers come from a real link, not a
+debug one.
 
 The toggle state is hoisted to `SessionScreen` and keyed the same way
 `imeRaised` and `ViewTransformHolder` are, so it survives a reconnect
