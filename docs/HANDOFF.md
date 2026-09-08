@@ -2058,3 +2058,60 @@ override or `pointer_location` debug setting left on the Pixel 10 Pro Fold;
 no daemons left on `9418`/`9419`; the throwaway `git worktree` and every
 scratch file it produced (registry snapshots, a copied `xwayland-xdg-shell`
 binary, stray runtime dirs) removed.
+
+### Known follow-ups from this branch
+
+Findings that were reviewed, judged non-blocking, and deliberately carried
+rather than fixed. Recorded here because the review workspace they were
+tracked in is scratch and does not survive.
+
+1. **`hudJob` pings and republishes forever once the reconnect retry budget
+   is spent.** `close()` never runs in that state, so the loop keeps sending a
+   1 Hz ping at a dead socket and republishing a sample whose `AGE` changes
+   every tick, so conflation never suppresses it. Battery and recomposition
+   cost behind a dead-session overlay; not a correctness defect. **This is the
+   next piece of work on the HUD.**
+2. **`SessionScreen.kt` is 918 lines against this project's 800-line
+   ceiling** (it was 827 before this branch). Extracting `SessionController`
+   is a larger change than the feature was and belongs on its own branch. The
+   largest thing still owed on this file.
+3. **`surfaceDestroyed` can return while a superseded decoder is still inside
+   `MediaCodec.release()`** on another thread. Bounded by one `stop()`, and
+   strictly better than what preceded it — hoisting teardown out of the
+   controller lock closed a per-frame contention window against `release()`.
+   No lock rearrangement inside `startDecoder` closes the residue; the real
+   fix is confining `startDecoder` to one thread so the packet loop and
+   `surfaceCreated` can never have two calls in flight, which would also
+   delete the `superseded` capture apparatus. That is a rewrite, not a patch.
+   12 on-device enter/leave cycles showed no hang, ANR or surface-abandon.
+4. **`SessionHudOverlay` has no `maxLines`/overflow bound** and `11.sp` scales
+   with the accessibility font setting. At ~2x scale the translucent ground
+   can sit under the keyboard-toggle button. Cosmetic only:
+   `Modifier.background()` registers no pointer-input node, so the button
+   stays tappable regardless. One-line fix when convenient.
+5. **Nothing pins that `sample()`'s global half survives a null `streamId`.**
+   The code is correct — `fps`, `decodeMs`, `ageMs` and `rttMs` are computed
+   outside the per-stream chain — but no test would notice if that stopped. A
+   future "blank everything when there is no stream" simplification would pass
+   all 195 tests while destroying the pre-bootstrap and post-`Ended`
+   diagnostic the overlay exists for: a healthy `RTT` beside a climbing `AGE`.
+   Costs one assertion on a sample already in hand.
+6. **`gate.primary` is read outside `lock` while the sample is taken inside
+   it.** A reconfigure landing in that window yields one sample whose
+   per-stream figures describe the outgoing stream, self-correcting on the
+   next tick. Not fixable by widening the lock — `StreamGate` is guarded by
+   its own `@Volatile`, not by `SessionController.lock`.
+7. **`SessionHud`'s zero-span `rate()` regression test pins `fps` but not
+   `bitrateBps`**, though both go through the same function.
+
+Two deliberate non-changes, so nobody "fixes" them later:
+
+- **`KBPS` counts payload bytes; the desktop viewer counts payload plus the
+  44-byte header** (`client.rs:342`). Under 1% at real bitrates. The Kotlin
+  matches this design's own metrics table, and changing it would make the
+  measured figures recorded above non-reproducible.
+- **The design spec contradicts itself about `KBPS`'s source** (its metrics
+  table says `payload_len`; its parity paragraph says "exactly as `hud.rs`").
+  Left as an honest artefact of the design pass rather than rewritten after
+  the fact; the truth lives in `android/README.md`'s Known limitations, which
+  is where anyone comparing the two clients will actually look.
