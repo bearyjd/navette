@@ -40,6 +40,16 @@ class SessionHudTest {
     }
 
     @Test
+    fun `a frame presented and sampled in the same millisecond reports no rate rather than a huge one`() {
+        val hud = SessionHud()
+        hud.recordPresented(timestampUs = 1L, nowMs = 1000L)
+        // Zero elapsed: there is no span to divide by. hud.rs returns 0.0 here
+        // (hud.rs:174-176) and a real clock hits this constantly, so dividing by
+        // a floored 1ms would put "FPS 1000.0" on the overlay.
+        assertEquals(0.0, hud.sample(1000L).fps, 0.0)
+    }
+
+    @Test
     fun `bitrate counts only video payload inside the window`() {
         val hud = SessionHud()
         hud.recordPacket(1000L, packet(sequence = 1, payload = 1000))

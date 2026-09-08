@@ -181,10 +181,19 @@ class SessionHud {
     /**
      * A rate over the window actually observed, not the nominal one: a stream
      * half a second old must not report half its true rate.
+     *
+     * Mirrors `hud.rs`'s `rate()` exactly: a zero-or-negative span reports
+     * `0.0` rather than dividing by a floored elapsed time. A real clock hits
+     * a zero-length span constantly -- a frame presented and sampled inside
+     * the same millisecond is routine, not exceptional -- so flooring the
+     * divisor to 1ms would flash a wildly inflated reading (e.g. "FPS
+     * 1000.0") on the overlay, and would diverge from the desktop client's
+     * FPS/KBPS, which the protocol treats as directly comparable.
      */
     private fun rate(total: Double, oldestMs: Long?, nowMs: Long): Double {
         if (oldestMs == null || total == 0.0) return 0.0
-        val elapsed = (nowMs - oldestMs).coerceAtLeast(1L)
+        val elapsed = nowMs - oldestMs
+        if (elapsed <= 0L) return 0.0
         return total * 1000.0 / elapsed.toDouble()
     }
 }
