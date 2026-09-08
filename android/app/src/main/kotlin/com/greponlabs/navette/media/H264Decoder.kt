@@ -18,6 +18,12 @@ sealed interface DecoderEvent {
     data class Configured(val width: Int, val height: Int) : DecoderEvent
 
     /**
+     * A decoded picture reached the surface. Carries the access unit's own
+     * timestamp so a HUD can pair it with the feed.
+     */
+    data class Presented(val timestampUs: Long) : DecoderEvent
+
+    /**
      * An access unit was dropped, so the frames that referenced it can no
      * longer decode. The caller must ask the bridge for a keyframe; nothing
      * else re-primes the picture before the encoder's own GOP cadence.
@@ -314,6 +320,7 @@ class H264Decoder(
                         sizeAwaitingPresentation.also { sizeAwaitingPresentation = null }
                     }
                 if (size != null) onEvent(DecoderEvent.Configured(size.first, size.second))
+                onEvent(DecoderEvent.Presented(info.presentationTimeUs))
             }
 
             override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {

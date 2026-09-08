@@ -571,6 +571,7 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
                 if (!isCurrent(source)) return
                 _state.update { it.copy(contentSize = event.width to event.height, decodeError = null) }
             }
+            is DecoderEvent.Presented -> Unit
             // Through requestKeyframe(), not sendInput(), so the decoder's
             // drops share the client's once-until-one-arrives gate rather than
             // asking per dropped access unit.
