@@ -164,10 +164,10 @@ once:
   - `DEC` (decode time) and `AGE` (time since the last decoded frame) moved
     independently of the above, staying live during idle periods.
   - `RTT` read a plausible tailnet figure (20-63ms across several samples)
-    and turned blank (`--`), not frozen or zero, the moment the media socket's
-    ping/pong stopped being answered -- both against a dropped link and
-    against a daemon that doesn't understand `ping` at all (see Known
-    limitations).
+    and turned blank (`--`), not frozen or zero, within about five seconds of
+    the media socket's ping/pong going unanswered (`RTT_STALE_MS`) -- both
+    against a dropped link and against a daemon that doesn't understand `ping`
+    at all (see Known limitations).
   - `DROP` read `0` within every controller's lifetime -- an ordinary attach,
     a resize, and after a reconnect. A real reconnect rebuilds the
     controller and resets every counter (`DISC` was seen going 6 → 0 → 2
@@ -251,6 +251,10 @@ hand, and that no stray click reaches the guest when a pinch starts.
   `MediaCodec` async round trip (submit to callback), where the desktop
   viewer's is a narrower decode-only measurement. Don't read them side by
   side as the same metric.
+- **The HUD's `KBPS` counts payload bytes; the desktop viewer's counts
+  payload plus the 44-byte media header** (`client.rs:342`). Under 1% at real
+  bitrates, so it changes no reading anyone acts on, but the two figures are
+  not byte-identical if you diff the clients.
 - **`RTT` is answered by `navetted`'s media socket task, not the bridge
   loop**, so it stays low even while the bridge loop itself is stalled or
   falling behind -- a healthy `RTT` next to a climbing `AGE` means exactly

@@ -36,7 +36,16 @@ private const val BASELINE_PACKETS: Long = 3
  */
 private const val PENDING_FEEDS = 16
 
-/** One stream's performance figures at a point in time. Nulls mean "no reading", never zero. */
+/**
+ * The HUD's figures at a point in time. Nulls mean "no reading", never zero.
+ *
+ * Two scopes in one line, which is deliberate. [droppedPackets],
+ * [discontinuities] and [bitrateBps] describe the one stream being rendered,
+ * because sequence numbering and payload are per-stream. [fps], [decodeMs],
+ * [ageMs] and [rttMs] are socket-wide: the first three are only ever fed for
+ * the adopted stream anyway, and the round trip is a property of the media
+ * socket, which carries no per-stream ping.
+ */
 data class HudSample(
     val fps: Double,
     val bitrateBps: Double,
@@ -70,6 +79,13 @@ fun HudSample.format(): String {
 /**
  * Accumulates one session's HUD inputs.
  *
+ * Split by scope, because the media socket carries every one of the guest's
+ * streams and only one of them is on the surface: the sequence, drop,
+ * discontinuity and byte counters are kept per stream and read back by
+ * [sample]'s `streamId`, while frames, decode time, frame age and the round
+ * trip stay socket-wide. See [HudSample] for why each field falls where it
+ * does.
+ *
  * Every figure is reconstructed from what the client already receives --
  * packet headers, decoder callbacks, and the pong answering a ping this class
  * was told about. Nothing here reads a clock: time arrives as a parameter, the
@@ -84,14 +100,27 @@ fun HudSample.format(): String {
  * on that external synchronization for safety.
  */
 class SessionHud {
-    private val frames = ArrayDeque<Long>()
-    private val videoBytes = ArrayDeque<Pair<Long, Int>>()
-    private val pendingFeeds = ArrayDeque<Pair<Long, Long>>()
+    /**
+     * The counters that only mean anything within one stream.
+     *
+     * Kept per stream for the same reason `hud.rs` keeps a `StreamHud` per
+     * stream (`session.rs:47`): sequence numbering is per-stream
+     * (`bridge.rs:1177-1181`) and the hub replays every stream to a new
+     * attachment (`media.rs:150-153`), so one shared sequence cursor reads
+     * each hop between two streams as a gap of thousands of packets.
+     */
+    private class StreamCounters {
+        val videoBytes = ArrayDeque<Pair<Long, Int>>()
+        var lastSequence: Long? = null
+        var packets: Long = 0
+        var droppedPackets: Long = 0
+        var discontinuities: Long = 0
+    }
 
-    private var lastSequence: Long? = null
-    private var packets: Long = 0
-    private var droppedPackets: Long = 0
-    private var discontinuities: Long = 0
+    private val streams = HashMap<Long, StreamCounters>()
+
+    private val frames = ArrayDeque<Long>()
+    private val pendingFeeds = ArrayDeque<Pair<Long, Long>>()
 
     private var decodeMs: Double? = null
     private var lastFrameAtMs: Long? = null
@@ -101,11 +130,19 @@ class SessionHud {
 
     /** Records one packet's wire cost, sequence position and discontinuity flag. */
     fun recordPacket(nowMs: Long, packet: MediaPacket) {
-        noteSequence(packet.header.sequence)
-        if (packet.header.flags.discontinuity) discontinuities++
+        val streamId = packet.header.streamId
+        // Mirrors the eviction at `session.rs:258`. Before getOrPut, so an
+        // ended stream is not immediately given fresh counters to leak.
+        if (packet.header.kind == MediaKind.STREAM_END) {
+            streams.remove(streamId)
+            return
+        }
+        val counters = streams.getOrPut(streamId) { StreamCounters() }
+        noteSequence(counters, packet.header.sequence)
+        if (packet.header.flags.discontinuity) counters.discontinuities = counters.discontinuities.saturatingInc()
         if (packet.header.kind == MediaKind.VIDEO) {
-            videoBytes.addLast(nowMs to packet.payload.size)
-            trimBytes(nowMs)
+            counters.videoBytes.addLast(nowMs to packet.payload.size)
+            trimBytes(counters, nowMs)
         }
     }
 
@@ -138,20 +175,29 @@ class SessionHud {
         rtt = (nowMs - sentAt) to nowMs
     }
 
-    /** Computes the current figures, discarding whatever has aged out. */
-    fun sample(nowMs: Long): HudSample {
+    /**
+     * Computes the current figures, discarding whatever has aged out.
+     *
+     * [streamId] is the stream actually on the surface -- `gate.primary`.
+     * `null`, or a stream with no counters, reports blanks for the per-stream
+     * half of [HudSample] rather than another stream's numbers; the
+     * socket-wide half is reported regardless.
+     */
+    fun sample(nowMs: Long, streamId: Long?): HudSample {
         trimFrames(nowMs)
-        trimBytes(nowMs)
-        val bits = videoBytes.sumOf { it.second.toDouble() * 8.0 }
+        val counters = streamId?.let { streams[it] }
+        counters?.let { trimBytes(it, nowMs) }
+        val videoBytes = counters?.videoBytes
+        val bits = videoBytes?.sumOf { it.second.toDouble() * 8.0 } ?: 0.0
         val liveRtt = rtt?.takeIf { nowMs - it.second <= RTT_STALE_MS }?.first
         return HudSample(
             fps = rate(frames.size.toDouble(), frames.firstOrNull(), nowMs),
-            bitrateBps = rate(bits, videoBytes.firstOrNull()?.first, nowMs),
+            bitrateBps = rate(bits, videoBytes?.firstOrNull()?.first, nowMs),
             decodeMs = decodeMs,
             ageMs = lastFrameAtMs?.let { nowMs - it },
             rttMs = liveRtt,
-            droppedPackets = droppedPackets,
-            discontinuities = discontinuities,
+            droppedPackets = counters?.droppedPackets ?: 0L,
+            discontinuities = counters?.discontinuities ?: 0L,
         )
     }
 
@@ -161,25 +207,28 @@ class SessionHud {
      * A sequence that does not advance is the hub replaying an older packet:
      * neither a drop nor a reason to rewind the baseline.
      */
-    private fun noteSequence(sequence: Long) {
-        val observed = packets
-        packets++
-        val last = lastSequence
+    private fun noteSequence(counters: StreamCounters, sequence: Long) {
+        val observed = counters.packets
+        counters.packets = counters.packets.saturatingInc()
+        val last = counters.lastSequence
         if (last == null) {
-            lastSequence = sequence
+            counters.lastSequence = sequence
             return
         }
         if (sequence <= last) return
-        if (observed >= BASELINE_PACKETS) droppedPackets += sequence - last - 1
-        lastSequence = sequence
+        if (observed >= BASELINE_PACKETS) {
+            counters.droppedPackets = counters.droppedPackets.saturatingAdd(sequence - last - 1)
+        }
+        counters.lastSequence = sequence
     }
 
     private fun trimFrames(nowMs: Long) {
         while (frames.isNotEmpty() && nowMs - frames.first() > HUD_WINDOW_MS) frames.removeFirst()
     }
 
-    private fun trimBytes(nowMs: Long) {
-        while (videoBytes.isNotEmpty() && nowMs - videoBytes.first().first > HUD_WINDOW_MS) videoBytes.removeFirst()
+    private fun trimBytes(counters: StreamCounters, nowMs: Long) {
+        val bytes = counters.videoBytes
+        while (bytes.isNotEmpty() && nowMs - bytes.first().first > HUD_WINDOW_MS) bytes.removeFirst()
     }
 
     /**
@@ -201,3 +250,13 @@ class SessionHud {
         return total * 1000.0 / elapsed.toDouble()
     }
 }
+
+/**
+ * `hud.rs` counts with `saturating_add`; Kotlin has no equivalent, and a
+ * 64-bit counter that did overflow would wrap negative and read as a HUD
+ * going backwards. Clamping to the previous value pins it instead. Correct
+ * only for a non-negative [delta], which is all these counters ever take.
+ */
+private fun Long.saturatingAdd(delta: Long): Long = (this + delta).coerceAtLeast(this)
+
+private fun Long.saturatingInc(): Long = saturatingAdd(1L)

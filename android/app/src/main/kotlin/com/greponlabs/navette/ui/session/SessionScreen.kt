@@ -519,7 +519,11 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
                     // reading on screen is at most one interval behind the
                     // link, not two.
                     delay(HUD_SAMPLE_INTERVAL_MS)
-                    val sample = synchronized(lock) { hud.sample(System.currentTimeMillis()) }
+                    // Read outside the lock: `gate.primary` is @Volatile, and
+                    // the per-stream figures must describe the stream on the
+                    // surface rather than whichever the socket last carried.
+                    val rendered = gate.primary?.streamId
+                    val sample = synchronized(lock) { hud.sample(System.currentTimeMillis(), rendered) }
                     _state.update { it.copy(hud = sample) }
                 }
             }
@@ -648,8 +652,13 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
                 if (!isCurrent(source)) return
                 _state.update { it.copy(contentSize = event.width to event.height, decodeError = null) }
             }
-            is DecoderEvent.Presented ->
+            // Same guard, same reason: a superseded decoder draining its last
+            // output buffers would otherwise put FPS/AGE/DEC readings on the
+            // overlay for a stream that is no longer on the surface.
+            is DecoderEvent.Presented -> {
+                if (!isCurrent(source)) return
                 synchronized(lock) { hud.recordPresented(event.timestampUs, System.currentTimeMillis()) }
+            }
             // Through requestKeyframe(), not sendInput(), so the decoder's
             // drops share the client's once-until-one-arrives gate rather than
             // asking per dropped access unit.

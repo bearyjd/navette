@@ -1953,7 +1953,7 @@ registry) hasn't been started.
 decode time, frame age, round-trip time, dropped packets, discontinuities),
 toggled by a two-finger long-press held past 250ms; repeating the gesture
 hides it. `crates/navette-protocol` grew a `MediaInput::Ping{nonce}` /
-`MediaPong{nonce}` pair, answered by a small task on `navetted`'s media
+`MediaServerMessage::Pong{nonce}` pair, answered by a small task on `navetted`'s media
 socket -- deliberately not routed through the bridge loop, so a stalled
 bridge doesn't also kill the one signal that would reveal the stall (`AGE`
 is the overlay's answer to that same gap: it stays live even when `RTT`

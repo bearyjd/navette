@@ -21,8 +21,8 @@ import androidx.compose.ui.unit.sp
  * proportional font makes a number that changes every second jitter sideways
  * and become much harder to read at a glance.
  *
- * Top-aligned: the bottom of this screen is where the IME and the gesture
- * surface live, and a HUD there would sit under the on-screen keyboard.
+ * Top-aligned: the bottom of this screen is where the IME comes up, and a HUD
+ * there would sit under the on-screen keyboard.
  */
 @Composable
 internal fun SessionHudOverlay(sample: HudSample?, visible: Boolean) {

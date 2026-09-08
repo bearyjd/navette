@@ -45,7 +45,7 @@ Phases map onto PRP milestones; each phase lists market-derived features added b
 
 ### Phase 1 — Phone attach (M2–M3) · "the demo"
 - Encoder bridge (VA-API H.264), Android drawer + session screen, resize-follows-viewport, reconnect UX.
-- *Market additions:* **performance HUD** (fps/bitrate/latency overlay, Parsec-style — invaluable for tuning and for credibility); **input completeness pass** (keyboard layouts, compose/IME basics, momentum scroll); **PIN on attach** option layered above tailnet auth (defense in depth for a phone that leaves the house).
+- *Market additions:* ~~performance HUD (fps/bitrate/latency overlay, Parsec-style — invaluable for tuning and for credibility)~~ **done** — `SessionHud` in `android/app/src/main/kotlin/com/greponlabs/navette/ui/session/SessionHud.kt`; **input completeness pass** (keyboard layouts, compose/IME basics, momentum scroll); **PIN on attach** option layered above tailnet auth (defense in depth for a phone that leaves the house).
 
 ### Phase 2 — Table stakes closure (M4) · "daily driver"
 - Cloud host recipe, multi-host registry, icons/thumbnails.

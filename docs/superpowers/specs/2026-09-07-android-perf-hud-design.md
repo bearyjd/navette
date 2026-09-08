@@ -92,8 +92,9 @@ deliberate boundary, not an unfinished half of this work.
 
 The media socket allows `MAX_INPUT_MESSAGES_PER_SECOND = 240` (`api.rs:28`);
 a 1 Hz ping is 0.4% of that budget, including during a drag. If a ping is
-nonetheless rate-limited, lost, or unanswered, the HUD shows no `RTT` sample
-for that second. It must never show an error state, a stale value presented
+nonetheless rate-limited, lost, or unanswered, the HUD holds the last reading
+for a few seconds and then shows no `RTT` sample at all (`RTT_STALE_MS`).
+It must never show an error state, a stale value presented
 as live, or an unbounded reading. A nonce that returns after its successor
 has been sent is discarded, not attributed to the wrong send.
 
