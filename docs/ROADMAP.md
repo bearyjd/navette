@@ -41,7 +41,7 @@ Phases map onto PRP milestones; each phase lists market-derived features added b
 
 ### Phase 0 — Core proof (PRP M0–M1) · "it works"
 - wprs adopt-vs-fork gate; supervisor, registry, XDG app index, stable WS API, CLI (`ls/run/attach/detach/kill`), Tailscale-first transport.
-- *Market additions:* **text clipboard sync** promoted into M1 (universal expectation, cheap over the control channel); session metadata for the drawer (icon, title, last-attached).
+- *Market additions:* session metadata for the drawer (icon, title, last-attached).
 
 ### Phase 1 — Phone attach (M2–M3) · "the demo"
 - Encoder bridge (VA-API H.264), Android drawer + session screen, resize-follows-viewport, reconnect UX.
@@ -49,7 +49,7 @@ Phases map onto PRP milestones; each phase lists market-derived features added b
 
 ### Phase 2 — Table stakes closure (M4) · "daily driver"
 - Cloud host recipe, multi-host registry, icons/thumbnails.
-- *Market additions:* **file transfer** (per-session drop target + `navette cp`, over the API channel — biggest gap vs. every camp-1 product); **image clipboard**; **wake-on-LAN** (`navette wake tower` — trivial, delightful for homelab); **software x264 fallback** for hosts without VA-API; **session thumbnails as live previews** in the drawer.
+- *Market additions:* **text clipboard sync** (moved from Phase 0 — the control-channel protocol exists on both sides today, `SetClipboard`/`GetClipboard` in `crates/navetted/src/api.rs`, but the daemon only echoes an in-memory `Mutex<Option<String>>` back to itself; it never reaches wprs, the guest, or the host's Wayland clipboard, and no Android UI calls it yet); **file transfer** (per-session drop target + `navette cp`, over the API channel — biggest gap vs. every camp-1 product); **image clipboard**; **wake-on-LAN** (`navette wake tower` — trivial, delightful for homelab); ~~software x264 fallback for hosts without VA-API~~ **done** — `EncoderBackend::Libx264` in `crates/navette-bridge/src/encoder.rs`; **session thumbnails as live previews** in the drawer.
 
 ### Phase 3 — Experience depth (M5) · "feels premium"
 - *From PRP:* audio (PipeWire → Opus), AV1/HEVC where hardware allows, upstream dmabuf contribution, desktop GUI drawer.

@@ -1946,3 +1946,114 @@ registry) hasn't been started.
 - `android/README.md` for the current Verified/Not-verified/Known-limitations
   split, kept in sync with every slice.
 - PR #17 on GitHub for the itemized commit-by-commit story and CI links.
+
+## Android performance HUD: landed and on-device-verified, one real environment bug found along the way (2026-09-08)
+
+**What landed.** A performance overlay on the session screen (fps, bitrate,
+decode time, frame age, round-trip time, dropped packets, discontinuities),
+toggled by a two-finger long-press held past 250ms; repeating the gesture
+hides it. `crates/navette-protocol` grew a `MediaInput::Ping{nonce}` /
+`MediaPong{nonce}` pair, answered by a small task on `navetted`'s media
+socket -- deliberately not routed through the bridge loop, so a stalled
+bridge doesn't also kill the one signal that would reveal the stall (`AGE`
+is the overlay's answer to that same gap: it stays live even when `RTT`
+can't see a bridge-loop problem). Full suites green going in: `cargo test
+--workspace` 182 passed / 1 pre-existing ignored; Android 188 passed (JUnit
+XML in `app/build/test-results/testDebugUnitTest/`, both suites run with
+`--rerun-tasks`).
+
+**Measured on-device (Pixel 10 Pro Fold, Android 17, `mvp` / Firefox, real
+tailnet at `100.111.143.67:9417`):**
+
+| condition | FPS | KBPS | DEC | AGE | RTT | DROP | DISC |
+|---|---|---|---|---|---|---|---|
+| fresh two-finger-long-press toggle | 21.3 | 24 | 27.0ms | 502ms | -- (stale pre-rebuild daemon, see below) | 0 | 3 |
+| idle, a few seconds later | 0.0 | 0 | 47.0ms | 5623ms | 34ms | 0 | 6 |
+| actively scrolling | 16.7 | 2746 | 29.0ms | 21ms | 63ms | 0 | 6 |
+| wifi dropped ~8s | 0.0 | 0 | -- | -- | -- (blank, not frozen) | 0 | 0 (fresh controller) |
+| wifi restored, auto-recovered | 0.0 | 0 | -- | -- | -- (mid-reconnect) | 0 | 0 |
+| after a forced live resize | 0.0 | 0 | 23.0ms | 15305ms | 33ms | 0 | 5 (+1, this resize) |
+| against the old (pre-ping) daemon | 0.0 | 0 | 22.0ms | 6366ms | -- (permanently blank) | 0 | 5 |
+
+`RTT` ranged 20-63ms across samples -- a plausible tailnet figure, never
+zero or blank during a healthy link. `DROP` read `0` within every
+controller's lifetime; a real reconnect rebuilds the controller and resets
+every counter (`DISC` was observed going 6 → 0 → 2 across one reconnect), so
+a post-reconnect `DROP 0` covers only the new attachment, not the whole
+session -- worth knowing before reading a single sample as a session-wide
+guarantee. A quick (<250ms) two-finger tap still opened the guest's own
+right-click context menu, confirmed precisely on a real Firefox link, so the
+new gesture didn't regress the existing one. A forced live resize incremented
+`DISC` by exactly one and nothing else.
+
+**12 real enter/leave cycles**, each confirmed by a fresh `H264Decoder:
+decoder started at ...` logcat line rather than by key-event count alone --
+worth stating plainly because a first pass at this check used a stale
+landscape coordinate for the drawer's `mvp` row against an idle guest,
+silently drifted off the app via a `KEYCODE_BACK` that landed on an unrelated
+foreground app (the same `com.ventouxlabs.bascule` app noted in "Environment,
+as left" below), and would have measured nothing while looking like a clean
+pass. Re-run with the drawer's actual bounds, a scroll before each cycle so
+frames were genuinely flowing, and the decoder-start count as the real
+evidence: 12 cycles, 12 decoder starts, no hang, no ANR, no surface-abandon
+warning, same process (`pidof`) throughout. This is the reproduction for the
+codec-callback/teardown lock hazard fixed earlier in this arc.
+
+**A real environment bug, found rather than assumed.** The `navetted`
+handed off as "already running" for this task turned out to be a stale
+release binary (`Sep 5 11:01`, predating this branch's ping-handler
+commits) -- its media socket answered every `ping` with `invalid_input:
+unknown variant \`ping\``, which is exactly the old-daemon symptom Step 4
+was supposed to go looking for deliberately, showing up by accident first.
+Rebuilding `navetted --release` from the branch tip and restarting it (same
+bind address, existing `mvp` registry entry reconciled cleanly against the
+still-running `wprsd` -- no session loss) fixed it; `RTT` went from
+permanently blank to a live 20ms immediately, with no app-side interaction
+needed, confirming the client's own reconnect/retry path handles a daemon
+restart as just another transient drop.
+
+**The two-finger gesture, driven for real, not deferred.** The known
+scratchpad `uinput` driver from earlier sessions was gone, so it was rebuilt
+from AOSP's `cmds/uinput` JSON schema (`register`/`inject`/`delay` over
+`adb shell uinput -`) rather than deferring the check to a human. The
+device's touch-coordinate transform was measured, not assumed: a raw touch
+at portrait-native `(x, y)` lands on the landscape-locked session screen at
+`(screenX, screenY) = (y, 1079 - x)`, confirmed with the `pointer_location`
+debug overlay before relying on it for the real gesture sequences. Every
+check in the brief that depends on multi-touch (long-press toggle both
+directions, quick-tap right-click, the resize/`DISC` check, the ten-plus
+enter/leave cycles) was driven this way and is not a deferred human-check.
+
+**Step 4 (old-daemon compatibility), done with one deliberate deviation from
+the brief.** `master`'s `navetted` (`390aaa9`, no ping handler) was built in
+a throwaway `git worktree` and pointed at the *same* already-running `mvp`
+session (via `--state-file` pointed at the real registry, default
+runtime-dir, so it reconciled against the live `wprsd` instead of spawning a
+new one) -- confirmed by the `invalid_input`/`unknown variant \`ping\`` log
+lines and the permanently-blank `RTT` row in the table above, with the
+session otherwise working normally (video decoded, `DROP` still `0`). The
+brief asked for this on a *different port*; the Android app's Connect screen
+has no port field and always appends the default `9417`
+(`net/NavetteClient.kt`'s `controlWebSocketUrl(host, port = 9417)`, and a
+combined `host:port` string is explicitly untrusted input there -- typing
+one produces `Invalid URL port: "9417:9417"`, not a working override), so
+there's no way to point the *Android app itself* at a non-default port
+without a code change. Ran the old daemon on `9417` instead, with the real
+(new) daemon stopped for the duration -- confirmed no double-supervision of
+`mvp` by checking `navette ls` showed exactly one entry throughout -- and
+swapped the new daemon back onto `9417` immediately after, confirming `RTT`
+resumed live (`43ms`) with no app-side interaction. Two side quests this
+uncovered, neither novel: `wprsd`'s own Xwayland spawn needs a config with
+`enable_xwayland: false` in this environment (same underlying gap the M2
+handoff already recorded -- XWayland spawn fails here) to avoid colliding
+with the already-running session's own Xwayland display, and a stray
+`navette-<name>`/`navette-<name>.lock` pair left in `/run/user/1000` by an
+aborted `wprsd` attempt will hang the *next* attempt at the exact same
+wayland-display name, silently, until removed.
+
+**Left as found:** `navetted` (new binary, ping handler included) and
+`wprsd` for `mvp` both running on `100.111.143.67:9417`; no `device_state`
+override or `pointer_location` debug setting left on the Pixel 10 Pro Fold;
+no daemons left on `9418`/`9419`; the throwaway `git worktree` and every
+scratch file it produced (registry snapshots, a copied `xwayland-xdg-shell`
+binary, stray runtime dirs) removed.
