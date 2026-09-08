@@ -165,7 +165,14 @@ async fn media_websocket_answers_a_ping_without_troubling_the_bridge() {
         .send(ClientMessage::Text(r#"{"type":"ping","nonce":99}"#.into()))
         .await
         .unwrap();
-    let pong = socket.next().await.unwrap().unwrap();
+    // Every wait here is bounded. An unbounded `socket.next()` for a reply
+    // that does not exist yet hangs the red step instead of failing it, and
+    // would hang all of CI on any future regression rather than reporting one.
+    let pong = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+        .await
+        .expect("timed out waiting for a pong -- the server did not answer the ping")
+        .unwrap()
+        .unwrap();
     assert_eq!(pong.to_text().unwrap(), r#"{"type":"pong","nonce":99}"#);
 
     // The bridge must never see a ping: it is answered at the socket, so a
@@ -176,8 +183,11 @@ async fn media_websocket_answers_a_ping_without_troubling_the_bridge() {
         .send(ClientMessage::Text(r#"{"type":"request_keyframe"}"#.into()))
         .await
         .unwrap();
+    let forwarded = tokio::time::timeout(std::time::Duration::from_secs(5), input.recv())
+        .await
+        .expect("timed out waiting for the forwarded request_keyframe");
     assert_eq!(
-        input.recv().await,
+        forwarded,
         Some(crate::media::MediaCommand::Input {
             attachment_id: 1,
             input: MediaInput::RequestKeyframe,
