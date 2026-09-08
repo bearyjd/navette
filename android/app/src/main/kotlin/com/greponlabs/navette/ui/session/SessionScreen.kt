@@ -527,8 +527,15 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
         connectionJob?.cancel()
         hudJob?.cancel()
         client.onPong = null
-        stopDecoder(expected = null)
+        // Clear the surface BEFORE stopping the decoder. Cancelling
+        // packetsJob above does not preempt a route() already inside
+        // startDecoder, and with the old order that call could publish a
+        // fresh decoder after stopDecoder had run -- leaking a codec and a
+        // HandlerThread onto a Surface being torn down. With surface nulled
+        // first, a racing publish bails at `surface ?: return`, and anything
+        // published before the swap is still caught by stopDecoder below.
         synchronized(lock) { surface = null }
+        stopDecoder(expected = null)
         client.close()
         scope.cancel()
     }
