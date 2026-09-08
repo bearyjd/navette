@@ -2059,6 +2059,61 @@ no daemons left on `9418`/`9419`; the throwaway `git worktree` and every
 scratch file it produced (registry snapshots, a copied `xwayland-xdg-shell`
 binary, stray runtime dirs) removed.
 
+### Multi-window guest, verified on device (2026-09-08)
+
+The one item the PR's test plan left unchecked. The per-stream counter fix
+(`e1a1716`) had seven unit tests but had never run against a guest with two
+toplevels — the exact case it was written for.
+
+**Setup.** `foot` launched on the `mvp` session's display
+(`WAYLAND_DISPLAY=navette-mvp`) printing a date once a second, alongside the
+existing Firefox window, giving two live streams. A dependency-free
+`websockets` probe read the media socket directly to confirm the shape before
+touching the phone:
+
+```
+DISTINCT STREAMS: 2
+  stream_id=1  seq 1467..1468  size=(2416, 1132)
+  stream_id=2  seq 1..68       size=(696, 496)
+SEQUENCE SPREAD between streams at attach: 1466
+```
+
+That spread is the quantity that used to corrupt `DROP`: pre-fix, a single
+counter was shared across streams, so every transition from the low-sequence
+stream to the high one added roughly that number.
+
+**The app confirmed it was in the contaminating configuration**, from logcat:
+
+```
+D H264Decoder: decoder started at 2416x1132
+I StreamGate: ignoring stream 2; this screen renders only the primary stream
+```
+
+Stream 2 is ignored for *rendering* but its packets still flow through
+`route()` into the HUD, which is precisely the path that was wrong.
+
+**Result — HUD read during active painting, both streams live:**
+
+```
+FPS 23.3  KBPS 3260  DEC 25.0MS  AGE 351MS  RTT 30MS  DROP 0  DISC 2
+```
+
+`DROP 0`, held across four samples over ~3 minutes. The two-finger long-press
+toggled the HUD, re-confirming that gesture on the cover display.
+
+**Two honest limits on this run.** `KBPS` reflecting *only* the sampled
+stream was not independently isolated — `foot`'s byte contribution was small
+relative to Firefox's and the two were not measured apart, so assertion 4 in
+`SessionHudTest` remains the only evidence for that column. And getting
+Firefox to repaint needed a tap through the app to give it keyboard focus
+first; `wtype` alone reached the compositor but not the window, which is why
+three earlier samples read `FPS 0.0` with `AGE` climbing — honest idle, not a
+HUD fault.
+
+**Environment restored**: `foot` killed, back to one stream, `navetted` and
+`wprsd` still running for `mvp`, app force-stopped, no debug settings or
+`device_state` override left on the phone.
+
 ### Known follow-ups from this branch
 
 Findings that were reviewed, judged non-blocking, and deliberately carried
