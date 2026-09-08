@@ -1336,6 +1336,16 @@ Add the HUD to Verified, with the gesture and the field meanings; add to Known l
 
 Add to `docs/HANDOFF.md` a section recording: what landed, the measured on-device figures from Step 3, the old-daemon result from Step 4, and the two-finger deviation and why.
 
+- [ ] **Step 6b: Correct two mis-tracked items in `docs/ROADMAP.md`**
+
+Found while scoping Phase 2; both are wrong in the doc today and were confirmed against the code.
+
+**Text clipboard sync is NOT delivered**, though §3 Phase 0 lists it as "promoted into M1". `crates/navetted/src/api.rs:35` holds `clipboard: Arc<Mutex<Option<String>>>`; `SetClipboard` writes that string and `GetClipboard` reads it back. It never reaches wprs, the guest, or the host's Wayland clipboard, and `clipboard_round_trip` asserts only the echo. No Android UI calls it at all. Move it out of Phase 0's delivered list and into Phase 2, noting that the control-channel protocol exists on both sides and only the actual sync and the client UI are missing.
+
+**Software x264 fallback IS delivered**, though §3 Phase 2 lists it as an unstarted market addition. `EncoderBackend::Libx264` in `crates/navette-bridge/src/encoder.rs` runs `-preset ultrafast -tune zerolatency -bf 0`. Mark it done.
+
+Do not restructure the roadmap beyond these two corrections.
+
 - [ ] **Step 7: Commit**
 
 ```bash
