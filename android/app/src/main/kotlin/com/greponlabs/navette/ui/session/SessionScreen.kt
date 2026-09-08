@@ -406,9 +406,12 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
     private var packetsJob: Job? = null
     private var resizeJob: Job? = null
 
-    // Confined to the packet loop's dispatcher and the decoder callback, the
-    // same two writers `decoder` already has -- so it takes `lock` for the
-    // same reason and in the same order.
+    // Reached from four threads: the packet loop (Dispatchers.Default) via
+    // recordPacket/recordFed, the codec's own callback thread via
+    // recordPresented, hudJob (Main.immediate) via recordPing/sample, and
+    // OkHttp's reader thread via onPong's recordPong. SessionHud is not
+    // thread-safe, so every access takes `lock` -- the same lock `decoder`
+    // uses, in the same order.
     private val hud = SessionHud()
     private var hudJob: Job? = null
     private var pingNonce: ULong = 0uL
@@ -556,15 +559,22 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
         // raise an event before the assignment below, because nothing has
         // called start() yet.
         var created: H264Decoder? = null
+        var stopping: H264Decoder? = null
         val fresh =
             synchronized(lock) {
                 val target = surface ?: return
-                decoder?.stop()
+                stopping = decoder
                 val instance = H264Decoder(target) { event -> created?.let { onDecoderEvent(it, event) } }
                 created = instance
                 decoder = instance
                 instance
             }
+        // Outside the lock, same as stopDecoder: stop() calls
+        // MediaCodec.release(), and the codec's callback thread may be
+        // blocked on this very lock inside recordPresented. Run before
+        // fresh.start(stream) so the old and new codecs never both hold the
+        // Surface at once.
+        stopping?.stop()
         _state.update { it.copy(streamEnded = false, decodeError = null, contentSize = null) }
         // Started outside the lock. configure()+start() costs tens to hundreds
         // of milliseconds, and holding the lock across it would block
@@ -584,11 +594,15 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
      * case this code exists for, not a corner.
      */
     private fun stopDecoder(expected: H264Decoder?) {
-        synchronized(lock) {
-            if (expected != null && decoder !== expected) return
-            decoder?.stop()
-            decoder = null
-        }
+        val stopping =
+            synchronized(lock) {
+                if (expected != null && decoder !== expected) return
+                decoder.also { decoder = null }
+            }
+        // Outside the lock: stop() calls MediaCodec.release(), and the
+        // codec's callback thread may be blocked on this very lock inside
+        // recordPresented.
+        stopping?.stop()
     }
 
     /**
@@ -651,19 +665,21 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
              * Must finish before returning: a Surface released under a running
              * codec throws.
              *
-             * This can block on [lock] while the packet loop is starting a
-             * codec, which costs tens to hundreds of milliseconds on the main
-             * thread. That is the accepted trade -- a brief stall on leaving
-             * the screen beats rendering into a released Surface -- and rapid
-             * session entry and exit is where it would show, so it is on the
-             * on-device checklist.
+             * The wait this incurs is `stop()`'s own `MediaCodec.release()`,
+             * called outside [lock] as everywhere else in this file -- not
+             * lock contention, since every section that holds [lock] is now a
+             * brief field read or write. That is the accepted trade -- a
+             * brief stall on leaving the screen beats rendering into a
+             * released Surface -- and rapid session entry and exit is where
+             * it would show, so it is on the on-device checklist.
              */
             override fun surfaceDestroyed(holder: SurfaceHolder) {
-                synchronized(lock) {
-                    decoder?.stop()
-                    decoder = null
-                    surface = null
-                }
+                val stopping =
+                    synchronized(lock) {
+                        surface = null
+                        decoder.also { decoder = null }
+                    }
+                stopping?.stop()
             }
         }
 

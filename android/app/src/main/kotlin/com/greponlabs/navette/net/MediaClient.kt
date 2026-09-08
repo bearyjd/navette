@@ -60,9 +60,12 @@ internal fun packetBudgetKib(packet: MediaPacket, budgetKib: Int): Int {
  * user re-attaches from the drawer.
  *
  * **Thread-confined, not thread-safe**, on the same terms as [NavetteClient]:
- * [connect] and [close] belong to a single dispatcher. [sendInput] is the one
- * exception and is safe from any thread, because it only touches OkHttp's own
- * thread-safe [WebSocket.send].
+ * [connect] and [close] belong to a single dispatcher. [sendInput] -- and
+ * [sendPing], which is built on it -- is the exception and is safe from any
+ * thread, because it only touches OkHttp's own thread-safe [WebSocket.send].
+ * [onPong] is different again: it is set from the connecting dispatcher
+ * before [connect] but invoked on OkHttp's reader thread, so whatever it does
+ * must itself be safe to run there.
  */
 class MediaClient(private val webSocketUrl: String) {
     private val httpClient =
@@ -73,9 +76,14 @@ class MediaClient(private val webSocketUrl: String) {
             // not close the TCP socket, and nothing else here would detect it.
             // The session screen retries on that failure, so a shorter interval
             // is what turns a frozen picture into a "Reconnecting..." within
-            // seconds. Pongs are answered on OkHttp's own I/O thread, not the
-            // main thread, so app jank cannot cause a false timeout; only a
-            // genuine [PING_INTERVAL_SECONDS]-long network stall can.
+            // seconds. OkHttp answers its own pings on this same reader
+            // thread, which also runs onMessage -- and onMessage's onPong
+            // hook now takes a lock shared with the main thread. That wait is
+            // bounded by whatever section of [SessionController] holds the
+            // lock, and every one of those is a brief field read or write,
+            // never a codec teardown -- so a false timeout still tracks a
+            // genuine [PING_INTERVAL_SECONDS]-long network stall, not
+            // main-thread jank or a MediaCodec.release().
             .pingInterval(PING_INTERVAL_SECONDS, TimeUnit.SECONDS)
             .build()
 

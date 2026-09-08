@@ -76,8 +76,12 @@ fun HudSample.format(): String {
  * same discipline `crates/navette-viewer/src/hud.rs` keeps, so the rolling
  * windows are asserted against a scripted clock in a plain JVM test.
  *
- * **Not thread-safe.** The caller confines it to one thread, exactly as
- * `SessionController` confines its gesture state.
+ * **Not thread-safe.** `SessionController` reaches this from four threads --
+ * the packet loop (`Dispatchers.Default`), the `MediaCodec` callback thread,
+ * `hudJob` (`Main.immediate`), and OkHttp's reader thread via `onPong` -- and
+ * guards every access with its own lock. Unlike the controller's gesture
+ * state, which really is confined to one thread, this class depends entirely
+ * on that external synchronization for safety.
  */
 class SessionHud {
     private val frames = ArrayDeque<Long>()
