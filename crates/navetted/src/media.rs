@@ -3,12 +3,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
-use navette_protocol::media::{MediaInput, MediaKind, MediaPacket};
+use navette_protocol::media::{MediaInput, MediaKind, MediaPacket, MediaServerMessage};
 use thiserror::Error;
 use tokio::sync::{Notify, mpsc};
 
 const DEFAULT_CLIENT_QUEUE_CAPACITY: usize = 8;
 const INPUT_QUEUE_CAPACITY: usize = 256;
+/// Server messages are small, rare, and order-sensitive only in that the
+/// newest clipboard value wins. A backlog means the socket is not
+/// draining, so the oldest is dropped rather than the newest.
+const MESSAGE_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Clone)]
 pub struct MediaHub {
@@ -234,6 +238,21 @@ impl MediaHub {
         Ok(stats)
     }
 
+    /// Fan a server message out to every client attached to `session`.
+    /// Unlike `publish`, this is infallible and silent: a clipboard push
+    /// to a session nobody is watching is a no-op, not an error.
+    pub fn publish_message(&self, session: &str, message: MediaServerMessage) {
+        let Ok(state) = self.inner.lock() else {
+            return;
+        };
+        let Some(session_state) = state.sessions.get(session) else {
+            return;
+        };
+        for queue in session_state.clients.values() {
+            queue.push_message(message.clone());
+        }
+    }
+
     pub fn active_clients(&self, session: &str) -> usize {
         self.inner
             .lock()
@@ -253,6 +272,10 @@ pub struct MediaAttachment {
 impl MediaAttachment {
     pub async fn recv(&self) -> Option<Arc<MediaPacket>> {
         self.queue.recv().await
+    }
+
+    pub async fn recv_message(&self) -> Option<MediaServerMessage> {
+        self.queue.recv_message().await
     }
 
     pub fn submit_input(&self, input: MediaInput) -> Result<(), MediaHubError> {
@@ -298,6 +321,7 @@ impl Drop for MediaAttachment {
 struct ClientQueue {
     state: Mutex<ClientQueueState>,
     notify: Notify,
+    message_notify: Notify,
     capacity: usize,
 }
 
@@ -305,6 +329,7 @@ struct ClientQueue {
 struct ClientQueueState {
     packets: VecDeque<Arc<MediaPacket>>,
     needs_keyframe: HashSet<u64>,
+    messages: VecDeque<MediaServerMessage>,
     closed: bool,
 }
 
@@ -319,6 +344,7 @@ impl ClientQueue {
         Self {
             state: Mutex::new(ClientQueueState::default()),
             notify: Notify::new(),
+            message_notify: Notify::new(),
             capacity,
         }
     }
@@ -384,11 +410,41 @@ impl ClientQueue {
         }
     }
 
+    fn push_message(&self, message: MediaServerMessage) {
+        let mut state = self.state.lock().expect("media queue lock poisoned");
+        if state.closed {
+            return;
+        }
+        while state.messages.len() >= MESSAGE_QUEUE_CAPACITY {
+            state.messages.pop_front();
+        }
+        state.messages.push_back(message);
+        drop(state);
+        self.message_notify.notify_one();
+    }
+
+    async fn recv_message(&self) -> Option<MediaServerMessage> {
+        loop {
+            let notified = self.message_notify.notified();
+            {
+                let mut state = self.state.lock().expect("media queue lock poisoned");
+                if let Some(message) = state.messages.pop_front() {
+                    return Some(message);
+                }
+                if state.closed {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+
     fn close(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.closed = true;
         }
         self.notify.notify_waiters();
+        self.message_notify.notify_waiters();
     }
 }
 
@@ -582,6 +638,82 @@ mod tests {
                 .await
                 .is_err(),
             "the replay must end with the live stream's keyframe"
+        );
+    }
+
+    #[tokio::test]
+    async fn published_messages_reach_every_attached_client() {
+        let hub = MediaHub::default();
+        // register_session returns the command receiver; it must stay alive
+        // for the session to remain registered.
+        let _input = hub.register_session("one");
+        let first = hub.attach("one").unwrap();
+        let second = hub.attach("one").unwrap();
+
+        hub.publish_message(
+            "one",
+            MediaServerMessage::Clipboard {
+                text: "hello".into(),
+            },
+        );
+
+        assert_eq!(
+            first.recv_message().await,
+            Some(MediaServerMessage::Clipboard {
+                text: "hello".into()
+            })
+        );
+        assert_eq!(
+            second.recv_message().await,
+            Some(MediaServerMessage::Clipboard {
+                text: "hello".into()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn messages_do_not_disturb_the_packet_queue() {
+        let hub = MediaHub::default();
+        let _input = hub.register_session("one");
+        let client = hub.attach("one").unwrap();
+
+        hub.publish_message(
+            "one",
+            MediaServerMessage::Clipboard {
+                text: "hello".into(),
+            },
+        );
+
+        // The packet queue must still be empty and must not have been woken.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), client.recv())
+                .await
+                .is_err(),
+            "a server message must not wake the packet queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn message_queue_drops_oldest_when_saturated() {
+        let hub = MediaHub::default();
+        let _input = hub.register_session("one");
+        let client = hub.attach("one").unwrap();
+
+        for index in 0..MESSAGE_QUEUE_CAPACITY + 1 {
+            hub.publish_message(
+                "one",
+                MediaServerMessage::Clipboard {
+                    text: format!("value-{index}"),
+                },
+            );
+        }
+
+        // The very first value is gone; the second is now at the head.
+        assert_eq!(
+            client.recv_message().await,
+            Some(MediaServerMessage::Clipboard {
+                text: "value-1".into()
+            })
         );
     }
 

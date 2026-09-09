@@ -245,6 +245,12 @@ impl InputState {
             }
             MediaInput::RequestKeyframe => {}
             MediaInput::Ping { .. } => {}
+            // Clipboard is intercepted in navetted's bridge loop before
+            // `InputState::apply` is reached (Task 6), so this arm is
+            // unreachable at runtime. It exists to keep the match
+            // exhaustive: that exhaustiveness is exactly what surfaced
+            // this build break, and a catch-all would have hidden it.
+            MediaInput::SetClipboard { .. } => {}
         }
         Ok(())
     }
