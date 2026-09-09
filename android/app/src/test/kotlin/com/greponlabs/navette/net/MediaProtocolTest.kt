@@ -1,6 +1,7 @@
 package com.greponlabs.navette.net
 
 import kotlinx.serialization.SerializationException
+import kotlinx.serialization.json.Json
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -309,5 +310,28 @@ class MediaProtocolTest {
         bytes[offset + 1] = (value ushr 16 and 0xFF).toByte()
         bytes[offset + 2] = (value ushr 8 and 0xFF).toByte()
         bytes[offset + 3] = (value and 0xFF).toByte()
+    }
+
+    @Test
+    fun setClipboardEncodesToWire() {
+        val encoded = Json.encodeToString(
+            MediaInput.serializer(),
+            MediaInput.SetClipboard("hello"),
+        )
+        assertEquals("""{"type":"set_clipboard","text":"hello"}""", encoded)
+    }
+
+    @Test
+    fun clipboardServerMessageDecodesFromWire() {
+        val decoded = Json.decodeFromString(
+            MediaServerMessage.serializer(),
+            """{"type":"clipboard","text":"hello"}""",
+        )
+        assertEquals(MediaServerMessage.Clipboard("hello"), decoded)
+    }
+
+    @Test
+    fun setClipboardPassesValidation() {
+        assertNull(MediaInput.SetClipboard("hello").validate())
     }
 }

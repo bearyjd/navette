@@ -380,6 +380,7 @@ class MediaClient(private val webSocketUrl: String) {
                         .getOrNull()
                 when (reported) {
                     is MediaServerMessage.Pong -> onPong?.invoke(reported.nonce)
+                    is MediaServerMessage.Clipboard -> {} // Clipboard handling is implemented in later tasks
                     is MediaServerMessage.Error, null -> Log.w(TAG, "media server reported: ${reported ?: text}")
                 }
             }
