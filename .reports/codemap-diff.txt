@@ -1,0 +1,51 @@
+CODEMAP SCAN — 2026-09-08
+=========================
+First generation. No previous codemaps existed at docs/CODEMAPS/ or
+.reports/codemaps/, so there is no diff to compute and no >30% approval gate
+to apply.
+
+SCOPE
+  33 Rust source files across 5 workspace crates (17,409 lines)
+  23 Kotlin source files (Android app)
+  Generated: architecture.md, backend.md, frontend.md, data.md, dependencies.md
+
+CRATE SIZES
+  navette-viewer    13 files   6,209 lines
+  navetted           9 files   5,780 lines
+  navette-bridge     7 files   4,037 lines
+  navette-protocol   2 files     844 lines
+  navette-cli        2 files     539 lines
+
+NO DATABASE
+  This project has no SQL store, ORM, or migrations. data.md documents the
+  three things that actually hold state instead: the 44-byte binary media
+  header, the JSON control/input messages, and a newline-delimited registry
+  file. Recorded explicitly so a future scan does not read the absence as a
+  gap in the codemaps.
+
+DEPENDENCY NOTES
+  wprs   — FORK pin, github.com/bearyjd/wprs rev 5763d746
+  minifb — UPSTREAM pin, github.com/emoon/rust_minifb rev 3a711add
+           (the fork was dropped once the Wayland keysym fix merged upstream)
+  No cloud services, third-party APIs, telemetry, or auth providers.
+  Transport is a tailnet with no TLS termination or gateway in the path.
+
+ARCHITECTURE NOTE WORTH CARRYING
+  navette-bridge is a LIBRARY, not a process. navetted links it and owns the
+  calloop event loop, so there is no IPC hop between them. This is easy to
+  misread from the crate names alone and it changes where code can live: for
+  example clipboard handling cannot go in scene.rs, because scene.apply()
+  returns events and holds no transport.
+
+IN-FLIGHT WORK AT SCAN TIME
+  Branch feat/clipboard-sync, 5 of 9 planned tasks committed, task 6 running.
+  Two items in these codemaps describe state that is about to change:
+    - backend.md marks control-socket SetClipboard/GetClipboard as
+      "[being removed]" — task 7 deletes that surface. Nothing sends it;
+      navette-cli holds only an exhaustive-match render arm.
+    - data.md's MediaInput list already includes set_clipboard (landed) but
+      the Android clipboard UI does not exist yet (task 8).
+  Re-run this command after the branch merges.
+
+STALENESS
+  No documents are stale; all five were generated in this pass.

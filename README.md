@@ -6,8 +6,8 @@ put on a host as named, persistent sessions; the Navette shuttle carries
 your window to whatever device you're holding — a Linux desktop as a real
 native Wayland window, a phone over a decoded video stream.
 
-Org: Grepon Labs LLC · License: AGPL-3.0-only · Status: experimental M1
-host daemon and Linux CLI.
+Org: Grepon Labs LLC · License: AGPL-3.0-only · Status: experimental — M1
+host daemon and Linux CLI, M2 encoder bridge, M3 Android client.
 
 ## Project layout
 
@@ -15,12 +15,17 @@ host daemon and Linux CLI.
 - `crates/navette-cli` — CLI / desktop client
 - `crates/navette-bridge` — in-process wprs client role (encoder bridge)
 - `crates/navette-protocol` — shared Navette API types
-- `android/` — Navette Android client (not started; see M3 in the roadmap)
+- `crates/navette-viewer` — Linux viewer client
+- `android/` — Navette Android client (Compose; drawer, session screen, perf HUD)
 
 ## Docs
 
-- [`docs/prp/startup.md`](docs/prp/startup.md) — product requirements & plan
+- [`docs/CODEMAPS/`](docs/CODEMAPS/) — architecture maps, read these first
+- [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) — setup, commands, test gates
+- [`docs/RUNBOOK.md`](docs/RUNBOOK.md) — running, diagnosing, rolling back
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — feature roadmap
+- [`docs/HANDOFF.md`](docs/HANDOFF.md) — running engineering log
+- [`docs/prp/PRP-plan.md`](docs/prp/PRP-plan.md) — product requirements & plan
 - [`docs/superpowers/specs/`](docs/superpowers/specs/) — design specs
 - [`docs/superpowers/plans/`](docs/superpowers/plans/) — implementation plans
 
