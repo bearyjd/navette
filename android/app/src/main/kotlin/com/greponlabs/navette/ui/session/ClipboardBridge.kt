@@ -1,7 +1,31 @@
 package com.greponlabs.navette.ui.session
 
-/** Mirrors the daemon's cap. UTF-8 bytes, not characters. */
-const val MAX_CLIPBOARD_BYTES: Int = 1024 * 1024
+import com.greponlabs.navette.net.MediaInput
+import com.greponlabs.navette.net.mediaJson
+
+/**
+ * Mirrors the daemon's *graceful* per-message limit -- `MAX_INPUT_MESSAGE`
+ * in `crates/navette-protocol/src/media.rs:10` -- not the harder cap the
+ * WebSocket transport itself enforces (`api.rs:127`,
+ * `MAX_INPUT_MESSAGE * 2` = 32 KiB). Above that harder cap, tungstenite
+ * fails the frame on the read path before the daemon's own graceful
+ * "input message exceeds..." handler ever runs, tearing the whole media
+ * socket down -- confirmed on-device: video drops, the client reconnects.
+ * Staying at or under this 16 KiB figure keeps every clipboard send inside
+ * the band the daemon refuses cleanly instead.
+ */
+const val MAX_INPUT_MESSAGE_BYTES: Int = 16 * 1024
+
+/**
+ * The size that actually crosses the wire for [text], not its raw UTF-8
+ * byte count. JSON escaping inflates quotes and backslashes 2x and control
+ * characters 6x (`\uXXXX`), so a 6 KiB clipboard of the wrong bytes could
+ * still clear [MAX_INPUT_MESSAGE_BYTES] under a raw-length guard -- this
+ * measures the actual encoded frame instead, the same encoding
+ * `MediaClient.sendInput` performs when it actually sends.
+ */
+private fun encodedClipboardFrameBytes(text: String): Int =
+    mediaJson.encodeToString(MediaInput.serializer(), MediaInput.SetClipboard(text)).toByteArray(Charsets.UTF_8).size
 
 /**
  * Decides what to do with a clipboard change, and touches no Android
@@ -20,8 +44,10 @@ class ClipboardBridge {
     private var echoFromLocal: String? = null
 
     /**
-     * The last value we sent, so a resume read of unchanged content does
-     * not resend it.
+     * The last value actually confirmed sent, so a resume read of unchanged
+     * content does not resend it. Set only by [markSent], once delivery is
+     * confirmed -- never by the decision methods themselves, which merely
+     * decide a send is warranted and may still fail or be retried.
      */
     private var lastSent: String? = null
 
@@ -46,7 +72,7 @@ class ClipboardBridge {
     /** A local clipboard change from the listener firing. Returns the text to send, or null. */
     fun onLocalClipboard(text: String): String? {
         if (text.isEmpty()) return null
-        if (text.toByteArray(Charsets.UTF_8).size > MAX_CLIPBOARD_BYTES) return null
+        if (encodedClipboardFrameBytes(text) > MAX_INPUT_MESSAGE_BYTES) return null
 
         if (echoFromLocal == text) {
             echoFromLocal = null
@@ -54,7 +80,15 @@ class ClipboardBridge {
         }
         if (lastSent == text) return null
 
-        lastSent = text
+        // A genuine send is being decided here, not merely attempted: the
+        // phone's clipboard has moved past whatever the daemon last pushed
+        // (this text is neither that echo nor the last confirmed send), so
+        // a later resume must stop comparing against that stale push. Left
+        // set, [onLocalClipboardResume] would keep this exact text from
+        // ever reaching the guest again once the phone's clipboard cycles
+        // back around to it after an intervening remote push moved
+        // `phone_text` on beyond it.
+        lastRemote = null
         return text
     }
 
@@ -69,6 +103,28 @@ class ClipboardBridge {
     fun onLocalClipboardResume(text: String): String? {
         if (text == lastRemote) return null
         return onLocalClipboard(text)
+    }
+
+    /**
+     * Commits [text] as sent. Called only once delivery is actually
+     * confirmed -- not from [onLocalClipboard]/[onLocalClipboardResume]
+     * themselves, which only *decide* to send.
+     *
+     * Deciding and confirming are different moments precisely because a
+     * decision can fail to reach the socket and be retried elsewhere (see
+     * `SessionController.sendClipboardOrRetryOnConnect`). Writing [lastSent]
+     * at decision time -- the original shape of this method -- made a
+     * dropped-then-retried attempt indistinguishable from a delivered one:
+     * if the retry itself then failed (`close()` cancelling it mid-wait, for
+     * instance), [lastSent] already held this text, so the very next resume
+     * reading the same still-undelivered clipboard would see
+     * `lastSent == text`, decide there was nothing to send, and that text
+     * would never reach the guest for the rest of the session -- silently,
+     * and only on a reconnect that itself failed, which is exactly when a
+     * retry exists to matter.
+     */
+    fun markSent(text: String) {
+        lastSent = text
     }
 
     /** A push from the daemon. Returns the text to write locally, or null. */

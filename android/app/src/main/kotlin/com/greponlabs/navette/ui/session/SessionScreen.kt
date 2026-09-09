@@ -1026,14 +1026,29 @@ private class SessionController(
      * out. `pendingClipboardResend` is a child of `scope`, so `close()`'s
      * `scope.cancel()` already tears it down; no explicit cancel is needed
      * there.
+     *
+     * [ClipboardBridge.markSent] is called only where a send is actually
+     * confirmed -- on both the immediate and the retried attempt -- never
+     * merely because one was decided. A controller review caught the
+     * earlier shape, where the decision methods wrote `lastSent`
+     * themselves: a decision that lost the race here and then had its
+     * retry cancelled too (a `close()` mid-wait) left `lastSent` already
+     * holding the text, so the next resume of the same still-undelivered
+     * clipboard saw a false match and silently gave up on it for the rest
+     * of the session.
      */
     private fun sendClipboardOrRetryOnConnect(text: String) {
-        if (client.sendInput(MediaInput.SetClipboard(text))) return
+        if (client.sendInput(MediaInput.SetClipboard(text))) {
+            synchronized(lock) { bridge.markSent(text) }
+            return
+        }
         pendingClipboardResend?.cancel()
         pendingClipboardResend =
             scope.launch {
                 client.connectionState.first { it is ConnectionState.Connected }
-                client.sendInput(MediaInput.SetClipboard(text))
+                if (client.sendInput(MediaInput.SetClipboard(text))) {
+                    synchronized(lock) { bridge.markSent(text) }
+                }
             }
     }
 

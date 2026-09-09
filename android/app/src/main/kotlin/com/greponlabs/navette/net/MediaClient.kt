@@ -169,7 +169,9 @@ class MediaClient(private val webSocketUrl: String) {
      * Always returns `false`, so callers can tail-call it as their failure path.
      */
     private fun logDropped(input: MediaInput, reason: String): Boolean {
-        Log.d(TAG, "dropped $input: $reason")
+        // Variant name only: MediaInput.SetClipboard is a data class, so the
+        // naive "$input" would render the user's clipboard text into logcat.
+        Log.d(TAG, "dropped ${input::class.simpleName}: $reason")
         return false
     }
 

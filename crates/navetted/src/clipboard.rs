@@ -96,6 +96,16 @@ impl ClipboardSync {
                     return SyncAction::Nothing;
                 };
 
+                // Mirrors the Kotlin side's `text.isEmpty()` check in
+                // `ClipboardBridge.onLocalClipboard`. Without this, an empty
+                // guest transfer sets `phone_text = Some("")` and every
+                // later guest paste is answered with empty bytes until the
+                // phone genuinely sets something -- a real state, just not
+                // one worth propagating.
+                if text.is_empty() {
+                    return SyncAction::Nothing;
+                }
+
                 if self.echo_from_guest.as_deref() == Some(text.as_str()) {
                     self.echo_from_guest = None;
                     return SyncAction::Nothing;
@@ -234,6 +244,29 @@ mod tests {
                 bytes: vec![0xff, 0xfe, 0xfd]
             }),
             SyncAction::Nothing
+        );
+    }
+
+    /// A controller review caught this reappearing: Task 5 deferred it as
+    /// handled downstream, which was true before `phone_text` was written on
+    /// this exact path. An empty transfer must not become the phone's
+    /// clipboard, or every later guest paste is answered with empty bytes
+    /// until the phone genuinely copies something.
+    #[test]
+    fn an_empty_guest_transfer_is_dropped_and_does_not_become_phone_text() {
+        let mut sync = ClipboardSync::new();
+        sync.on_phone_clipboard("earlier".into());
+        sync.on_guest(offer(&["text/plain"]));
+        assert_eq!(
+            sync.on_guest(GuestEvent::TransferFromGuest { bytes: Vec::new() }),
+            SyncAction::Nothing
+        );
+        assert_eq!(
+            sync.on_guest(GuestEvent::PasteRequested),
+            SyncAction::AnswerGuest {
+                bytes: b"earlier".to_vec()
+            },
+            "an empty transfer must not overwrite phone_text with an empty value"
         );
     }
 

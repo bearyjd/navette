@@ -2282,25 +2282,41 @@ crates/navetted/src/bridge.rs` is empty.
      (`a_paste_with_no_phone_text_is_still_answered` in `clipboard.rs`)
      remains the only verification of this path; it was not confirmed
      on-device this session.
-5. **Oversized check (>1 MiB from the phone): PASS, but the actual rejection
-   happens one layer lower than expected.** Sent a 1,049,076-byte
-   `SetClipboard` (1 MiB + 500 bytes) directly over the media WebSocket. It
-   never reached `MediaInput` JSON parsing or `ClipboardSync` at all — the
-   underlying transport (axum/tokio-tungstenite) enforces a 32,768-byte
-   per-message cap by default, and the connection was reset with `media
-   WebSocket receive failed error=Space limit exceeded: Message too long:
-   1049113 > 32768`. The daemon, the `mvp` session, and the attached phone
-   all survived: `/healthz` stayed `ok`, `navette ls` still showed `mvp`
-   running, and a screenshot taken immediately after showed the guest's
-   video still live and the app fully responsive. So "refused, not
-   truncated, session survives" holds — but because any real clipboard text
-   over `MAX_CLIPBOARD_BYTES` (1 MiB) is necessarily also over 32 KiB, the
-   `MediaInput::validate()` / `InputValidationError::ClipboardTooLarge` path
-   that Task 1 built and unit-tests is unreachable for oversized clipboard
-   pastes arriving over this transport in practice — the WebSocket layer
-   rejects first, every time. Worth someone deciding whether that's fine
-   (it is, for the user-facing contract) or worth raising the frame limit so
-   the intended error path is the one that actually fires.
+5. **Oversized check (>1 MiB from the phone): originally reported as one
+   band, actually spans two, and the first write-up here got the boundary
+   wrong. Corrected below, after the controller's second review caught it.**
+   The daemon enforces two different limits, not one: `MAX_INPUT_MESSAGE`
+   (`crates/navette-protocol/src/media.rs:10`, **16 KiB**) is the size the
+   graceful handler in `api.rs` refuses with an `Error` text frame on an
+   otherwise-live connection; `MAX_INPUT_MESSAGE * 2` (`api.rs:127`, **32
+   KiB**) is the WebSocket transport's own hard cap, enforced by
+   axum/tokio-tungstenite on the read path *before* that graceful handler
+   ever sees the frame. My original test sent 1,049,076 bytes — comfortably
+   inside the second, harder band, not the first — and reported "refused,
+   not truncated, session survives" without saying which band that was, or
+   that the *daemon and `mvp` session* surviving is a different claim from
+   *the sending connection* surviving; that connection is in fact torn down
+   in this band, not gracefully refused.
+
+   Re-tested both bands precisely, directly against the daemon, after this
+   session's fix wave added a matching client-side guard (see "Fix wave"
+   below):
+   - **16–32 KiB (the graceful band):** a 20,000-byte `SetClipboard` got
+     back `{"type":"error","code":"message_too_large","message":"input
+     message exceeds 16384 bytes"}`, and the *same connection* answered a
+     follow-up ping afterward — genuinely refused, not torn down.
+   - **>32 KiB (the hard band):** a 40,000-byte `SetClipboard` reset the
+     connection outright (`ConnectionResetError`, no close frame) — the
+     symptom the controller described: video drops, that client
+     reconnects. The daemon and `mvp` stayed up throughout
+     (`/healthz` `ok`, `navette ls` still showing `mvp`), which is real but
+     is a claim about the daemon, not about that connection.
+
+   The fix (below) makes this moot for the real client: it now refuses to
+   send anything whose *encoded* frame exceeds 16 KiB, so the Android app
+   can no longer reach either band — this stays as a direct probe of the
+   daemon's own behavior, not a description of what the shipped client can
+   still trigger.
 6. **MIME spellings, real guest.** Firefox (an XWayland client) offered, in
    one `SelectionOffered`: `text/plain;charset=utf-8`, `UTF8_STRING`,
    `COMPOUND_TEXT`, `TEXT`, `text/plain`, `STRING` — with
@@ -2421,6 +2437,106 @@ itself is verified only by the on-device 3/3 re-run above, not by a unit
 test. Full suites green: `cargo test --workspace` 212 passed across all
 crates / 1 pre-existing ignored / 0 failed; Android `testDebugUnitTest` 210
 passed / 0 failed (209 before this test, +1 for the new one).
+
+### Fix wave: five findings from the whole-branch review, all fixed and re-verified (2026-09-09)
+
+The whole-branch review came back **Ship with fixes** — five findings, all
+small and local, three of them in the same files this session had already
+been touching. All five are fixed and re-verified on-device.
+
+1. **Clipboard text was reaching logcat.** `MediaClient.kt`'s `logDropped`
+   did `Log.d(TAG, "dropped $input: $reason")`; `MediaInput.SetClipboard` is
+   a data class, so `$input` rendered `SetClipboard(text=<the user's
+   clipboard>)`. Reached from both the no-socket and the socket-declined
+   paths — the "Fixed and re-verified" section above quotes this exact line
+   firing during the original 3/3 repro. Fixed to log the variant name
+   only: `Log.d(TAG, "dropped ${input::class.simpleName}: $reason")`. Every
+   logcat line captured during this session's re-verification (see check 2
+   re-run below) reads `dropped SetClipboard: no socket` — confirmed
+   directly, not just by reading the diff.
+2. **`lastSent` was committed at decision time, not at confirmed delivery.**
+   `ClipboardBridge.onLocalClipboard` wrote `lastSent = text` and returned;
+   if the send then lost the race against the socket and `SessionScreen`'s
+   retry (added earlier this session) also never resolved — `close()`
+   cancelling it mid-wait, for instance — `lastSent` already held that text.
+   The next resume reading the same still-undelivered clipboard would see
+   `lastSent == text`, decide there was nothing to send, and that text would
+   never reach the guest for the rest of the session, silently. Fixed by
+   splitting decision from confirmation: `onLocalClipboard`/
+   `onLocalClipboardResume` no longer touch `lastSent` at all; a new
+   `ClipboardBridge.markSent(text)` does, called from
+   `SessionController.sendClipboardOrRetryOnConnect` only where
+   `client.sendInput` actually returned `true` — on both the immediate and
+   the retried attempt.
+3. **A phone copy over 32 KiB could tear down the media socket.** See the
+   corrected check 5 above for the two-band breakdown this finding is
+   about. Fixed with a matching client-side guard: `ClipboardBridge` now
+   measures the *encoded* JSON frame (not the raw text — JSON escaping
+   inflates quotes/backslashes 2x and control characters 6x, so a raw-byte
+   guard would pass text that still cleared the limit) against
+   `MAX_INPUT_MESSAGE_BYTES` (16 KiB, mirroring
+   `crates/navette-protocol/src/media.rs:10`'s `MAX_INPUT_MESSAGE`), and
+   refuses anything over it before `SessionController` ever calls
+   `sendInput`. This **replaces** the old `MAX_CLIPBOARD_BYTES` (1 MiB)
+   guard, which never actually protected anything — it compared raw text
+   bytes against a limit far above where the transport itself acts.
+4. **An empty guest transfer became the phone's clipboard.** `clipboard.rs`
+   decoded an empty `TransferFromGuest` to `""`, which passed the size and
+   echo checks, so `phone_text = Some("")` and every later guest paste got
+   answered with empty bytes until the phone genuinely copied something.
+   Task 5 deferred this as handled downstream, which was true before a
+   later ruling added the `phone_text` write on this exact path and
+   reintroduced it. Fixed with an early `if text.is_empty() { return
+   SyncAction::Nothing; }`, mirroring the Kotlin side's own `text.isEmpty()`
+   check. Unit test added:
+   `an_empty_guest_transfer_is_dropped_and_does_not_become_phone_text`.
+5. **A resume could never re-forward a value the guest had already
+   received, even long after the phone's clipboard cycled back to it.**
+   `ClipboardBridge.onLocalClipboardResume` returns null whenever the text
+   equals `lastRemote`, and nothing ever cleared `lastRemote` except another
+   remote push. So a value the daemon once pushed here could never again be
+   sent phone→guest via resume — the path the spec calls the one most real
+   transfers take — even after an intervening genuine local copy had moved
+   the daemon's own `phone_text` on past it, at which point a guest paste
+   should get the newer value again, not the stale one the resume path
+   silently refused to re-send. Fixed: `onLocalClipboard` now clears
+   `lastRemote` whenever it decides a genuine send (not an echo, not an
+   unchanged resend) — the phone's clipboard has, by definition, moved past
+   whatever the daemon last pushed once that decision is made. Unit test
+   added: `a resume forwards a remote value again once an intervening send
+   has moved past it`.
+
+**Re-verification, on device, not by reasoning.** Rebuilt and reinstalled
+both binaries, restarted `navetted` fresh (`find ... -newer` empty), ran the
+exact same repro that failed 3/3 before any of this session's fixes existed:
+
+- **3/3 pass, and confirmed content-free logcat.** Three fresh markers
+  (`Wave5Verify1/2/3`), same copy-in-Settings-then-switch-back flow. All
+  three logged `dropped SetClipboard: no socket` — no text, matching
+  finding 1's fix — and all three then arrived correctly in the guest,
+  confirmed by pasting into Firefox's find-in-page bar and reading back the
+  exact marker each time. A full logcat scan for any of the three marker
+  strings turned up nothing from the app (`adbd`'s own log of the `adb
+  shell input text` commands that typed them is the only match — an
+  artifact of the test tooling, not a leak).
+- **Echo-loop re-checked again, with the full fix wave in place.** Same
+  temporary content-free instrumentation as both earlier rounds (added,
+  used, fully reverted — `git diff crates/navetted/src/bridge.rs` is empty
+  at every checkpoint in this log). Guest → phone: still exactly one
+  `PushToPhone` despite Firefox's double `SelectionOffered` — unaffected,
+  since none of these five fixes touch that direction. Phone → guest, with
+  a fresh marker (`EchoRecheckW5`) run through the same drop-then-retry
+  path finding 2 changed: **exactly one** `OfferToGuest` reached the
+  daemon, and the marker arrived correctly. Deferring `markSent` to
+  confirmed delivery did not introduce a duplicate send.
+- **Both size bands re-measured precisely** (finding 3) — see the corrected
+  check 5 above.
+- Full suites green: `cargo test --workspace` 213 passed / 1 pre-existing
+  ignored / 0 failed (+1 for the empty-transfer test). Android
+  `testDebugUnitTest` 213 passed / 0 failed (210 before this wave, +3: the
+  markSent-not-confirmed regression test, the lastRemote-cleared-by-a-send
+  test, and one of the two rewritten size-cap tests that is net new rather
+  than a rename).
 
 **Carried follow-ups (from prior task reviews, recorded here for the
 permanent record):**
