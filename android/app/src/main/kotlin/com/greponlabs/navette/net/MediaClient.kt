@@ -335,6 +335,15 @@ class MediaClient(private val webSocketUrl: String) {
     @Volatile
     var onPong: ((ULong) -> Unit)? = null
 
+    /**
+     * Told about each guest clipboard push. Same contract as [onPong]: set
+     * before [connect], called on OkHttp's reader thread, so whatever it does
+     * must itself be safe to run there. Never logged past here -- the text
+     * is clipboard content.
+     */
+    @Volatile
+    var onClipboard: ((String) -> Unit)? = null
+
     private val listener =
         object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: OkHttpResponse) {
@@ -380,7 +389,7 @@ class MediaClient(private val webSocketUrl: String) {
                         .getOrNull()
                 when (reported) {
                     is MediaServerMessage.Pong -> onPong?.invoke(reported.nonce)
-                    is MediaServerMessage.Clipboard -> {} // Clipboard handling is implemented in later tasks
+                    is MediaServerMessage.Clipboard -> onClipboard?.invoke(reported.text)
                     is MediaServerMessage.Error, null -> Log.w(TAG, "media server reported: ${reported ?: text}")
                 }
             }

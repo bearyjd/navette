@@ -1,5 +1,8 @@
 package com.greponlabs.navette.ui.session
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.Surface
@@ -34,10 +37,12 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
 import com.greponlabs.navette.media.DecoderEvent
@@ -140,6 +145,9 @@ fun SessionScreen(
     val fieldFocus = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val context = LocalContext.current
+    val clipboard =
+        remember(context) { context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager }
     // Keyed on the session, not the nonce, like the retry counters above: a
     // reconnect must not silently drop the user out of the on-screen
     // keyboard they had raised.
@@ -150,12 +158,37 @@ fun SessionScreen(
 
     LockLandscapeWhileAttached()
 
+    // Clipboard listener and lifecycle observer registered and torn down here,
+    // in the same effect that opens and closes the controller -- so a leaked
+    // OnPrimaryClipChangedListener cannot outlive the session. The ON_RESUME
+    // read is not a fallback for the listener: since Android 10
+    // getPrimaryClip() returns null when the app is not focused, and copying
+    // from another app necessarily unfocuses Navette, so the listener alone
+    // would miss the case this feature exists for.
     DisposableEffect(controller) {
+        fun forwardLocalClipboard() {
+            val text = clipboard.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString() ?: return
+            controller.onLocalClipboard(text)
+        }
+        val clipboardListener = ClipboardManager.OnPrimaryClipChangedListener { forwardLocalClipboard() }
+        clipboard.addPrimaryClipChangedListener(clipboardListener)
+        val clipboardObserver =
+            LifecycleEventObserver { _, event ->
+                if (event == Lifecycle.Event.ON_RESUME) forwardLocalClipboard()
+            }
+        lifecycleOwner.lifecycle.addObserver(clipboardObserver)
         controller.open()
-        onDispose { controller.close() }
+        onDispose {
+            clipboard.removePrimaryClipChangedListener(clipboardListener)
+            lifecycleOwner.lifecycle.removeObserver(clipboardObserver)
+            controller.close()
+        }
     }
 
-    LaunchedEffect(controller) { controller.onToggleHud = { hudVisible = !hudVisible } }
+    LaunchedEffect(controller) {
+        controller.onToggleHud = { hudVisible = !hudVisible }
+        controller.onClipboardPush = { text -> clipboard.setPrimaryClip(ClipData.newPlainText("navette", text)) }
+    }
 
     // Re-asserts whichever focus target is correct, every time this effect
     // reruns (keyed on the controller, so every reconnect). Merely skipping
@@ -428,6 +461,11 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
     private var hudJob: Job? = null
     private var pingNonce: ULong = 0uL
 
+    // Reached from the same two threads as `hud` above -- the main thread via
+    // onLocalClipboard, OkHttp's reader thread via client.onClipboard in
+    // open() -- so it shares `lock` rather than getting its own.
+    private val bridge = ClipboardBridge()
+
     // Gesture state. All main-thread only: the touch listener, the surface
     // callbacks, and `scope` (Main.immediate) are the only writers. pressJob
     // must stay on that dispatcher -- moving it to Default would turn
@@ -444,6 +482,14 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
 
     /** Set by the screen, which owns whether the HUD is showing. */
     var onToggleHud: (() -> Unit)? = null
+
+    /**
+     * Set by the screen, which owns the `ClipboardManager` call. Invoked on
+     * [scope] (Main.immediate) from [client]'s `onClipboard`, which itself
+     * runs on OkHttp's reader thread -- `ClipboardManager.setPrimaryClip`
+     * must not be called from there.
+     */
+    var onClipboardPush: ((String) -> Unit)? = null
 
     /**
      * The surface the most recent successfully-sent motion was addressed to.
@@ -501,6 +547,13 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
         // Installed before connect(), not after: connect() starts OkHttp's
         // reader thread, and that thread is what delivers pongs.
         client.onPong = { nonce -> synchronized(lock) { hud.recordPong(nonce, System.currentTimeMillis()) } }
+        // Dispatched onto `scope` rather than invoked inline: this callback
+        // runs on OkHttp's reader thread, and onClipboardPush ends in a
+        // ClipboardManager call the screen must make from the main thread.
+        client.onClipboard = { text ->
+            val toWrite = synchronized(lock) { bridge.onRemoteClipboard(text) }
+            if (toWrite != null) scope.launch { onClipboardPush?.invoke(toWrite) }
+        }
         // connect() before the state collector, not after. The client's flow
         // starts at Disconnected; connect() moves it to Connecting
         // synchronously. Collecting first, on Main.immediate, would publish
@@ -546,6 +599,7 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
         connectionJob?.cancel()
         hudJob?.cancel()
         client.onPong = null
+        client.onClipboard = null
         // Clear the surface BEFORE stopping the decoder. Cancelling
         // packetsJob above does not preempt a route() already inside
         // startDecoder, and with the old order that call could publish a
@@ -895,6 +949,16 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
         for (input in InputMapper.imeTextDelta(stream.clientId, stream.surfaceId, previous, current)) {
             client.sendInput(input)
         }
+    }
+
+    /**
+     * A local clipboard read, from the listener firing or an ON_RESUME poll.
+     * [bridge] decides whether it is our own echo, unchanged, or genuinely
+     * new; only a genuinely new value reaches [client].
+     */
+    fun onLocalClipboard(text: String) {
+        val forward = synchronized(lock) { bridge.onLocalClipboard(text) } ?: return
+        client.sendInput(MediaInput.SetClipboard(forward))
     }
 
     /**
