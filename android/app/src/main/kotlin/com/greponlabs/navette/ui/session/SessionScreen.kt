@@ -133,9 +133,18 @@ fun SessionScreen(
     // Zoom and pan outlive a rebuild too: a retry the user never noticed must
     // not snap a zoomed, panned view back to the corner.
     val transformHolder = remember(host, sessionName) { ViewTransformHolder() }
+    // Keyed on the session, not the nonce, like transformHolder above: a
+    // reconnect rebuilds SessionController, but the bridge's one-shot echo
+    // and last-remote state must survive it. A fresh bridge per reconnect
+    // forgets what the daemon last pushed here, and the lifecycle observer
+    // re-added below re-syncs to ON_RESUME immediately on every rebuild --
+    // without this, that resume would re-forward the daemon's own stale
+    // push as if the phone had copied it new, clobbering whatever the guest
+    // copied while the socket was down.
+    val clipboardBridge = remember(host, sessionName) { ClipboardBridge() }
     val controller =
         remember(host, sessionName, reconnectNonce) {
-            SessionController(mediaWebSocketUrl(host, sessionName), transformHolder)
+            SessionController(mediaWebSocketUrl(host, sessionName), transformHolder, clipboardBridge)
         }
     val state by controller.state.collectAsState()
     val focusRequester = remember { FocusRequester() }
@@ -166,15 +175,23 @@ fun SessionScreen(
     // from another app necessarily unfocuses Navette, so the listener alone
     // would miss the case this feature exists for.
     DisposableEffect(controller) {
-        fun forwardLocalClipboard() {
-            val text = clipboard.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString() ?: return
-            controller.onLocalClipboard(text)
-        }
-        val clipboardListener = ClipboardManager.OnPrimaryClipChangedListener { forwardLocalClipboard() }
+        fun readLocalClipboard(): String? = clipboard.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()
+        val clipboardListener =
+            ClipboardManager.OnPrimaryClipChangedListener {
+                readLocalClipboard()?.let { controller.onLocalClipboard(it) }
+            }
         clipboard.addPrimaryClipChangedListener(clipboardListener)
+        // Goes through onLocalClipboardResume, not onLocalClipboard: this
+        // observer is re-added on every reconnect and syncs to the current
+        // RESUMED state immediately, so it can fire on a resume that is
+        // really "the socket just reopened", not just "the user switched
+        // apps and back" -- see clipboardBridge's comment above for why that
+        // case needs its own suppression.
         val clipboardObserver =
             LifecycleEventObserver { _, event ->
-                if (event == Lifecycle.Event.ON_RESUME) forwardLocalClipboard()
+                if (event == Lifecycle.Event.ON_RESUME) {
+                    readLocalClipboard()?.let { controller.onLocalClipboardResume(it) }
+                }
             }
         lifecycleOwner.lifecycle.addObserver(clipboardObserver)
         controller.open()
@@ -420,7 +437,18 @@ private fun BoxScope.ImeLayer(
  * down and recreating a `MediaCodec` per recomposition would be a black
  * flash per frame of UI state change.
  */
-private class SessionController(mediaUrl: String, private val transformHolder: ViewTransformHolder) {
+private class SessionController(
+    mediaUrl: String,
+    private val transformHolder: ViewTransformHolder,
+    // Passed in rather than owned, on the same terms as transformHolder:
+    // remembered by the screen keyed on the session, not the reconnect
+    // nonce, so a rebuilt controller does not start the bridge's one-shot
+    // echo and last-remote state over from scratch. Reached from the same
+    // two threads as `hud` -- the main thread via onLocalClipboard/
+    // onLocalClipboardResume, OkHttp's reader thread via client.onClipboard
+    // in open() -- so it is guarded by `lock` rather than getting its own.
+    private val bridge: ClipboardBridge,
+) {
     private val client = MediaClient(mediaUrl)
     private val gate = StreamGate()
     private val scope = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
@@ -460,11 +488,6 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
     private val hud = SessionHud()
     private var hudJob: Job? = null
     private var pingNonce: ULong = 0uL
-
-    // Reached from the same two threads as `hud` above -- the main thread via
-    // onLocalClipboard, OkHttp's reader thread via client.onClipboard in
-    // open() -- so it shares `lock` rather than getting its own.
-    private val bridge = ClipboardBridge()
 
     // Gesture state. All main-thread only: the touch listener, the surface
     // callbacks, and `scope` (Main.immediate) are the only writers. pressJob
@@ -952,12 +975,22 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
     }
 
     /**
-     * A local clipboard read, from the listener firing or an ON_RESUME poll.
-     * [bridge] decides whether it is our own echo, unchanged, or genuinely
-     * new; only a genuinely new value reaches [client].
+     * A local clipboard read from the listener firing. [bridge] decides
+     * whether it is our own echo, unchanged, or genuinely new; only a
+     * genuinely new value reaches [client].
      */
     fun onLocalClipboard(text: String) {
         val forward = synchronized(lock) { bridge.onLocalClipboard(text) } ?: return
+        client.sendInput(MediaInput.SetClipboard(forward))
+    }
+
+    /**
+     * A local clipboard read from an `ON_RESUME`. Not routed through
+     * [onLocalClipboard]: see [ClipboardBridge.onLocalClipboardResume] for
+     * why a resume needs a suppression the listener path does not.
+     */
+    fun onLocalClipboardResume(text: String) {
+        val forward = synchronized(lock) { bridge.onLocalClipboardResume(text) } ?: return
         client.sendInput(MediaInput.SetClipboard(forward))
     }
 

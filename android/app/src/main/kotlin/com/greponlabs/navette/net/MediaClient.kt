@@ -390,7 +390,11 @@ class MediaClient(private val webSocketUrl: String) {
                 when (reported) {
                     is MediaServerMessage.Pong -> onPong?.invoke(reported.nonce)
                     is MediaServerMessage.Clipboard -> onClipboard?.invoke(reported.text)
-                    is MediaServerMessage.Error, null -> Log.w(TAG, "media server reported: ${reported ?: text}")
+                    is MediaServerMessage.Error -> Log.w(TAG, "media server reported: $reported")
+                    // Never `text` itself: an unparseable frame that was meant
+                    // to be a Clipboard message has clipboard content
+                    // embedded in this raw, undecoded body.
+                    null -> Log.w(TAG, "media server sent an undecodable ${text.length}-char text frame")
                 }
             }
 
