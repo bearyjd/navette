@@ -2230,16 +2230,17 @@ crates/navetted/src/bridge.rs` is empty.
    `https://fedoraproject.org/start/` immediately, and tapping **Paste** in
    the stock Settings search field inserted it verbatim.
 2. **Phone → guest: the Android UI path FAILED, 3/3 attempts — a real,
-   deterministic bug, not flakiness.** See "New finding" below. The
-   underlying daemon/wprsd/XWayland pipeline was then verified directly
-   (bypassing the broken UI) by opening a second WebSocket to the same
-   session's media endpoint and sending `{"type":"set_clipboard","text":
-   "ScriptProbeMarker"}` by hand: `clipboard: phone SetClipboard len=17` →
-   `action OfferToGuest` with the five canonical MIME types, and a `Ctrl+V`
-   into Firefox's address bar (real device, real guest) inserted
-   `ScriptProbeMarker` correctly. So the wire protocol and the daemon-side
-   state machine are sound on real hardware; the break is entirely in the
-   Android client's reconnect wiring.
+   deterministic bug, not flakiness. Fixed and re-verified the same day; see
+   "Fixed and re-verified" below.** The underlying daemon/wprsd/XWayland
+   pipeline was verified directly first (bypassing the then-broken UI) by
+   opening a second WebSocket to the same session's media endpoint and
+   sending `{"type":"set_clipboard","text": "ScriptProbeMarker"}` by hand:
+   `clipboard: phone SetClipboard len=17` → `action OfferToGuest` with the
+   five canonical MIME types, and a `Ctrl+V` into Firefox's address bar
+   (real device, real guest) inserted `ScriptProbeMarker` correctly. So the
+   wire protocol and the daemon-side state machine were sound on real
+   hardware from the start; the break was entirely in the Android client's
+   reconnect wiring, and is now fixed there.
 3. **Echo-loop check: no repeated traffic observed on either direction, on
    real hardware.** Guest → phone: one address-bar copy produced two
    `SelectionOffered` events from Firefox milliseconds apart (it re-announces
@@ -2330,33 +2331,96 @@ session (`mOverrideState=Optional.empty` confirmed both before touching the
 device and again at the end) and `pointer_location` was already `0`. Nothing
 to reset.
 
-**New finding — phone → guest clipboard is silently dropped on every
-reconnect through the real Android UI.** Reproduced 3/3 times, always with
-the identical Android logcat line `MediaClient: dropped
-SetClipboard(text=...): no socket`. Root cause, confirmed from source:
-`SessionScreen.kt`'s `DisposableEffect(controller)` (line 177) registers a
-`LifecycleEventObserver` on the *already-resumed* lifecycle
-(`lifecycleOwner.lifecycle.addObserver(clipboardObserver)`, line 196) —
-which, per `androidx.lifecycle` semantics, synchronously replays the missed
-`ON_RESUME` event the instant it is added — and only calls `controller.open()`
-on the very next line (197). `controller.open()` is what calls
-`client.connect()`, which is what sets `MediaClient.webSocket` non-null. So
-the resume-triggered clipboard read (`onLocalClipboardResume`, added
-specifically so a copy made while Navette was backgrounded isn't missed —
-see `ClipboardBridge`'s own doc comment) fires and calls `sendInput` *before*
-a socket exists on every single reattach, not merely on a lucky/unlucky
-timing window. `MediaClient.sendInput` (`net/MediaClient.kt:153`) drops
-silently in that case (`logDropped`, debug-level, "no socket") and nothing
-ever retries it — `SessionController.open()` has no clipboard-resend logic.
-Net effect: the ordinary real-world flow — copy something in another app,
-switch back to Navette — loses that copy every time a reconnect happens on
-the way back in, which in this environment was every time (each background
-period was long enough that the media socket was torn down, observed as
-`WebSocket receive failed error=IO error: Connection reset by peer` in
-`navetted`'s own log). Not filed as a fix here — Task 9 is verification
-only — but it is the one thing in this branch most likely to make a real
-user conclude "clipboard sync doesn't work," since it hits the single most
-natural way to use the feature.
+**Finding — phone → guest clipboard was silently dropped on every reconnect
+through the real Android UI. Found, fixed, and re-verified on-device the
+same day.** Reproduced 3/3 times, always with the identical Android logcat
+line `MediaClient: dropped SetClipboard(text=...): no socket`. Root cause,
+confirmed from source: `SessionScreen.kt`'s `DisposableEffect(controller)`
+(line 177) registers a `LifecycleEventObserver` on the *already-resumed*
+lifecycle (`lifecycleOwner.lifecycle.addObserver(clipboardObserver)`, line
+196) — which, per `androidx.lifecycle` semantics, synchronously replays the
+missed `ON_RESUME` event the instant it is added — and only calls
+`controller.open()` on the very next line (197). `controller.open()` is what
+calls `client.connect()`, which is what sets `MediaClient.webSocket`
+non-null. So the resume-triggered clipboard read (`onLocalClipboardResume`,
+added specifically so a copy made while Navette was backgrounded isn't
+missed — see `ClipboardBridge`'s own doc comment) fires and calls
+`sendInput` *before* a socket exists on every single reattach, not merely on
+a lucky/unlucky timing window. `MediaClient.sendInput`
+(`net/MediaClient.kt:153`) drops silently in that case (`logDropped`,
+debug-level, "no socket") and nothing retried it. Net effect: the ordinary
+real-world flow — copy something in another app, switch back to Navette —
+lost that copy every time a reconnect happened on the way back in, which in
+this environment was every time (each background period was long enough
+that the media socket was torn down, observed as `WebSocket receive failed
+error=IO error: Connection reset by peer` in `navetted`'s own log). It was
+the one thing in this branch most likely to make a real user conclude
+"clipboard sync doesn't work," since it hit the single most natural way to
+use the feature.
+
+### Fixed and re-verified, same day (2026-09-08, later)
+
+**The fix.** A controller review flagged that reordering
+`controller.open()` ahead of `addObserver` was tempting but not obviously
+sufficient — `connect()`'s handshake is asynchronous, so even a send issued
+right after it returns is not guaranteed to land on an open socket — and
+asked for whichever hook actually closes the gap, verified on-device rather
+than by reasoning, without relocating the lifecycle calls this file has
+already burned four rounds getting right. The fix stayed entirely inside
+`SessionController` (`SessionScreen.kt`, next to `onLocalClipboard` /
+`onLocalClipboardResume`): both now route through a new
+`sendClipboardOrRetryOnConnect(text)`, which sends immediately and, only if
+`MediaClient.sendInput` returns `false`, waits on
+`client.connectionState.first { it is ConnectionState.Connected }` and sends
+once more. A second call before the wait resolves cancels the first
+(`pendingClipboardResend: Job?`), so at most one retry is ever pending and
+only the latest text is the one that eventually goes out. The retry is a
+child of `scope`, so `close()`'s existing `scope.cancel()` already tears it
+down — no new teardown path was added. `git diff` on this fix touches only
+that one region of `SessionScreen.kt`; the `DisposableEffect`'s lifecycle
+ordering is untouched.
+
+**Re-verified on-device, 3/3.** Same repro that failed 3/3 before: copy a
+fresh marker in Settings' search field, switch back to Navette (a real
+reconnect every time — the media socket does not survive backgrounding in
+this environment). All three attempts (`FixVerify1`, `FixVerify2`,
+`FixVerify3`) still logged the initial `dropped SetClipboard(...): no
+socket` — the drop itself is unchanged, and unavoidable given the
+lifecycle-observer ordering the controller asked not to touch — but all
+three then arrived correctly in the guest, confirmed by pasting into
+Firefox's find-in-page bar (chosen to avoid the address bar's own
+autocomplete, which produced a false positive during the original
+verification) and reading back the exact marker text each time. Zero data
+loss across 3/3, where before it was 3/3 permanent loss.
+
+**Echo-loop re-check.** Re-ran check 3 with the fix in place, using the same
+temporary content-free instrumentation as the original verification (added,
+used, and fully reverted again — `git diff crates/navetted/src/bridge.rs` is
+empty). Guest → phone: still exactly one `PushToPhone` despite Firefox's
+double `SelectionOffered`, unchanged from before — this direction was never
+touched. Phone → guest, the direction the fix changes: for each of two
+copies tested after the fix (one carried over from the 3/3 re-run, one
+fresh, `EchoRecheckMarker`), the daemon log shows **exactly one**
+`clipboard: action OfferToGuest` per copy — the failed first attempt never
+left the device at all, so there was nothing to duplicate, and the retry's
+single resend is the only transmission that ever reaches the wire. No
+looping, no double delivery.
+
+**Unit test.** Added `sendInput before connect is dropped, not silently
+queued for later` to `MediaClientTest.kt` (plain JVM, `MockWebServer`, this
+project's existing no-mocking convention — no instrumentation needed). It
+pins the exact one-layer-down behavior the fix depends on: a
+`MediaClient.sendInput` call issued before `connect()` returns `false`
+cleanly rather than queuing for later delivery. It does **not** reach
+`SessionController.sendClipboardOrRetryOnConnect` — that class is
+file-private in `SessionScreen.kt` and reaching it from a separate test file
+would mean widening its visibility, which is a bigger change than this fix
+warranted. Said plainly rather than writing a test that exercises
+`SessionController` through some indirect, vacuous path: the retry logic
+itself is verified only by the on-device 3/3 re-run above, not by a unit
+test. Full suites green: `cargo test --workspace` 212 passed across all
+crates / 1 pre-existing ignored / 0 failed; Android `testDebugUnitTest` 210
+passed / 0 failed (209 before this test, +1 for the new one).
 
 **Carried follow-ups (from prior task reviews, recorded here for the
 permanent record):**

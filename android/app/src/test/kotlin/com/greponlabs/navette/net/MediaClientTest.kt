@@ -314,4 +314,24 @@ class MediaClientTest {
         broken.connect()
         assertTrue(broken.connectionState.value is ConnectionState.Failed)
     }
+
+    /**
+     * The precise on-device failure behind the resume-clipboard bug:
+     * `SessionScreen`'s `ON_RESUME` observer replays synchronously the
+     * instant it is registered -- before `SessionController.open()`'s
+     * `connect()` has run -- so the very first resume-triggered clipboard
+     * send on every reattach used to call `sendInput` before this client
+     * had ever connected. This is what that looks like at this layer: a
+     * clean `false`, not a delayed delivery -- confirming there is nothing
+     * here to retry against without the caller doing so itself, which is
+     * exactly what `SessionController.sendClipboardOrRetryOnConnect` now
+     * does (verified separately, on-device, three real reattaches). This
+     * test cannot reach that private retry logic -- it pins the one-layer-down
+     * behavior the fix depends on: a send before `connect()` is never
+     * silently queued for later.
+     */
+    @Test
+    fun `sendInput before connect is dropped, not silently queued for later`() {
+        assertTrue(!client.sendInput(MediaInput.SetClipboard("never sent")))
+    }
 }

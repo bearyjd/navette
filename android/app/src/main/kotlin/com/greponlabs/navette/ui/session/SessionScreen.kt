@@ -981,7 +981,7 @@ private class SessionController(
      */
     fun onLocalClipboard(text: String) {
         val forward = synchronized(lock) { bridge.onLocalClipboard(text) } ?: return
-        client.sendInput(MediaInput.SetClipboard(forward))
+        sendClipboardOrRetryOnConnect(forward)
     }
 
     /**
@@ -991,7 +991,50 @@ private class SessionController(
      */
     fun onLocalClipboardResume(text: String) {
         val forward = synchronized(lock) { bridge.onLocalClipboardResume(text) } ?: return
-        client.sendInput(MediaInput.SetClipboard(forward))
+        sendClipboardOrRetryOnConnect(forward)
+    }
+
+    /**
+     * Tracks a clipboard send retried after [sendClipboardOrRetryOnConnect]
+     * lost the race against the socket, so a second one can replace it
+     * rather than the two eventually racing each other.
+     */
+    private var pendingClipboardResend: Job? = null
+
+    /**
+     * Sends now, or -- if [client] has no socket yet -- waits for the first
+     * [ConnectionState.Connected] and sends then.
+     *
+     * Exists because `onLocalClipboardResume` is called from a
+     * `LifecycleEventObserver` that is added to an already-resumed
+     * lifecycle: per `androidx.lifecycle`, that add synchronously replays
+     * the missed `ON_RESUME`, so the very first resume-triggered send on
+     * every reattach happens before [open]'s `client.connect()` has run.
+     * `MediaClient.sendInput` drops silently when that happens (logged
+     * client-side as `"no socket"`) and nothing retried it -- confirmed on
+     * a real device, 3/3 reconnects, before this existed. `client.connect()`
+     * itself is likewise no guarantee: the handshake it starts is
+     * asynchronous, so even a send issued after it returns is not
+     * guaranteed to reach an open socket. Waiting on [ConnectionState]
+     * rather than on any particular call having returned is what makes this
+     * correct regardless of where in that async sequence the first attempt
+     * landed.
+     *
+     * At most one retry is ever pending: a second call here (a genuine new
+     * copy arriving while the first retry is still waiting) cancels the
+     * older one, so only the latest text is the one that eventually goes
+     * out. `pendingClipboardResend` is a child of `scope`, so `close()`'s
+     * `scope.cancel()` already tears it down; no explicit cancel is needed
+     * there.
+     */
+    private fun sendClipboardOrRetryOnConnect(text: String) {
+        if (client.sendInput(MediaInput.SetClipboard(text))) return
+        pendingClipboardResend?.cancel()
+        pendingClipboardResend =
+            scope.launch {
+                client.connectionState.first { it is ConnectionState.Connected }
+                client.sendInput(MediaInput.SetClipboard(text))
+            }
     }
 
     /**
