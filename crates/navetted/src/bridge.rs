@@ -14,9 +14,15 @@ use navette_bridge::{
 };
 use navette_protocol::Session;
 use navette_protocol::media::{
-    MediaFlags, MediaHeader, MediaInput, MediaKind, MediaPacket, StreamConfig,
+    MediaFlags, MediaHeader, MediaInput, MediaKind, MediaPacket, MediaServerMessage, StreamConfig,
 };
+use wprs::serialization::wayland::{
+    DataDestinationEvent, DataDestinationRequest, DataEvent, DataRequest, DataSource,
+    DataSourceEvent, DataSourceRequest, DataToTransfer, SourceMetadata,
+};
+use wprs::serialization::{Event, RecvType, Request};
 
+use crate::clipboard::{ClipboardSync, GuestEvent, SyncAction};
 use crate::media::{MediaCommand, MediaHub};
 
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(100);
@@ -166,6 +172,21 @@ struct WorkerState {
     /// different surfaces are independent -- but a future requirement to
     /// composite in arrival order needs a different container, not a tweak.
     pending_composites: std::collections::BTreeSet<SurfaceKey>,
+    /// Clipboard state for this session. Plain state, not behind a lock:
+    /// calloop is single-threaded, and both the guest's requests and the
+    /// phone's input are applied on it.
+    clipboard: ClipboardSync,
+}
+
+/// Where one session's work goes out: the wprs link for the guest side, the
+/// media hub for the phone side, and the encode queue. Bundled because the
+/// clipboard needs all three at once and `pump_input` is already at
+/// clippy's argument limit.
+struct SessionIo<'a> {
+    transport: &'a WprsTransport,
+    media: &'a MediaHub,
+    encode: &'a EncodeQueue,
+    session: &'a str,
 }
 
 fn run_bridge(
@@ -202,6 +223,13 @@ fn run_bridge(
         input: InputState::default(),
         encode: Arc::clone(&encode),
         pending_composites: std::collections::BTreeSet::new(),
+        clipboard: ClipboardSync::new(),
+    };
+    let io = SessionIo {
+        transport: &transport,
+        media: &media,
+        encode: &encode,
+        session,
     };
     let mut resize: Option<(Instant, u32, u32)> = None;
 
@@ -232,22 +260,24 @@ fn run_bridge(
             // One closure shared by every call site below, so the seven-argument
             // `pump_input` call is written once instead of three times drifting
             // independently.
-            let mut pump = |input: &mut InputState, scene: &Scene| {
-                pump_input(
-                    &mut commands,
-                    input,
-                    scene,
-                    &encode,
-                    &transport,
-                    &mut resize,
-                    &mut stats,
-                );
-            };
+            let mut pump =
+                |input: &mut InputState, scene: &Scene, clipboard: &mut ClipboardSync| {
+                    pump_input(
+                        &mut commands,
+                        input,
+                        scene,
+                        &io,
+                        &mut resize,
+                        &mut stats,
+                        clipboard,
+                    );
+                };
             let scene_start = Instant::now();
             let batch = pending.drain(..).filter_map(|event| match event {
                 ChannelEvent::Msg(message) => Some(message),
                 _ => None,
             });
+            let batch = take_clipboard_requests(&mut worker.clipboard, batch, &io);
             let applied = apply_scene_messages(&mut worker, batch, &mut pump);
             messages += applied.0;
             apply_us += applied.1;
@@ -258,7 +288,7 @@ fn run_bridge(
             let scene_us = scene_start.elapsed().as_micros();
             // A final pump catches anything that arrived after the last unit of
             // work above.
-            pump(&mut worker.input, &worker.scene);
+            pump(&mut worker.input, &worker.scene, &mut worker.clipboard);
             let InputStats {
                 inputs,
                 worst_wait_us: worst_input_wait_us,
@@ -383,7 +413,7 @@ fn handle_scene_events(worker: &mut WorkerState, events: Vec<SceneEvent>) {
 fn apply_scene_messages(
     worker: &mut WorkerState,
     messages: impl IntoIterator<Item = wprs::serialization::RecvType<wprs::serialization::Request>>,
-    mut between: impl FnMut(&mut InputState, &Scene),
+    mut between: impl FnMut(&mut InputState, &Scene, &mut ClipboardSync),
 ) -> (u32, u128) {
     let mut count = 0;
     let mut apply_us = 0;
@@ -396,9 +426,108 @@ fn apply_scene_messages(
             Ok(events) => handle_scene_events(worker, events),
             Err(error) => tracing::warn!(%error, "rejected wprs scene message"),
         }
-        between(&mut worker.input, &worker.scene);
+        between(&mut worker.input, &worker.scene, &mut worker.clipboard);
     }
     (count, apply_us)
+}
+
+/// Carries out the clipboard requests in one batch and returns everything
+/// else, for `apply_scene_messages`.
+///
+/// Clipboard is handled here rather than in `Scene::apply` because
+/// `Scene::apply` only *returns* scene events and holds no transport, and
+/// every clipboard request has to be answered on one -- the same
+/// interception `api.rs` does for `Ping` ahead of `submit_input`.
+/// `scene.rs`'s own `Request::Data` arm stays as a backstop; after this
+/// nothing reaches it.
+///
+/// Clipboard requests are therefore carried out ahead of the batch's scene
+/// messages instead of in arrival order. The two are independent -- no
+/// clipboard decision reads the scene, and no scene message reads the
+/// clipboard -- so only the order *among* clipboard requests matters, and
+/// that is preserved.
+fn take_clipboard_requests(
+    clipboard: &mut ClipboardSync,
+    messages: impl IntoIterator<Item = RecvType<Request>>,
+    io: &SessionIo<'_>,
+) -> Vec<RecvType<Request>> {
+    let mut rest = Vec::new();
+    for message in messages {
+        match message {
+            RecvType::Object(Request::Data(request)) => {
+                handle_guest_data(clipboard, request, io);
+            }
+            other => rest.push(other),
+        }
+    }
+    rest
+}
+
+/// Translates one wprs data request into a `ClipboardSync` event and carries
+/// out what it decides. Pure translation: every clipboard *decision* lives in
+/// `crate::clipboard`, and nothing here inspects or logs the content.
+fn handle_guest_data(clipboard: &mut ClipboardSync, request: DataRequest, io: &SessionIo<'_>) {
+    let event = match request {
+        DataRequest::SourceRequest(DataSourceRequest::SetSelection(
+            DataSource::Selection,
+            metadata,
+        )) => GuestEvent::SelectionOffered {
+            mime_types: metadata.mime_types,
+        },
+        DataRequest::TransferData(DataSource::Selection, data) => {
+            GuestEvent::TransferFromGuest { bytes: data.0 }
+        }
+        DataRequest::DestinationRequest(DataDestinationRequest::RequestDataTransfer(
+            DataSource::Selection,
+            _mime,
+        )) => GuestEvent::PasteRequested,
+        // Primary selection and drag-and-drop ride these same enums and are
+        // out of scope: they fall through without touching clipboard state.
+        _ => return,
+    };
+
+    apply_sync_action(clipboard.on_guest(event), io);
+}
+
+/// Carries out one decision.
+///
+/// Nothing in here may log the action or its payload: `SyncAction` and
+/// `GuestEvent` both render clipboard content under `{:?}`, so a `?action`
+/// would put a user's clipboard in a log line. MIME types, byte counts and
+/// variant names only.
+///
+/// Every `AnswerGuest` must reach `send`. wprsd has already `take()`n the
+/// pipe fd by the time a paste reaches us; an answer that never goes out
+/// leaves that pipe unwritten and unclosed, and the pasting guest
+/// application blocks on read forever. Hence no `?` and no early return on
+/// this path.
+fn apply_sync_action(action: SyncAction, io: &SessionIo<'_>) {
+    match action {
+        SyncAction::Nothing => {}
+        SyncAction::AskGuestFor { mime } => {
+            io.transport.send(Event::Data(DataEvent::SourceEvent(
+                DataSourceEvent::MimeTypeSendRequestedByDestination(DataSource::Selection, mime),
+            )));
+        }
+        SyncAction::PushToPhone { text } => {
+            io.media
+                .publish_message(io.session, MediaServerMessage::Clipboard { text });
+        }
+        SyncAction::OfferToGuest { mime_types } => {
+            io.transport.send(Event::Data(DataEvent::DestinationEvent(
+                DataDestinationEvent::SelectionSet(
+                    DataSource::Selection,
+                    SourceMetadata::from_mime_types(mime_types),
+                ),
+            )));
+        }
+        SyncAction::AnswerGuest { bytes } => {
+            io.transport.send(Event::Data(DataEvent::TransferData(
+                DataSource::Selection,
+                DataToTransfer(bytes),
+            )));
+        }
+    }
 }
 
 /// Composites every toplevel owed one and submits the frames, returning how
@@ -410,7 +539,7 @@ fn apply_scene_messages(
 /// ~45ms each -- so input has to be served inside it, not only after it.
 fn flush_composites(
     worker: &mut WorkerState,
-    mut between: impl FnMut(&mut InputState, &Scene),
+    mut between: impl FnMut(&mut InputState, &Scene, &mut ClipboardSync),
 ) -> u32 {
     let mut composites = 0;
     for toplevel in std::mem::take(&mut worker.pending_composites) {
@@ -427,7 +556,7 @@ fn flush_composites(
         // batch. Deliberate. Pumping first would only move the same asymmetry
         // onto the last composite, and no consumer compares keyframe timing
         // across streams -- each surface owns its own stream and encoder.
-        between(&mut worker.input, &worker.scene);
+        between(&mut worker.input, &worker.scene, &mut worker.clipboard);
     }
     composites
 }
@@ -462,10 +591,10 @@ fn pump_input(
     commands: &mut tokio::sync::mpsc::Receiver<MediaCommand>,
     input_state: &mut InputState,
     scene: &Scene,
-    encode: &EncodeQueue,
-    transport: &WprsTransport,
+    io: &SessionIo<'_>,
     resize: &mut Option<(Instant, u32, u32)>,
     stats: &mut InputStats,
+    clipboard: &mut ClipboardSync,
 ) {
     let started = Instant::now();
     while let Ok(command) = commands.try_recv() {
@@ -487,19 +616,28 @@ fn pump_input(
                 input: MediaInput::RequestKeyframe,
                 ..
             } => {
-                encode.submit(EncodeCommand::ForceKeyframeAll);
+                io.encode.submit(EncodeCommand::ForceKeyframeAll);
+            }
+            // Intercepted ahead of `InputState::apply`: a clipboard value is
+            // neither a pointer nor a keyboard event and targets no surface,
+            // so there is nothing for the input layer to scope it to.
+            MediaCommand::Input {
+                input: MediaInput::SetClipboard { text },
+                ..
+            } => {
+                apply_sync_action(clipboard.on_phone_clipboard(text), io);
             }
             MediaCommand::Input {
                 attachment_id,
                 input,
                 ..
             } => {
-                if let Err(error) = input_state.apply(attachment_id, input, scene, transport) {
+                if let Err(error) = input_state.apply(attachment_id, input, scene, io.transport) {
                     tracing::warn!(%error, "rejected scoped media input");
                 }
             }
             MediaCommand::Disconnected { attachment_id } => {
-                input_state.disconnect(attachment_id, transport)
+                input_state.disconnect(attachment_id, io.transport)
             }
         }
     }
@@ -847,9 +985,10 @@ mod tests {
         SubsurfacePosition, SurfaceRequest, SurfaceRequestPayload, SurfaceState, WlSurfaceId,
     };
     use wprs::serialization::xdg_shell::{XdgToplevelId, XdgToplevelState};
-    use wprs::serialization::{ClientId, RecvType, Request};
+    use wprs::serialization::{ClientId, Serializer};
 
     use super::*;
+    use crate::clipboard::OFFERED_MIME_TYPES;
     use crate::media::MediaAttachment;
 
     fn session_fixture(name: &str, socket_path: impl Into<String>) -> Session {
@@ -984,6 +1123,7 @@ mod tests {
             input: InputState::default(),
             encode: Arc::new(EncodeQueue::new()),
             pending_composites: std::collections::BTreeSet::new(),
+            clipboard: ClipboardSync::new(),
         }
     }
 
@@ -996,7 +1136,7 @@ mod tests {
         handle_scene_events(worker, events);
         // No-op hook: production pumps input between composites, but these
         // tests assert on what composition produces, not on input timing.
-        flush_composites(worker, |_, _| {});
+        flush_composites(worker, |_, _, _| {});
     }
 
     /// The stream map the encode thread would own, held locally so a test can
@@ -1546,7 +1686,7 @@ mod tests {
         ];
 
         let mut served = 0;
-        let (count, _) = apply_scene_messages(&mut worker, batch, |_, _| served += 1);
+        let (count, _) = apply_scene_messages(&mut worker, batch, |_, _, _| served += 1);
 
         assert_eq!(count, 3);
         assert_eq!(
@@ -1577,7 +1717,7 @@ mod tests {
         }
 
         let mut served = 0;
-        let composites = flush_composites(&mut worker, |_, _| served += 1);
+        let composites = flush_composites(&mut worker, |_, _, _| served += 1);
 
         assert_eq!(composites, 3, "three windows owe three composites");
         assert_eq!(
@@ -1606,7 +1746,7 @@ mod tests {
             "ten commits to one window owe one composite"
         );
         assert_eq!(
-            flush_composites(&mut worker, |_, _| {}),
+            flush_composites(&mut worker, |_, _, _| {}),
             1,
             "and compositing the batch runs exactly once"
         );
@@ -1634,13 +1774,355 @@ mod tests {
         });
 
         let mut served = 0;
-        let composites = flush_composites(&mut worker, |_, _| served += 1);
+        let composites = flush_composites(&mut worker, |_, _, _| served += 1);
 
         assert_eq!(composites, 1, "only the committed surface composites");
         assert_eq!(
             served, 2,
             "input must be pumped after the failure too, not only after the success"
         );
+    }
+
+    /// A headless stand-in for `wprsd`: gives a `WprsTransport` something to
+    /// talk to and hands back the raw `Event`s it sent, so a test can see
+    /// what the clipboard wiring actually put on the wire.
+    ///
+    /// `navette-bridge/src/input.rs` has a fixture of the same shape, built
+    /// on `Serializer::new_server`. That is not usable here.
+    /// `new_server` binds through `wprs::utils::bind_user_socket`, which
+    /// widens the process-wide umask (`umask(S_IXUSR | S_IRWXG | S_IRWXO)`)
+    /// around the bind; a `mkdir` from another test thread landing in that
+    /// window comes back without its own owner-execute bit, so the directory
+    /// is untraversable and unrelated tests fail with `EACCES`. Measured at
+    /// five failures in ten runs of this binary. `navette-bridge` gets away
+    /// with it because every temp dir in *that* binary is created under the
+    /// same lock; the twenty-odd in this one are not, and serializing them
+    /// all on a wprs quirk is not a trade worth making.
+    ///
+    /// So neither end binds a wprs socket: both connect as clients to one
+    /// plain `UnixListener`, and two relay threads splice the accepted
+    /// streams together. wprs is designed to run over an SSH-forwarded
+    /// socket and so passes no file descriptors, only framed bytes, which is
+    /// what makes a byte relay a faithful stand-in for the real link.
+    struct FakeWprsd {
+        events: calloop::channel::Channel<RecvType<Event>>,
+        _server: Serializer<Request, Event>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl FakeWprsd {
+        fn connect() -> (WprsTransport, Self) {
+            let dir = tempfile::tempdir().expect("create temp dir for the relay socket");
+            let socket = dir.path().join("wprs.sock");
+            let listener = UnixListener::bind(&socket).expect("bind the relay socket");
+            // Both connects complete against the backlog, so they are
+            // accepted below in the order they were made here.
+            let transport = WprsTransport::connect(&socket).expect("connect the bridge end");
+            let mut server: Serializer<Request, Event> =
+                Serializer::new_client(&socket).expect("connect the fake wprsd end");
+            let (bridge_end, _) = listener.accept().expect("accept the bridge end");
+            let (wprsd_end, _) = listener.accept().expect("accept the fake wprsd end");
+            splice(&bridge_end, &wprsd_end);
+            splice(&wprsd_end, &bridge_end);
+            let events = server.reader().expect("fake wprsd reader already taken");
+            (
+                transport,
+                Self {
+                    events,
+                    _server: server,
+                    _dir: dir,
+                },
+            )
+        }
+
+        /// The next event the transport sent, skipping the connection
+        /// preamble (`WprsClientConnect`, `Output`) `WprsTransport::connect`
+        /// emits on its own.
+        fn recv(&self) -> Event {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match self.events.try_recv() {
+                    Ok(RecvType::Object(Event::WprsClientConnect | Event::Output(_)))
+                    | Ok(RecvType::RawBuffer(_)) => continue,
+                    Ok(RecvType::Object(event)) => return event,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "timed out waiting for a wprs event"
+                        );
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        panic!("fake wprsd channel disconnected")
+                    }
+                }
+            }
+        }
+
+        /// Asserts nothing further arrives -- used to prove a would-be event
+        /// was never sent rather than merely delayed.
+        fn assert_no_further_events(&self) {
+            thread::sleep(Duration::from_millis(20));
+            match self.events.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty)
+                | Ok(RecvType::Object(Event::WprsClientConnect | Event::Output(_))) => {}
+                Ok(RecvType::Object(event)) => {
+                    // Names the variant only: an event carrying clipboard
+                    // text must not be rendered into a panic message either.
+                    panic!("expected no further events, got {}", event_name(&event))
+                }
+                Ok(RecvType::RawBuffer(_)) => {
+                    panic!("expected no further events, got a raw buffer")
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("fake wprsd channel disconnected")
+                }
+            }
+        }
+    }
+
+    /// Copies one direction of the relay until its source closes.
+    fn splice(from: &std::os::unix::net::UnixStream, to: &std::os::unix::net::UnixStream) {
+        let mut from = from.try_clone().expect("clone the relay source");
+        let mut to = to.try_clone().expect("clone the relay sink");
+        thread::spawn(move || {
+            let _ = std::io::copy(&mut from, &mut to);
+            let _ = to.shutdown(std::net::Shutdown::Write);
+        });
+    }
+
+    /// The variant name of an event, with no payload. Clipboard text must
+    /// not reach a log line or an assertion message.
+    fn event_name(event: &Event) -> &'static str {
+        match event {
+            Event::WprsClientConnect => "WprsClientConnect",
+            Event::Output(_) => "Output",
+            Event::PointerFrame(_) => "PointerFrame",
+            Event::KeyboardEvent(_) => "KeyboardEvent",
+            Event::Toplevel(_) => "Toplevel",
+            Event::Popup(_) => "Popup",
+            Event::Data(_) => "Data",
+            Event::Surface(_) => "Surface",
+        }
+    }
+
+    fn data_request(request: DataRequest) -> RecvType<Request> {
+        RecvType::Object(Request::Data(request))
+    }
+
+    /// The next server message the hub published. Mirrors `recv_packet`,
+    /// which does the same for media packets.
+    async fn recv_message(client: &MediaAttachment) -> MediaServerMessage {
+        tokio::time::timeout(Duration::from_secs(5), client.recv_message())
+            .await
+            .expect("a server message should have been published before the timeout")
+            .expect("media channel closed unexpectedly")
+    }
+
+    /// Everything one clipboard test needs, driven through the same two
+    /// entry points `run_bridge` uses: `take_clipboard_requests` for what
+    /// the guest sends, and `pump_input` for what the phone sends.
+    struct ClipboardFixture {
+        worker: WorkerState,
+        transport: WprsTransport,
+        wprsd: FakeWprsd,
+        media: MediaHub,
+        client: MediaAttachment,
+        commands: tokio::sync::mpsc::Receiver<MediaCommand>,
+    }
+
+    impl ClipboardFixture {
+        fn new() -> Self {
+            let media = MediaHub::default();
+            let commands = media.register_session("s1");
+            let client = media.attach("s1").expect("attach to the fixture session");
+            let (transport, wprsd) = FakeWprsd::connect();
+            Self {
+                worker: worker_fixture(Scene::default()),
+                transport,
+                wprsd,
+                media,
+                client,
+                commands,
+            }
+        }
+
+        /// One batch through the loop's partition, returning what is left
+        /// for `apply_scene_messages`.
+        fn send_requests(&mut self, messages: Vec<RecvType<Request>>) -> Vec<RecvType<Request>> {
+            let io = SessionIo {
+                transport: &self.transport,
+                media: &self.media,
+                encode: &self.worker.encode,
+                session: "s1",
+            };
+            take_clipboard_requests(&mut self.worker.clipboard, messages, &io)
+        }
+
+        /// One input pump, the same call the loop makes between units of
+        /// work.
+        fn pump(&mut self) {
+            let io = SessionIo {
+                transport: &self.transport,
+                media: &self.media,
+                encode: &self.worker.encode,
+                session: "s1",
+            };
+            let mut resize = None;
+            let mut stats = InputStats::default();
+            pump_input(
+                &mut self.commands,
+                &mut self.worker.input,
+                &self.worker.scene,
+                &io,
+                &mut resize,
+                &mut stats,
+                &mut self.worker.clipboard,
+            );
+        }
+    }
+
+    /// A guest copy travels: the offer comes in, the bridge asks the guest
+    /// for the text, the transfer comes in, and the text reaches the media
+    /// hub. None of it goes through `Scene::apply`, which is the point --
+    /// `Scene::apply` only returns scene events and has no transport to ask
+    /// on.
+    #[tokio::test]
+    async fn a_guest_copy_reaches_the_media_hub() {
+        let mut fixture = ClipboardFixture::new();
+
+        fixture.send_requests(vec![data_request(DataRequest::SourceRequest(
+            DataSourceRequest::SetSelection(
+                DataSource::Selection,
+                SourceMetadata::from_mime_types(vec!["text/plain".to_string()]),
+            ),
+        ))]);
+
+        assert!(
+            matches!(
+                fixture.wprsd.recv(),
+                Event::Data(DataEvent::SourceEvent(
+                    DataSourceEvent::MimeTypeSendRequestedByDestination(DataSource::Selection, mime)
+                )) if mime == "text/plain"
+            ),
+            "the bridge must ask the guest for the offered text"
+        );
+
+        fixture.send_requests(vec![data_request(DataRequest::TransferData(
+            DataSource::Selection,
+            DataToTransfer(b"hello".to_vec()),
+        ))]);
+
+        assert_eq!(
+            recv_message(&fixture.client).await,
+            MediaServerMessage::Clipboard {
+                text: "hello".into()
+            },
+            "the guest's clipboard text must reach the media hub"
+        );
+    }
+
+    /// The other direction, end to end: the phone's copy is offered to the
+    /// guest, and the guest's later paste is answered with that text.
+    #[test]
+    fn a_phone_copy_is_offered_and_answered() {
+        let mut fixture = ClipboardFixture::new();
+
+        fixture
+            .client
+            .submit_input(MediaInput::SetClipboard {
+                text: "hello".into(),
+            })
+            .expect("the fixture session accepts input");
+        fixture.pump();
+
+        let offered: Vec<String> = OFFERED_MIME_TYPES
+            .iter()
+            .map(|mime| (*mime).to_string())
+            .collect();
+        assert!(
+            matches!(
+                fixture.wprsd.recv(),
+                Event::Data(DataEvent::DestinationEvent(
+                    DataDestinationEvent::SelectionSet(DataSource::Selection, metadata)
+                )) if metadata.mime_types == offered
+            ),
+            "the phone's clipboard must be offered to the guest"
+        );
+
+        fixture.send_requests(vec![data_request(DataRequest::DestinationRequest(
+            DataDestinationRequest::RequestDataTransfer(
+                DataSource::Selection,
+                "text/plain".to_string(),
+            ),
+        ))]);
+
+        assert!(
+            matches!(
+                fixture.wprsd.recv(),
+                Event::Data(DataEvent::TransferData(
+                    DataSource::Selection,
+                    DataToTransfer(bytes)
+                )) if bytes.as_slice() == b"hello".as_slice()
+            ),
+            "the guest's paste must be answered with the phone's text"
+        );
+    }
+
+    /// The hang regression, at the wiring level. wprsd `take()`s the pipe fd
+    /// when it forwards the paste, so a paste we never answer leaves that
+    /// pipe unwritten and unclosed and the pasting guest application blocks
+    /// on read forever. `clipboard.rs` proves the decision is always to
+    /// answer; this proves the answer reaches the wire even when there is
+    /// nothing to say.
+    #[test]
+    fn a_paste_with_no_phone_copy_is_still_answered_on_the_wire() {
+        let mut fixture = ClipboardFixture::new();
+
+        fixture.send_requests(vec![data_request(DataRequest::DestinationRequest(
+            DataDestinationRequest::RequestDataTransfer(
+                DataSource::Selection,
+                "text/plain".to_string(),
+            ),
+        ))]);
+
+        assert!(
+            matches!(
+                fixture.wprsd.recv(),
+                Event::Data(DataEvent::TransferData(
+                    DataSource::Selection,
+                    DataToTransfer(bytes)
+                )) if bytes.is_empty()
+            ),
+            "a paste with nothing to answer with must still be answered, or the guest hangs"
+        );
+    }
+
+    /// Only `DataSource::Selection` is the clipboard: primary selection and
+    /// drag-and-drop ride the same enums and must produce nothing. And every
+    /// message that is not a data request has to come back out of the
+    /// partition, or the scene stops being drawn.
+    #[test]
+    fn primary_selection_is_ignored_and_scene_messages_pass_through() {
+        let mut fixture = ClipboardFixture::new();
+
+        let rest = fixture.send_requests(vec![
+            RecvType::RawBuffer(vec![0; 8]),
+            data_request(DataRequest::SourceRequest(DataSourceRequest::SetSelection(
+                DataSource::Primary,
+                SourceMetadata::from_mime_types(vec!["text/plain".to_string()]),
+            ))),
+            commit(surface_state(1, 1)),
+        ]);
+
+        assert_eq!(
+            rest.len(),
+            2,
+            "only data requests are taken out of the batch"
+        );
+        assert!(matches!(rest[0], RecvType::RawBuffer(_)));
+        assert!(matches!(rest[1], RecvType::Object(Request::Surface(_))));
+        fixture.wprsd.assert_no_further_events();
     }
 
     /// The real thread, not the synchronous drain every other test uses: it
