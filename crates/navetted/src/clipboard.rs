@@ -102,6 +102,7 @@ impl ClipboardSync {
                 }
 
                 self.echo_from_phone = Some(text.clone());
+                self.phone_text = Some(text.clone());
                 SyncAction::PushToPhone { text }
             }
             // Always answer. wprsd has taken the pipe fd; leaving it
@@ -400,6 +401,30 @@ mod tests {
                 bytes: b"stale".to_vec()
             }),
             SyncAction::Nothing
+        );
+    }
+
+    /// `phone_text` must track the phone's actual clipboard, including
+    /// values that arrived via a guest-to-phone push, not just values set
+    /// directly by `on_phone_clipboard`. A paste answered from a stale
+    /// `phone_text` hands the guest data the phone no longer has.
+    #[test]
+    fn a_paste_after_a_guest_push_answers_with_the_pushed_text_not_a_stale_value() {
+        let mut sync = ClipboardSync::new();
+        sync.on_phone_clipboard("foo".into());
+        sync.on_guest(offer(&["text/plain"]));
+        assert_eq!(
+            sync.on_guest(GuestEvent::TransferFromGuest {
+                bytes: b"bar".to_vec()
+            }),
+            SyncAction::PushToPhone { text: "bar".into() }
+        );
+        assert_eq!(
+            sync.on_guest(GuestEvent::PasteRequested),
+            SyncAction::AnswerGuest {
+                bytes: b"bar".to_vec()
+            },
+            "phone_text must reflect the value just pushed to the phone, not the earlier one"
         );
     }
 }
