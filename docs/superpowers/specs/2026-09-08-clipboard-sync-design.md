@@ -90,9 +90,28 @@ third arm in the `select!` at `api.rs:140` that sends it as
 
 This is the only genuinely new structure in the feature.
 
+## Where the handling lives
+
+In `crates/navetted/src/bridge.rs`, **not** `crates/navette-bridge/src/scene.rs`.
+
+`scene.apply()` only *returns* `Vec<SceneEvent>`; it has no transport and
+cannot send. Every `transport.send(Event::...)` in the tree is in
+`navette-bridge`'s `transport.rs` and `input.rs`, never `scene.rs`. So
+clipboard, which must send, cannot be handled there.
+
+`bridge.rs:393` passes each raw `RecvType<Request>` to `scene.apply()`, and
+at the batch-drain site (`bridge.rs:247-250`) `transport` is already in
+scope. **`Request::Data` is partitioned out of the batch there**, before it
+reaches `apply_scene_messages` — the same interception pattern `api.rs`
+uses for `Ping` ahead of `submit_input`.
+
+This keeps clipboard state out of the `navette-bridge` crate entirely.
+`scene.rs:365`'s `Request::Data(_) => Ok(Vec::new())` stays as a backstop;
+after interception nothing reaches it.
+
 ## State ownership
 
-Two plain fields on the bridge loop in `crates/navetted/src/bridge.rs`. No
+Plain fields on the bridge loop in `crates/navetted/src/bridge.rs`. No
 lock: calloop is single-threaded, and both the guest's pull and our answer
 arrive there. Putting this state behind an `Arc<Mutex<>>` elsewhere would
 add a lock crossing to every paste for nothing.
@@ -106,10 +125,11 @@ phone_text: Option<String>,
 /// attributed to the current offer.
 guest_offer_generation: u64,
 
-/// Last value sent to the guest, and last value pushed to the phone.
-/// Compared before forwarding, to break the echo loop described below.
-last_sent_to_guest: Option<String>,
-last_pushed_to_phone: Option<String>,
+/// One-shot echo tokens. Set when we send in a direction; consumed by
+/// the first matching inbound value. See the echo loop below -- these
+/// must be cleared on match, not retained.
+echo_token_to_guest: Option<String>,
+echo_token_to_phone: Option<String>,
 ```
 
 `guest_offer_generation` deliberately does not promise more than the
@@ -163,6 +183,22 @@ guests, which is the common case for browsers.
 4. Bridge answers
    `Event::Data(DataEvent::TransferData(DataSource::Selection, DataToTransfer(bytes)))`.
 
+## On attach
+
+The media hub replays every stream's config and keyframe when a client
+attaches (`media.rs:150-153`). **Clipboard deliberately has no equivalent.**
+
+Guest→phone is not replayed. If the guest copied while no phone was
+attached, the phone's clipboard is untouched until the guest copies again.
+Two reasons: overwriting the phone's own clipboard on every attach would
+clobber whatever the user had there, and not replaying means guest
+clipboard content is never retained past the moment it is forwarded.
+
+Phone→guest needs no replay. `phone_text` lives on the bridge loop, which
+outlives any single attachment, and wprsd already holds the offer we sent
+via `set_data_device_selection` — so a guest paste still works across a
+detach and reattach.
+
 ## Hazards
 
 These are the three failure modes the implementation must design against,
@@ -175,11 +211,18 @@ sets its selection → if wprsd sends `SetSelection` back to us, we push it
 to the phone → Android's listener fires on our own write → phone sets
 clipboard. Forever.
 
-**Mitigation:** remember the last value pushed in each direction and
-suppress a matching value arriving from the other side. Two `Option<String>`
-fields compared before forwarding. This works whether or not wprsd
-actually echoes, which is why it is specified rather than made conditional
-on the open question below.
+**Mitigation:** a **one-shot** token per direction. When we send a value,
+store it. The first inbound value that matches is dropped *and the token is
+cleared*. Everything after forwards normally.
+
+The one-shot part is the whole mitigation. A token that is merely *compared*
+and retained is a silent-drop bug: copy "foo" on the phone, and "foo"
+legitimately copied on the guest is suppressed forever after. That bug
+survives naive tests because tests use distinct strings, so the
+discriminating case is named explicitly in the testing section.
+
+This works whether or not wprsd actually echoes, which is why it is
+specified unconditionally rather than made to depend on open question 1.
 
 This is the most likely defect in the feature.
 
@@ -269,10 +312,21 @@ grep across `crates/` and `android/`.
 
 ## Testing
 
-**Rust unit** — MIME selection including the no-text-offered case; the size
-cap in `validate()`; UTF-8 decode failure; echo suppression in both
-directions; **a pull answered when `phone_text` is `None`**, which is the
-hang regression.
+**Rust unit** — MIME selection including the no-text-offered case; UTF-8
+decode failure; **a pull answered when `phone_text` is `None`**, which is
+the hang regression.
+
+Two tests carry more weight than the rest, because each pins a bug that
+would otherwise pass a naive suite:
+
+- **The echo token is one-shot.** Sync a value in one direction, then have
+  the *same text* legitimately copied on the other side, and assert it still
+  propagates. A retained-token implementation passes every distinct-string
+  test and fails only this one.
+- **The size cap has its own `validate()` arm.** `MediaInput::validate()`
+  ends in `_ => Ok(())`, so a missing `SetClipboard` arm silently accepts
+  any length. The test must assert that an over-cap `SetClipboard` is
+  *rejected*, not that a normal one is accepted.
 
 **Rust integration** — a scripted wprs `Request` sequence through the bridge
 loop asserting the emitted `Event` sequence, for both flows. Covers the
