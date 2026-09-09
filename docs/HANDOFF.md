@@ -2562,3 +2562,33 @@ permanent record):**
   equals the daemon's last push is suppressed. Unrelated to, and not
   fixed by, the resume-ordering bug found above — that bug drops the send
   before this heuristic even runs.
+
+### Follow-ups surfaced by the final fix-wave re-review (2026-09-09)
+
+Three observations from the last review pass. None blocks merge; all three were
+verified as pre-existing or by-design, and none was introduced by the fix wave.
+
+- **A parked clipboard retry can fire after newer text was already sent.**
+  `SessionScreen.kt`'s immediate-success branch returns before
+  `pendingClipboardResend?.cancel()`, so a retry parked for older text `A` can
+  still land after newer text `B` went out — a stale revert on the guest side.
+  That early return is byte-identical before and after the fix wave, so this
+  predates it. Worth noting that the new shape is *more* recoverable than the
+  old: ending with `lastSent = A` while the phone's clipboard holds `B` means
+  the next resume resends `B`, where the old decision-time write left
+  `lastSent = B` and suppressed exactly that correction.
+
+- **`MAX_INPUT_MESSAGE_BYTES` is a hand-maintained cross-language mirror.**
+  `ClipboardBridge.kt` mirrors `crates/navette-protocol/src/media.rs`'s
+  `MAX_INPUT_MESSAGE` (16 KiB) with no test binding the two, so they can drift
+  silently. This is the shape the size fix asked for — the client must know the
+  daemon's graceful limit to stay under it — but a drift guard would be a
+  separate change. If the Rust constant moves, this one must move with it.
+
+- **The Rust `MAX_CLIPBOARD_BYTES` (1 MiB) validate path stays unreachable over
+  this transport.** The WebSocket frame cap rejects first, so that arm never
+  runs. Left in place deliberately: it is correct, cheap, and would become live
+  again if the transport limit were ever raised. The behaviour that actually
+  governs is documented under check 5 above — refusal between 16 and 32 KiB,
+  teardown above 32 KiB, and a client-side guard that now keeps sends at or
+  under 16 KiB so neither is reached.
