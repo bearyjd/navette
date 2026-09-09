@@ -1815,15 +1815,16 @@ mod tests {
             let dir = tempfile::tempdir().expect("create temp dir for the relay socket");
             let socket = dir.path().join("wprs.sock");
             let listener = UnixListener::bind(&socket).expect("bind the relay socket");
-            // Both connects complete against the backlog, so they are
-            // accepted below in the order they were made here.
             let transport = WprsTransport::connect(&socket).expect("connect the bridge end");
             let mut server: Serializer<Request, Event> =
                 Serializer::new_client(&socket).expect("connect the fake wprsd end");
-            let (bridge_end, _) = listener.accept().expect("accept the bridge end");
-            let (wprsd_end, _) = listener.accept().expect("accept the fake wprsd end");
-            splice(&bridge_end, &wprsd_end);
-            splice(&wprsd_end, &bridge_end);
+            // Both connects completed against the backlog, so two accepts
+            // succeed here. Which end each one is does not matter: the relay
+            // below is symmetric, so it pairs them either way.
+            let (one, _) = listener.accept().expect("accept the first end");
+            let (other, _) = listener.accept().expect("accept the second end");
+            splice(&one, &other);
+            splice(&other, &one);
             let events = server.reader().expect("fake wprsd reader already taken");
             (
                 transport,
@@ -1861,21 +1862,27 @@ mod tests {
 
         /// Asserts nothing further arrives -- used to prove a would-be event
         /// was never sent rather than merely delayed.
+        ///
+        /// Drains to empty rather than inspecting one event. `connect` leaves
+        /// two preamble events queued ahead of anything a test provokes, so a
+        /// single `try_recv` would consume one of those, report success, and
+        /// never look at the event it exists to catch.
         fn assert_no_further_events(&self) {
             thread::sleep(Duration::from_millis(20));
-            match self.events.try_recv() {
-                Err(std::sync::mpsc::TryRecvError::Empty)
-                | Ok(RecvType::Object(Event::WprsClientConnect | Event::Output(_))) => {}
-                Ok(RecvType::Object(event)) => {
-                    // Names the variant only: an event carrying clipboard
-                    // text must not be rendered into a panic message either.
-                    panic!("expected no further events, got {}", event_name(&event))
-                }
-                Ok(RecvType::RawBuffer(_)) => {
-                    panic!("expected no further events, got a raw buffer")
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    panic!("fake wprsd channel disconnected")
+            loop {
+                match self.events.try_recv() {
+                    Ok(RecvType::Object(Event::WprsClientConnect | Event::Output(_)))
+                    | Ok(RecvType::RawBuffer(_)) => continue,
+                    Ok(RecvType::Object(event)) => {
+                        // Names the variant only: an event carrying clipboard
+                        // text must not be rendered into a panic message
+                        // either.
+                        panic!("expected no further events, got {}", event_name(&event))
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        panic!("fake wprsd channel disconnected")
+                    }
                 }
             }
         }
