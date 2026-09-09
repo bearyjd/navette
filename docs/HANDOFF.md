@@ -2199,3 +2199,186 @@ Two deliberate non-changes, so nobody "fixes" them later:
   Left as an honest artefact of the design pass rather than rewritten after
   the fact; the truth lives in `android/README.md`'s Known limitations, which
   is where anyone comparing the two clients will actually look.
+
+## Clipboard sync: on-device verification, one real bug found in the Android reconnect path (2026-09-08)
+
+**Rebuild/restart evidence.** The running `navetted` (PID 4032419, launched
+~22 hours earlier, binary timestamped Sep 8 00:39) predated ten source files
+including every clipboard file — confirmed stale before touching it.
+`cargo build --release` succeeded; `find crates -name "*.rs" -newer
+target/release/navetted` returned empty immediately after, and again after
+every subsequent rebuild in this session. The stale daemon was killed and a
+fresh one started against the same tailnet address, the same already-running
+`wprsd` (session `mvp`, `org.mozilla.firefox`), confirmed via `navette ls`
+surviving the daemon restart. Device: Pixel 10 Pro Fold, `57211FDCG0023C`,
+folded (cover screen, landscape once attached) throughout.
+
+Two temporary, content-free `tracing::debug!` lines (variant name and
+byte/mime counts only, per the existing rule in `bridge.rs` that clipboard
+content itself must never be logged) were added to `handle_guest_data`,
+`apply_sync_action`, and the `SetClipboard` arm of `pump_input` to make the
+state machine's actions observable without a wprsd-level log target. Used to
+gather every finding below, then reverted before this commit — `git diff
+crates/navetted/src/bridge.rs` is empty.
+
+**The six checks:**
+
+1. **Guest → phone: PASS.** Selected `fedoraproject.org/start/` in Firefox's
+   address bar (an XWayland client) and copied with a real `Ctrl+C` sent to
+   the phone's focused session. It arrived on the Android system clipboard
+   and was confirmed two ways: Gboard's clipboard-suggestion strip showed
+   `https://fedoraproject.org/start/` immediately, and tapping **Paste** in
+   the stock Settings search field inserted it verbatim.
+2. **Phone → guest: the Android UI path FAILED, 3/3 attempts — a real,
+   deterministic bug, not flakiness.** See "New finding" below. The
+   underlying daemon/wprsd/XWayland pipeline was then verified directly
+   (bypassing the broken UI) by opening a second WebSocket to the same
+   session's media endpoint and sending `{"type":"set_clipboard","text":
+   "ScriptProbeMarker"}` by hand: `clipboard: phone SetClipboard len=17` →
+   `action OfferToGuest` with the five canonical MIME types, and a `Ctrl+V`
+   into Firefox's address bar (real device, real guest) inserted
+   `ScriptProbeMarker` correctly. So the wire protocol and the daemon-side
+   state machine are sound on real hardware; the break is entirely in the
+   Android client's reconnect wiring.
+3. **Echo-loop check: no repeated traffic observed on either direction, on
+   real hardware.** Guest → phone: one address-bar copy produced two
+   `SelectionOffered` events from Firefox milliseconds apart (it re-announces
+   the same selection with an updated target list) and correspondingly two
+   `TransferFromGuest` deliveries — but only the first produced
+   `PushToPhone`; the second returned `Nothing` via the `awaiting_guest_transfer`
+   guard, so the phone received the text exactly once despite Firefox's
+   double announcement. Phone → guest (the direction the open question is
+   about): after `OfferToGuest` fired for `ScriptProbeMarker`, several
+   bridge-loop iterations passed with no further clipboard activity in the
+   log before the guest actually pulled the data; after the guest's paste
+   completed (`PasteRequested` → `AnswerGuest{bytes:17}`), several more
+   iterations passed with still no `SelectionOffered` coming back from wprsd.
+   No echo observed in either window.
+4. **Unanswered-pull check: UNRUN — could not be driven to the scenario it
+   tests, and here is exactly why.** The check needs a guest paste while
+   `phone_text` has *never* been set on that session. Two blockers, both
+   recorded honestly rather than papered over:
+   - A genuinely fresh session (`check4`, then `check4b`, both
+     `org.mozilla.firefox`) failed to start in this environment on both
+     attempts: `session bridge stopped session=check4 error=failed to
+     connect to /run/user/1000/navette/check4/wprs.sock`, with Firefox
+     falling back to X11 (`DISPLAY=':0'`) inside its own sandbox. This
+     reproduced identically for `check4b` after a longer wait, so it reads as
+     environment-specific (this sandbox's second-`wprsd` spawn path), not a
+     timing race and not a clipboard-code issue.
+   - On the existing `mvp` session, restarting `navetted` does reset
+     `ClipboardSync`'s in-memory `phone_text` to `None` (confirmed: the
+     daemon has no on-disk state), but the guest's own paste was still
+     satisfied with old text (`ScriptProbeMarker`) — and *zero*
+     `PasteRequested` lines appeared in the log for that paste. Firefox/XWayland
+     evidently retains its own copy of the last-transferred CLIPBOARD value
+     and satisfies later pastes locally, without asking navetted again. That
+     means once any transfer has ever happened on a session, this specific
+     hang scenario can no longer be observed from the guest side on that
+     session, by design of X11's clipboard-caching convention — a real
+     constraint on how this check can ever be exercised on-device, not a
+     defect. The unit-level guarantee
+     (`a_paste_with_no_phone_text_is_still_answered` in `clipboard.rs`)
+     remains the only verification of this path; it was not confirmed
+     on-device this session.
+5. **Oversized check (>1 MiB from the phone): PASS, but the actual rejection
+   happens one layer lower than expected.** Sent a 1,049,076-byte
+   `SetClipboard` (1 MiB + 500 bytes) directly over the media WebSocket. It
+   never reached `MediaInput` JSON parsing or `ClipboardSync` at all — the
+   underlying transport (axum/tokio-tungstenite) enforces a 32,768-byte
+   per-message cap by default, and the connection was reset with `media
+   WebSocket receive failed error=Space limit exceeded: Message too long:
+   1049113 > 32768`. The daemon, the `mvp` session, and the attached phone
+   all survived: `/healthz` stayed `ok`, `navette ls` still showed `mvp`
+   running, and a screenshot taken immediately after showed the guest's
+   video still live and the app fully responsive. So "refused, not
+   truncated, session survives" holds — but because any real clipboard text
+   over `MAX_CLIPBOARD_BYTES` (1 MiB) is necessarily also over 32 KiB, the
+   `MediaInput::validate()` / `InputValidationError::ClipboardTooLarge` path
+   that Task 1 built and unit-tests is unreachable for oversized clipboard
+   pastes arriving over this transport in practice — the WebSocket layer
+   rejects first, every time. Worth someone deciding whether that's fine
+   (it is, for the user-facing contract) or worth raising the frame limit so
+   the intended error path is the one that actually fires.
+6. **MIME spellings, real guest.** Firefox (an XWayland client) offered, in
+   one `SelectionOffered`: `text/plain;charset=utf-8`, `UTF8_STRING`,
+   `COMPOUND_TEXT`, `TEXT`, `text/plain`, `STRING` — with
+   `text/plain;charset=utf-8` and `text/plain` each appearing twice, and a
+   second, immediately-following announcement adding `SAVE_TARGETS`.
+   `select_text_mime`'s preference order picked `text/plain;charset=utf-8`
+   both times, correctly matching the guest's own spelling rather than a
+   normalised one. Resolves spec open question 2 for at least one real,
+   common XWayland guest.
+
+**Open question 1 — does wprsd echo `SetSelection` back to us on the
+XWayland path? Not observed, under real but limited conditions.** Across two
+separate windows on this hardware (a bare `OfferToGuest`, and an
+`OfferToGuest` followed by a real guest paste through to `AnswerGuest`), no
+`SelectionOffered` arrived back from wprsd attributable to our own push. This
+is the first real evidence on this question in either direction — it settles
+the *pure*-Wayland path from source (Task 6: `set_clipboard_selection` never
+calls `handler.new_selection`) and now adds a negative on-device result for
+XWayland specifically, one guest, one host, short observation windows. It
+does not prove absence. Per the controller's asymmetry-of-harm ruling, this
+makes removing the `echo_from_guest` one-shot token a candidate for a future
+evidence-backed change rather than a guess — but one session's evidence is
+thin, and `ClipboardSync` was deliberately left unchanged this session; the
+decision stays with whoever owns that ruling.
+
+**Device hygiene.** No `device_state` override was ever applied this
+session (`mOverrideState=Optional.empty` confirmed both before touching the
+device and again at the end) and `pointer_location` was already `0`. Nothing
+to reset.
+
+**New finding — phone → guest clipboard is silently dropped on every
+reconnect through the real Android UI.** Reproduced 3/3 times, always with
+the identical Android logcat line `MediaClient: dropped
+SetClipboard(text=...): no socket`. Root cause, confirmed from source:
+`SessionScreen.kt`'s `DisposableEffect(controller)` (line 177) registers a
+`LifecycleEventObserver` on the *already-resumed* lifecycle
+(`lifecycleOwner.lifecycle.addObserver(clipboardObserver)`, line 196) —
+which, per `androidx.lifecycle` semantics, synchronously replays the missed
+`ON_RESUME` event the instant it is added — and only calls `controller.open()`
+on the very next line (197). `controller.open()` is what calls
+`client.connect()`, which is what sets `MediaClient.webSocket` non-null. So
+the resume-triggered clipboard read (`onLocalClipboardResume`, added
+specifically so a copy made while Navette was backgrounded isn't missed —
+see `ClipboardBridge`'s own doc comment) fires and calls `sendInput` *before*
+a socket exists on every single reattach, not merely on a lucky/unlucky
+timing window. `MediaClient.sendInput` (`net/MediaClient.kt:153`) drops
+silently in that case (`logDropped`, debug-level, "no socket") and nothing
+ever retries it — `SessionController.open()` has no clipboard-resend logic.
+Net effect: the ordinary real-world flow — copy something in another app,
+switch back to Navette — loses that copy every time a reconnect happens on
+the way back in, which in this environment was every time (each background
+period was long enough that the media socket was torn down, observed as
+`WebSocket receive failed error=IO error: Connection reset by peer` in
+`navetted`'s own log). Not filed as a fix here — Task 9 is verification
+only — but it is the one thing in this branch most likely to make a real
+user conclude "clipboard sync doesn't work," since it hits the single most
+natural way to use the feature.
+
+**Carried follow-ups (from prior task reviews, recorded here for the
+permanent record):**
+- `RequestDataTransfer(DataSource::Primary, ..)` is still unanswered — the
+  same hang shape as the `Selection` path fixed in this branch, but
+  pre-existing and deliberately out of scope (`bridge.rs:2119` is the only
+  reference to `DataSource::Primary`, and it is not routed through
+  `ClipboardSync`).
+- `navette-bridge/src/input.rs:553` still uses `Serializer::new_server`,
+  which widens the process-wide umask around its bind. Harmless today, but
+  the first unguarded `tempfile::tempdir()` added to that crate's tests will
+  start flaking — measured in `navetted`: 5 failures in 10 runs before the
+  workaround.
+- `SessionScreen.kt` is now **1041 lines** against this project's 800-line
+  ceiling (measured this session; it was ~1008 at last count). Extracting a
+  `SessionController` remains deferred and is now overdue.
+- The stale-echo-token window is real but bounded: exactly one legitimate
+  same-text copy can be dropped, then the state self-heals on the next
+  distinct value. No correct in-layer fix exists — it needs a correlation id
+  wprs does not carry.
+- Same-text equality is a heuristic throughout `ClipboardBridge` and
+  `ClipboardSync`; a genuine resume whose local clipboard coincidentally
+  equals the daemon's last push is suppressed. Unrelated to, and not
+  fixed by, the resume-ordering bug found above — that bug drops the send
+  before this heuristic even runs.
