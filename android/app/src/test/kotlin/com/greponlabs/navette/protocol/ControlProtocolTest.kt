@@ -30,9 +30,6 @@ class ControlProtocolTest {
             5L to RequestCommand.Kill("work") to """{"request_id":5,"type":"kill","session":"work"}""",
             6L to RequestCommand.Attach("work") to """{"request_id":6,"type":"attach","session":"work"}""",
             7L to RequestCommand.Detach("work") to """{"request_id":7,"type":"detach","session":"work"}""",
-            8L to RequestCommand.SetClipboard("hello") to
-                """{"request_id":8,"type":"set_clipboard","text":"hello"}""",
-            9L to RequestCommand.GetClipboard to """{"request_id":9,"type":"get_clipboard"}""",
         )
 
         for ((requestIdAndCommand, expectedJson) in cases) {
@@ -57,11 +54,6 @@ class ControlProtocolTest {
 
         val ack = ControlCodec.decodeResponse("""{"request_id":3,"status":"ok","type":"ack"}""")
         assertEquals(ResponseOutcome.Ok(ResponseResult.Ack), ack.outcome)
-
-        val clipboard = ControlCodec.decodeResponse(
-            """{"request_id":4,"status":"ok","type":"clipboard"}""",
-        )
-        assertEquals(ResponseOutcome.Ok(ResponseResult.Clipboard(null)), clipboard.outcome)
     }
 
     @Test

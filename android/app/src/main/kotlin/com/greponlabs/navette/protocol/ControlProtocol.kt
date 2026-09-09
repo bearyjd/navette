@@ -56,14 +56,6 @@ sealed interface RequestCommand {
     @Serializable
     @SerialName("detach")
     data class Detach(val session: String) : RequestCommand
-
-    @Serializable
-    @SerialName("set_clipboard")
-    data class SetClipboard(val text: String) : RequestCommand
-
-    @Serializable
-    @SerialName("get_clipboard")
-    data object GetClipboard : RequestCommand
 }
 
 @Serializable
@@ -87,10 +79,6 @@ sealed interface ResponseResult {
     @Serializable
     @SerialName("ack")
     data object Ack : ResponseResult
-
-    @Serializable
-    @SerialName("clipboard")
-    data class Clipboard(val text: String? = null) : ResponseResult
 }
 
 sealed interface ResponseOutcome {

@@ -41,10 +41,6 @@ pub enum RequestCommand {
     Detach {
         session: String,
     },
-    SetClipboard {
-        text: String,
-    },
-    GetClipboard,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -90,23 +86,11 @@ pub enum ResponseOutcome {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseResult {
-    Apps {
-        apps: Vec<App>,
-    },
-    Sessions {
-        sessions: Vec<Session>,
-    },
-    Session {
-        session: Session,
-    },
-    Attach {
-        attach: AttachInfo,
-    },
+    Apps { apps: Vec<App> },
+    Sessions { sessions: Vec<Session> },
+    Session { session: Session },
+    Attach { attach: AttachInfo },
     Ack,
-    Clipboard {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        text: Option<String>,
-    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -186,8 +170,6 @@ mod tests {
             json!({"request_id": 5, "type": "kill", "session": "work"}),
             json!({"request_id": 6, "type": "attach", "session": "work"}),
             json!({"request_id": 7, "type": "detach", "session": "work"}),
-            json!({"request_id": 8, "type": "set_clipboard", "text": "hello"}),
-            json!({"request_id": 9, "type": "get_clipboard"}),
         ];
 
         for fixture in fixtures {
@@ -202,7 +184,6 @@ mod tests {
             json!({"request_id": 1, "status": "ok", "type": "apps", "apps": []}),
             json!({"request_id": 2, "status": "ok", "type": "sessions", "sessions": []}),
             json!({"request_id": 3, "status": "ok", "type": "ack"}),
-            json!({"request_id": 4, "status": "ok", "type": "clipboard"}),
             json!({
                 "request_id": 5,
                 "status": "error",

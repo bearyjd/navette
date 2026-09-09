@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Json;
@@ -32,7 +32,6 @@ pub struct ApiState<R: ProcessRunner> {
     pub supervisor: Arc<Supervisor<R>>,
     pub media: MediaHub,
     pub bridges: BridgeManager,
-    clipboard: Arc<Mutex<Option<String>>>,
 }
 
 impl<R: ProcessRunner> Clone for ApiState<R> {
@@ -42,7 +41,6 @@ impl<R: ProcessRunner> Clone for ApiState<R> {
             supervisor: Arc::clone(&self.supervisor),
             media: self.media.clone(),
             bridges: self.bridges.clone(),
-            clipboard: Arc::clone(&self.clipboard),
         }
     }
 }
@@ -55,7 +53,6 @@ impl<R: ProcessRunner> ApiState<R> {
             supervisor,
             bridges: BridgeManager::new(media.clone()),
             media,
-            clipboard: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -382,21 +379,6 @@ pub async fn dispatch<R: ProcessRunner>(state: &ApiState<R>, request: Request) -
             .map_err(|_| ApiFailure::internal("session registry lock is poisoned"))
             .and_then(|mut registry| registry.mark_detached(&session).map_err(ApiFailure::from))
             .map(|_| ResponseResult::Ack),
-        RequestCommand::SetClipboard { text } => state
-            .clipboard
-            .lock()
-            .map_err(|_| ApiFailure::internal("clipboard lock is poisoned"))
-            .map(|mut clipboard| {
-                *clipboard = Some(text);
-                ResponseResult::Ack
-            }),
-        RequestCommand::GetClipboard => state
-            .clipboard
-            .lock()
-            .map_err(|_| ApiFailure::internal("clipboard lock is poisoned"))
-            .map(|clipboard| ResponseResult::Clipboard {
-                text: clipboard.clone(),
-            }),
     };
 
     match result {
@@ -572,43 +554,6 @@ mod tests {
             vec![sequence as u8],
         )
         .unwrap()
-    }
-
-    #[tokio::test]
-    async fn clipboard_round_trip() {
-        let temp = TempDir::new().unwrap();
-        let state = test_state(&temp);
-        let set = dispatch(
-            &state,
-            Request {
-                request_id: 1,
-                command: RequestCommand::SetClipboard {
-                    text: "hello".into(),
-                },
-            },
-        )
-        .await;
-        assert!(matches!(
-            set.outcome,
-            ResponseOutcome::Ok {
-                result: ResponseResult::Ack
-            }
-        ));
-
-        let get = dispatch(
-            &state,
-            Request {
-                request_id: 2,
-                command: RequestCommand::GetClipboard,
-            },
-        )
-        .await;
-        assert!(matches!(
-            get.outcome,
-            ResponseOutcome::Ok {
-                result: ResponseResult::Clipboard { text: Some(text) }
-            } if text == "hello"
-        ));
     }
 
     #[tokio::test]
