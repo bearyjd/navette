@@ -179,6 +179,21 @@ async fn handle_media_socket(socket: WebSocket, attachment: crate::media::MediaA
                             Some(("rate_limited", "input rate limit exceeded".to_string()))
                         } else {
                             match serde_json::from_str::<MediaInput>(&text) {
+                                // Answered here rather than forwarded: the
+                                // bridge has no JSON path back to a client
+                                // (MediaAttachment::recv yields packets only),
+                                // and a pong that queued behind the bridge
+                                // loop would measure the loop, not the link.
+                                Ok(MediaInput::Ping { nonce }) => {
+                                    let pong = MediaServerMessage::Pong { nonce };
+                                    let Ok(encoded) = serde_json::to_string(&pong) else {
+                                        break;
+                                    };
+                                    if sender.send(Message::Text(encoded.into())).await.is_err() {
+                                        break;
+                                    }
+                                    None
+                                }
                                 Ok(input) => attachment.submit_input(input).err().map(media_hub_error),
                                 Err(error) => Some(("invalid_input", format!("invalid input: {error}"))),
                             }
@@ -742,6 +757,60 @@ mod tests {
                 attachment_id: 1,
                 input: MediaInput::RequestKeyframe,
                 // Ignored by `PartialEq`; any instant will do.
+                queued_at: std::time::Instant::now()
+            })
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn media_websocket_answers_a_ping_without_troubling_the_bridge() {
+        let temp = TempDir::new().unwrap();
+        let state = test_state(&temp);
+        add_running_session(&state, "work");
+        let mut input = state.media.register_session("work");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(state)).await.unwrap();
+        });
+        let mut request = format!("ws://{address}/v1/sessions/work/media")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            MEDIA_WEBSOCKET_SUBPROTOCOL.parse().unwrap(),
+        );
+        let (mut socket, _response) = connect_async(request).await.unwrap();
+
+        socket
+            .send(ClientMessage::Text(r#"{"type":"ping","nonce":99}"#.into()))
+            .await
+            .unwrap();
+        let pong = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("timed out waiting for a pong -- the server did not answer the ping")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pong.to_text().unwrap(), r#"{"type":"pong","nonce":99}"#);
+
+        // The bridge must never see a ping: it is answered at the socket, so a
+        // stalled bridge loop cannot delay it -- and equally cannot be measured
+        // by it. Sending a real input afterwards proves the channel still works
+        // and that nothing from the ping is sitting ahead of it in the queue.
+        socket
+            .send(ClientMessage::Text(r#"{"type":"request_keyframe"}"#.into()))
+            .await
+            .unwrap();
+        let forwarded = tokio::time::timeout(std::time::Duration::from_secs(5), input.recv())
+            .await
+            .expect("timed out waiting for the forwarded request_keyframe");
+        assert_eq!(
+            forwarded,
+            Some(crate::media::MediaCommand::Input {
+                attachment_id: 1,
+                input: MediaInput::RequestKeyframe,
                 queued_at: std::time::Instant::now()
             })
         );

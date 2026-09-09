@@ -280,6 +280,9 @@ pub enum MediaInput {
         height: u32,
     },
     RequestKeyframe,
+    Ping {
+        nonce: u64,
+    },
 }
 
 impl MediaInput {
@@ -335,6 +338,7 @@ impl std::error::Error for InputValidationError {}
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MediaServerMessage {
     Error { code: String, message: String },
+    Pong { nonce: u64 },
 }
 
 #[cfg(test)]
@@ -453,5 +457,26 @@ mod tests {
             modifiers(u32::MAX).validate(),
             Err(InputValidationError::LayoutOutOfRange(u32::MAX))
         );
+    }
+
+    #[test]
+    fn ping_round_trips_and_is_always_valid() {
+        let ping = MediaInput::Ping { nonce: 42 };
+        let encoded = serde_json::to_string(&ping).unwrap();
+        assert_eq!(encoded, r#"{"type":"ping","nonce":42}"#);
+        assert_eq!(serde_json::from_str::<MediaInput>(&encoded).unwrap(), ping);
+        assert_eq!(ping.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_ping_nonce_has_no_invalid_value() {
+        assert_eq!(MediaInput::Ping { nonce: 0 }.validate(), Ok(()));
+        assert_eq!(MediaInput::Ping { nonce: u64::MAX }.validate(), Ok(()));
+    }
+
+    #[test]
+    fn pong_serialises_with_the_nonce_it_answers() {
+        let encoded = serde_json::to_string(&MediaServerMessage::Pong { nonce: 7 }).unwrap();
+        assert_eq!(encoded, r#"{"type":"pong","nonce":7}"#);
     }
 }

@@ -74,6 +74,9 @@ import kotlinx.coroutines.launch
  */
 private const val RESIZE_DEBOUNCE_MS = 150L
 
+/** How often the HUD pings and republishes. One second, matching [HUD_WINDOW_MS]. */
+private const val HUD_SAMPLE_INTERVAL_MS: Long = 1000L
+
 /** What the screen renders. */
 internal data class SessionUiState(
     // Connecting, not Disconnected: the controller opens the socket from a
@@ -85,6 +88,8 @@ internal data class SessionUiState(
     val decodeError: String? = null,
     /** The size of the frame currently on the surface, or `null` before the first one. */
     val contentSize: Pair<Int, Int>? = null,
+    /** The latest metrics sample, or `null` before the first one. */
+    val hud: HudSample? = null,
 )
 
 /**
@@ -139,6 +144,9 @@ fun SessionScreen(
     // reconnect must not silently drop the user out of the on-screen
     // keyboard they had raised.
     var imeRaised by remember(host, sessionName) { mutableStateOf(false) }
+    // Keyed like imeRaised, not the nonce: a reconnect rebuild must not
+    // silently turn the HUD off while someone is watching it.
+    var hudVisible by remember(host, sessionName) { mutableStateOf(false) }
 
     LockLandscapeWhileAttached()
 
@@ -146,6 +154,8 @@ fun SessionScreen(
         controller.open()
         onDispose { controller.close() }
     }
+
+    LaunchedEffect(controller) { controller.onToggleHud = { hudVisible = !hudVisible } }
 
     // Re-asserts whichever focus target is correct, every time this effect
     // reruns (keyed on the controller, so every reconnect). Merely skipping
@@ -293,6 +303,8 @@ fun SessionScreen(
             onImeRaisedChange = { imeRaised = it },
         )
 
+        SessionHudOverlay(sample = state.hud, visible = hudVisible)
+
         SessionOverlay(
             state = state,
             reconnecting = reconnecting,
@@ -393,6 +405,11 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
     private var surface: Surface? = null
     private var surfaceSize: Pair<Int, Int>? = null
 
+    // Bumped under `lock` by every startDecoder call. Window 2 refuses to
+    // publish for a superseded claim, so the NEWEST call wins rather than
+    // whichever happens to resume last -- see the check in startDecoder.
+    private var startGeneration: Long = 0
+
     // Tracked so each is cancelled before being replaced, matching
     // AppViewModel's connectionJob/refreshJob discipline: a StateFlow and a
     // Channel both outlive their producer, so a leaked collector here would
@@ -400,6 +417,16 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
     private var connectionJob: Job? = null
     private var packetsJob: Job? = null
     private var resizeJob: Job? = null
+
+    // Reached from four threads: the packet loop (Dispatchers.Default) via
+    // recordPacket/recordFed, the codec's own callback thread via
+    // recordPresented, hudJob (Main.immediate) via recordPing/sample, and
+    // OkHttp's reader thread via onPong's recordPong. SessionHud is not
+    // thread-safe, so every access takes `lock` -- the same lock `decoder`
+    // uses, in the same order.
+    private val hud = SessionHud()
+    private var hudJob: Job? = null
+    private var pingNonce: ULong = 0uL
 
     // Gesture state. All main-thread only: the touch listener, the surface
     // callbacks, and `scope` (Main.immediate) are the only writers. pressJob
@@ -414,6 +441,9 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
     private var gestureState: GestureState = GestureState.Idle
     private var pressJob: Job? = null
     private var leftPressed = false
+
+    /** Set by the screen, which owns whether the HUD is showing. */
+    var onToggleHud: (() -> Unit)? = null
 
     /**
      * The surface the most recent successfully-sent motion was addressed to.
@@ -468,6 +498,9 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
                     route(packet)
                 }
             }
+        // Installed before connect(), not after: connect() starts OkHttp's
+        // reader thread, and that thread is what delivers pongs.
+        client.onPong = { nonce -> synchronized(lock) { hud.recordPong(nonce, System.currentTimeMillis()) } }
         // connect() before the state collector, not after. The client's flow
         // starts at Disconnected; connect() moves it to Connecting
         // synchronously. Collecting first, on Main.immediate, would publish
@@ -479,6 +512,25 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
         connectionJob =
             scope.launch {
                 client.connectionState.collect { connection -> _state.update { it.copy(connection = connection) } }
+            }
+        hudJob?.cancel()
+        hudJob =
+            scope.launch {
+                while (true) {
+                    val nonce = ++pingNonce
+                    synchronized(lock) { hud.recordPing(nonce, System.currentTimeMillis()) }
+                    client.sendPing(nonce)
+                    // Sampling after the ping rather than before means the
+                    // reading on screen is at most one interval behind the
+                    // link, not two.
+                    delay(HUD_SAMPLE_INTERVAL_MS)
+                    // Read outside the lock: `gate.primary` is @Volatile, and
+                    // the per-stream figures must describe the stream on the
+                    // surface rather than whichever the socket last carried.
+                    val rendered = gate.primary?.streamId
+                    val sample = synchronized(lock) { hud.sample(System.currentTimeMillis(), rendered) }
+                    _state.update { it.copy(hud = sample) }
+                }
             }
     }
 
@@ -492,17 +544,30 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
         resizeJob?.cancel()
         packetsJob?.cancel()
         connectionJob?.cancel()
-        stopDecoder(expected = null)
+        hudJob?.cancel()
+        client.onPong = null
+        // Clear the surface BEFORE stopping the decoder. Cancelling
+        // packetsJob above does not preempt a route() already inside
+        // startDecoder, and with the old order that call could publish a
+        // fresh decoder after stopDecoder had run -- leaking a codec and a
+        // HandlerThread onto a Surface being torn down. With surface nulled
+        // first, a racing publish bails at `surface ?: return`, and anything
+        // published before the swap is still caught by stopDecoder below.
         synchronized(lock) { surface = null }
+        stopDecoder(expected = null)
         client.close()
         scope.cancel()
     }
 
     private fun route(packet: MediaPacket) {
+        synchronized(lock) { hud.recordPacket(System.currentTimeMillis(), packet) }
         when (val event = gate.handle(packet)) {
             is StreamGateEvent.Bootstrap -> startDecoder(event.stream)
             is StreamGateEvent.Reconfigure -> startDecoder(event.stream)
-            is StreamGateEvent.Video -> synchronized(lock) { decoder }?.feed(event.accessUnit, event.timestampUs)
+            is StreamGateEvent.Video -> {
+                synchronized(lock) { hud.recordFed(event.timestampUs, System.currentTimeMillis()) }
+                synchronized(lock) { decoder }?.feed(event.accessUnit, event.timestampUs)
+            }
             StreamGateEvent.Ended -> _state.update { it.copy(streamEnded = true) }
             null -> Unit
         }
@@ -514,21 +579,59 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
      * picks it back up.
      */
     private fun startDecoder(stream: PrimaryStream) {
+        // Claim a generation before touching anything. A later call claims a
+        // higher one and both windows below stand down for the older claim,
+        // so the newest call wins rather than whichever resumes last. Without
+        // this, an older call resuming inside either window stops the newer
+        // decoder -- via the capture below, or via `superseded` -- and leaves
+        // the Surface showing a stale stream or nothing at all.
+        val generation = synchronized(lock) { ++startGeneration }
+        // Window 1: stop the outgoing decoder before publishing a successor.
+        // If both happened in one window, surfaceDestroyed could capture the
+        // new instance -- which holds nothing yet -- and return while the
+        // old codec was still live on the Surface.
+        val stopping =
+            synchronized(lock) {
+                // Stand down before touching `decoder` at all: a newer call
+                // may already have published and started its decoder, and
+                // capturing it here would stop it and leave the Surface with
+                // nothing until the next reconfigure.
+                if (generation != startGeneration) return
+                decoder.also { decoder = null }
+            }
+        // Outside the lock: stop() calls MediaCodec.release(), and the
+        // codec's callback thread may be blocked on this very lock inside
+        // recordPresented.
+        stopping?.stop()
+
         // Captured by reference so the callback can name the instance it came
         // from. Without that, a failure raised by a decoder that has since
         // been replaced would tear down its successor instead. Nothing can
         // raise an event before the assignment below, because nothing has
         // called start() yet.
         var created: H264Decoder? = null
+        var superseded: H264Decoder? = null
+        // Window 2: publish. `superseded` catches anything a racing
+        // startDecoder published in the gap between the two windows --
+        // without it that instance would be overwritten unstopped,
+        // unreachable through the field, and leak its codec and
+        // HandlerThread. The generation check below should make that
+        // unreachable -- every call that publishes held the highest claim, and
+        // a lower claim returns before publishing -- but it is kept because a
+        // future edit could break that invariant without anything noticing.
         val fresh =
             synchronized(lock) {
+                // A newer startDecoder has claimed the decoder; stand down
+                // rather than publish a stale stream over it.
+                if (generation != startGeneration) return
                 val target = surface ?: return
-                decoder?.stop()
                 val instance = H264Decoder(target) { event -> created?.let { onDecoderEvent(it, event) } }
                 created = instance
+                superseded = decoder
                 decoder = instance
                 instance
             }
+        superseded?.stop()
         _state.update { it.copy(streamEnded = false, decodeError = null, contentSize = null) }
         // Started outside the lock. configure()+start() costs tens to hundreds
         // of milliseconds, and holding the lock across it would block
@@ -548,11 +651,15 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
      * case this code exists for, not a corner.
      */
     private fun stopDecoder(expected: H264Decoder?) {
-        synchronized(lock) {
-            if (expected != null && decoder !== expected) return
-            decoder?.stop()
-            decoder = null
-        }
+        val stopping =
+            synchronized(lock) {
+                if (expected != null && decoder !== expected) return
+                decoder.also { decoder = null }
+            }
+        // Outside the lock: stop() calls MediaCodec.release(), and the
+        // codec's callback thread may be blocked on this very lock inside
+        // recordPresented.
+        stopping?.stop()
     }
 
     /**
@@ -570,6 +677,13 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
             is DecoderEvent.Configured -> {
                 if (!isCurrent(source)) return
                 _state.update { it.copy(contentSize = event.width to event.height, decodeError = null) }
+            }
+            // Same guard, same reason: a superseded decoder draining its last
+            // output buffers would otherwise put FPS/AGE/DEC readings on the
+            // overlay for a stream that is no longer on the surface.
+            is DecoderEvent.Presented -> {
+                if (!isCurrent(source)) return
+                synchronized(lock) { hud.recordPresented(event.timestampUs, System.currentTimeMillis()) }
             }
             // Through requestKeyframe(), not sendInput(), so the decoder's
             // drops share the client's once-until-one-arrives gate rather than
@@ -613,19 +727,21 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
              * Must finish before returning: a Surface released under a running
              * codec throws.
              *
-             * This can block on [lock] while the packet loop is starting a
-             * codec, which costs tens to hundreds of milliseconds on the main
-             * thread. That is the accepted trade -- a brief stall on leaving
-             * the screen beats rendering into a released Surface -- and rapid
-             * session entry and exit is where it would show, so it is on the
-             * on-device checklist.
+             * The wait this incurs is `stop()`'s own `MediaCodec.release()`,
+             * called outside [lock] as everywhere else in this file -- not
+             * lock contention, since every section that holds [lock] is now a
+             * brief field read or write. That is the accepted trade -- a
+             * brief stall on leaving the screen beats rendering into a
+             * released Surface -- and rapid session entry and exit is where
+             * it would show, so it is on the on-device checklist.
              */
             override fun surfaceDestroyed(holder: SurfaceHolder) {
-                synchronized(lock) {
-                    decoder?.stop()
-                    decoder = null
-                    surface = null
-                }
+                val stopping =
+                    synchronized(lock) {
+                        surface = null
+                        decoder.also { decoder = null }
+                    }
+                stopping?.stop()
             }
         }
 
@@ -746,6 +862,7 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
                 applyTransform()
             }
             is GestureEffect.Scroll -> sendScroll(effect.dx, effect.dy)
+            GestureEffect.ToggleHud -> onToggleHud?.invoke()
         }
     }
 

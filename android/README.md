@@ -152,6 +152,45 @@ once:
   Before the lifecycle-aware retry loop this exact cycle ended on a dead
   "Disconnected: failed to connect ... after 10000ms" screen.
 
+- **The performance HUD, on a Pixel 10 Pro Fold (Android 17), against a live
+  Firefox session.** Toggled by a two-finger long-press held past 250ms
+  (`TAP_TIMEOUT_MS`), both fingers still; repeating the same gesture hides it
+  again. Driven by a synthetic `/dev/uinput` two-finger touchscreen (`adb
+  shell uinput -`) calibrated against the device's real touch-coordinate
+  transform, confirmed with the `pointer_location` debug overlay before
+  relying on it. The seven fields, each observed changing as expected:
+  - `FPS`/`KBPS` climbed with an actively-scrolling guest (16.7fps / 2746kbps)
+    and decayed to `0.0`/`0` within a few seconds of the guest going idle.
+  - `DEC` (decode time) and `AGE` (time since the last decoded frame) moved
+    independently of the above, staying live during idle periods.
+  - `RTT` read a plausible tailnet figure (20-63ms across several samples)
+    and turned blank (`--`), not frozen or zero, within about five seconds of
+    the media socket's ping/pong going unanswered (`RTT_STALE_MS`) -- both
+    against a dropped link and against a daemon that doesn't understand `ping`
+    at all (see Known limitations).
+  - `DROP` read `0` within every controller's lifetime -- an ordinary attach,
+    a resize, and after a reconnect. A real reconnect rebuilds the
+    controller and resets every counter (`DISC` was seen going 6 → 0 → 2
+    across one), so a post-reconnect `DROP 0` covers only the new
+    attachment, not the session as a whole.
+  - `DISC` incremented exactly once for a real live resize (forced via
+    `adb shell cmd device_state state 2/reset`, which also reproduces the
+    fold-triggers-a-keyguard behaviour noted below) and did not increment for
+    input or idle activity alone.
+  - A quick two-finger tap (under 250ms) still opened the guest's own
+    right-click context menu at the tap point -- the HUD gesture did not
+    regress the existing two-finger tap.
+  - **12 real enter/leave cycles** against the live session (each confirmed
+    by a fresh `H264Decoder: decoder started at ...` logcat line, not just a
+    key event -- an earlier pass that only counted key events had silently
+    drifted off-app after a `KEYCODE_BACK` past the drawer and measured
+    nothing) produced no hang, no ANR, and no surface-abandon warning; same
+    process the whole time. This is the reproduction for the codec-callback/
+    teardown lock hazard fixed earlier in this work.
+  - A wifi drop (~8s) climbed `AGE`, blanked `RTT`, and the session recovered
+    on its own once wifi returned, consistent with the existing reconnect
+    behaviour above.
+
 ## Not verified
 
 No AVD/emulator binary is available in the environment this was built in
@@ -207,6 +246,21 @@ hand, and that no stray click reaches the guest when a pinch starts.
   (`PRESS_ARM_MS`). That is what lets a second finger cancel it, so a pinch
   no longer begins with a stray left click; a drag therefore starts a frame
   or two later than it used to. A tap shorter than the window still clicks.
+- **The HUD's `DEC` includes codec queueing and is not comparable to the
+  desktop viewer's `DEC`.** The Android figure is measured around the whole
+  `MediaCodec` async round trip (submit to callback), where the desktop
+  viewer's is a narrower decode-only measurement. Don't read them side by
+  side as the same metric.
+- **The HUD's `KBPS` counts payload bytes; the desktop viewer's counts
+  payload plus the 44-byte media header** (`client.rs:342`). Under 1% at real
+  bitrates, so it changes no reading anyone acts on, but the two figures are
+  not byte-identical if you diff the clients.
+- **`RTT` is answered by `navetted`'s media socket task, not the bridge
+  loop**, so it stays low even while the bridge loop itself is stalled or
+  falling behind -- a healthy `RTT` next to a climbing `AGE` means exactly
+  that: the transport is fine, the pipeline behind it isn't keeping up. This
+  is why `AGE` sits on the overlay beside it rather than `RTT` alone being
+  trusted as the latency signal.
 
 ## Building
 

@@ -1946,3 +1946,256 @@ registry) hasn't been started.
 - `android/README.md` for the current Verified/Not-verified/Known-limitations
   split, kept in sync with every slice.
 - PR #17 on GitHub for the itemized commit-by-commit story and CI links.
+
+## Android performance HUD: landed and on-device-verified, one real environment bug found along the way (2026-09-08)
+
+**What landed.** A performance overlay on the session screen (fps, bitrate,
+decode time, frame age, round-trip time, dropped packets, discontinuities),
+toggled by a two-finger long-press held past 250ms; repeating the gesture
+hides it. `crates/navette-protocol` grew a `MediaInput::Ping{nonce}` /
+`MediaServerMessage::Pong{nonce}` pair, answered by a small task on `navetted`'s media
+socket -- deliberately not routed through the bridge loop, so a stalled
+bridge doesn't also kill the one signal that would reveal the stall (`AGE`
+is the overlay's answer to that same gap: it stays live even when `RTT`
+can't see a bridge-loop problem). Full suites green going in: `cargo test
+--workspace` 182 passed / 1 pre-existing ignored; Android 188 passed (JUnit
+XML in `app/build/test-results/testDebugUnitTest/`, both suites run with
+`--rerun-tasks`).
+
+**Measured on-device (Pixel 10 Pro Fold, Android 17, `mvp` / Firefox, real
+tailnet at `100.111.143.67:9417`):**
+
+| condition | FPS | KBPS | DEC | AGE | RTT | DROP | DISC |
+|---|---|---|---|---|---|---|---|
+| fresh two-finger-long-press toggle | 21.3 | 24 | 27.0ms | 502ms | -- (stale pre-rebuild daemon, see below) | 0 | 3 |
+| idle, a few seconds later | 0.0 | 0 | 47.0ms | 5623ms | 34ms | 0 | 6 |
+| actively scrolling | 16.7 | 2746 | 29.0ms | 21ms | 63ms | 0 | 6 |
+| wifi dropped ~8s (still blank a few seconds after wifi came back, too) | 0.0 | 0 | -- | -- | -- (blank, not frozen) | 0 | 0 (fresh controller) |
+| wifi restored, actually recovered | 0.0 | 0 | 58.0ms | 11556ms | 38ms | 0 | 2 |
+| after a forced live resize | 0.0 | 0 | 23.0ms | 15305ms | 33ms | 0 | 5 (+1, this resize) |
+| against the old (pre-ping) daemon | 0.0 | 0 | 22.0ms | 6366ms | -- (permanently blank) | 0 | 5 |
+| daemon swapped back to the new (ping-supporting) binary | 0.0 | 0 | 51.0ms | 14630ms | 43ms | 0 | 2 |
+
+`RTT` ranged 20-63ms across samples -- a plausible tailnet figure, never
+zero or blank during a healthy link. `DROP` read `0` within every
+controller's lifetime; a real reconnect rebuilds the controller and resets
+every counter (`DISC` was observed going 6 → 0 → 2 across one reconnect), so
+a post-reconnect `DROP 0` covers only the new attachment, not the whole
+session -- worth knowing before reading a single sample as a session-wide
+guarantee. A quick (<250ms) two-finger tap still opened the guest's own
+right-click context menu, confirmed precisely on a real Firefox link, so the
+new gesture didn't regress the existing one. A forced live resize incremented
+`DISC` by exactly one and nothing else.
+
+**12 real enter/leave cycles**, each confirmed by a fresh `H264Decoder:
+decoder started at ...` logcat line rather than by key-event count alone --
+worth stating plainly because a first pass at this check used a stale
+landscape coordinate for the drawer's `mvp` row against an idle guest,
+silently drifted off the app via a `KEYCODE_BACK` that landed on an unrelated
+foreground app (the same `com.ventouxlabs.bascule` app noted in "Environment,
+as left" below), and would have measured nothing while looking like a clean
+pass. Re-run with the drawer's actual bounds, a scroll before each cycle so
+frames were genuinely flowing, and the decoder-start count as the real
+evidence: 12 cycles, 12 decoder starts, no hang, no ANR, no surface-abandon
+warning, same process (`pidof`) throughout. This is the reproduction for the
+codec-callback/teardown lock hazard fixed earlier in this arc.
+
+**A real environment bug, found rather than assumed.** The `navetted`
+handed off as "already running" for this task turned out to be a stale
+release binary (`Sep 5 11:01`, predating this branch's ping-handler
+commits) -- its media socket answered every `ping` with `invalid_input:
+unknown variant \`ping\``, which is exactly the old-daemon symptom Step 4
+was supposed to go looking for deliberately, showing up by accident first.
+Rebuilding `navetted --release` from the branch tip and restarting it (same
+bind address, existing `mvp` registry entry reconciled cleanly against the
+still-running `wprsd` -- no session loss) fixed it; `RTT` went from
+permanently blank to a live 20ms immediately, with no app-side interaction
+needed, confirming the client's own reconnect/retry path handles a daemon
+restart as just another transient drop.
+
+**The two-finger gesture, driven for real, not deferred.** The known
+scratchpad `uinput` driver from earlier sessions was gone, so it was rebuilt
+from AOSP's `cmds/uinput` JSON schema (`register`/`inject`/`delay` over
+`adb shell uinput -`) rather than deferring the check to a human. The
+device's touch-coordinate transform was measured, not assumed: a raw touch
+at portrait-native `(x, y)` lands on the landscape-locked session screen at
+`(screenX, screenY) = (y, 1079 - x)`, confirmed with the `pointer_location`
+debug overlay before relying on it for the real gesture sequences. Every
+check in the brief that depends on multi-touch (long-press toggle both
+directions, quick-tap right-click, the resize/`DISC` check, the ten-plus
+enter/leave cycles) was driven this way and is not a deferred human-check.
+
+**Step 4 (old-daemon compatibility), done with one deliberate deviation from
+the brief.** `master`'s `navetted` (`390aaa9`, no ping handler) was built in
+a throwaway `git worktree` and pointed at the *same* already-running `mvp`
+session (via `--state-file` pointed at the real registry, default
+runtime-dir, so it reconciled against the live `wprsd` instead of spawning a
+new one) -- confirmed by the `invalid_input`/`unknown variant \`ping\`` log
+lines and the permanently-blank `RTT` row in the table above, with the
+session otherwise working normally (video decoded, `DROP` still `0`). The
+brief asked for this on a *different port*; the Android app's Connect screen
+has no port field and always appends the default `9417`
+(`net/NavetteClient.kt`'s `controlWebSocketUrl(host, port = 9417)`, and a
+combined `host:port` string is explicitly untrusted input there -- typing
+one produces `Invalid URL port: "9417:9417"`, not a working override), so
+there's no way to point the *Android app itself* at a non-default port
+without a code change. Ran the old daemon on `9417` instead, with the real
+(new) daemon stopped for the duration -- confirmed no double-supervision of
+`mvp` by checking `navette ls` showed exactly one entry throughout -- and
+swapped the new daemon back onto `9417` immediately after, confirming `RTT`
+resumed live (`43ms`) with no app-side interaction. Two side quests this
+uncovered, neither novel: `wprsd`'s own Xwayland spawn needs a config with
+`enable_xwayland: false` in this environment (same underlying gap the M2
+handoff already recorded -- XWayland spawn fails here) to avoid colliding
+with the already-running session's own Xwayland display, and a stray
+`navette-<name>`/`navette-<name>.lock` pair left in `/run/user/1000` by an
+aborted `wprsd` attempt will hang the *next* attempt at the exact same
+wayland-display name, silently, until removed.
+
+**Left as found:** `navetted` (new binary, ping handler included) and
+`wprsd` for `mvp` both running on `100.111.143.67:9417`; no `device_state`
+override or `pointer_location` debug setting left on the Pixel 10 Pro Fold;
+no daemons left on `9418`/`9419`; the throwaway `git worktree` and every
+scratch file it produced (registry snapshots, a copied `xwayland-xdg-shell`
+binary, stray runtime dirs) removed.
+
+### Multi-window guest, verified on device (2026-09-08)
+
+The one item the PR's test plan left unchecked. The per-stream counter fix
+(`e1a1716`) had seven unit tests but had never run against a guest with two
+toplevels — the exact case it was written for.
+
+**Setup.** `foot` launched on the `mvp` session's display
+(`WAYLAND_DISPLAY=navette-mvp`) printing a date once a second, alongside the
+existing Firefox window, giving two live streams. A dependency-free
+`websockets` probe read the media socket directly to confirm the shape before
+touching the phone:
+
+```
+DISTINCT STREAMS: 2
+  stream_id=1  seq 1467..1468  size=(2416, 1132)
+  stream_id=2  seq 1..68       size=(696, 496)
+SEQUENCE SPREAD between streams at attach: 1466
+```
+
+That spread is the quantity that used to corrupt `DROP`: pre-fix, a single
+counter was shared across streams, so every transition from the low-sequence
+stream to the high one added roughly that number.
+
+**The app confirmed it was in the contaminating configuration**, from logcat:
+
+```
+D H264Decoder: decoder started at 2416x1132
+I StreamGate: ignoring stream 2; this screen renders only the primary stream
+```
+
+Stream 2 is ignored for *rendering* but its packets still flow through
+`route()` into the HUD, which is precisely the path that was wrong.
+
+**Result — HUD read during active painting, both streams live:**
+
+```
+FPS 23.3  KBPS 3260  DEC 25.0MS  AGE 351MS  RTT 30MS  DROP 0  DISC 2
+```
+
+`DROP 0`, held across four samples over ~3 minutes. The two-finger long-press
+toggled the HUD, re-confirming that gesture on the cover display.
+
+**Two honest limits on this run.** `KBPS` reflecting *only* the sampled
+stream was not independently isolated — `foot`'s byte contribution was small
+relative to Firefox's and the two were not measured apart, so assertion 4 in
+`SessionHudTest` remains the only evidence for that column. And getting
+Firefox to repaint needed a tap through the app to give it keyboard focus
+first; `wtype` alone reached the compositor but not the window, which is why
+three earlier samples read `FPS 0.0` with `AGE` climbing — honest idle, not a
+HUD fault.
+
+**Environment restored**: `foot` killed, back to one stream, `navetted` and
+`wprsd` still running for `mvp`, app force-stopped, no debug settings or
+`device_state` override left on the phone.
+
+### Known follow-ups from this branch
+
+Findings that were reviewed, judged non-blocking, and deliberately carried
+rather than fixed. Recorded here because the review workspace they were
+tracked in is scratch and does not survive.
+
+1. **`hudJob` pings and republishes forever once the reconnect retry budget
+   is spent.** `close()` never runs in that state, so the loop keeps sending a
+   1 Hz ping at a dead socket and republishing a sample whose `AGE` changes
+   every tick, so conflation never suppresses it. Battery and recomposition
+   cost behind a dead-session overlay; not a correctness defect. **This is the
+   next piece of work on the HUD.**
+2. **`SessionScreen.kt` is 918 lines against this project's 800-line
+   ceiling** (it was 827 before this branch). Extracting `SessionController`
+   is a larger change than the feature was and belongs on its own branch. The
+   largest thing still owed on this file.
+3. **`surfaceDestroyed` can return while a superseded decoder is still inside
+   `MediaCodec.release()`** on another thread. Bounded by one `stop()`, and
+   strictly better than what preceded it — hoisting teardown out of the
+   controller lock closed a per-frame contention window against `release()`.
+   No lock rearrangement inside `startDecoder` closes the residue; the real
+   fix is confining `startDecoder` to one thread so the packet loop and
+   `surfaceCreated` can never have two calls in flight, which would also
+   delete the `superseded` capture apparatus. That is a rewrite, not a patch.
+   12 on-device enter/leave cycles showed no hang, ANR or surface-abandon.
+4. **`SessionHudOverlay` has no `maxLines`/overflow bound** and `11.sp` scales
+   with the accessibility font setting. At ~2x scale the translucent ground
+   can sit under the keyboard-toggle button. Cosmetic only:
+   `Modifier.background()` registers no pointer-input node, so the button
+   stays tappable regardless. One-line fix when convenient.
+5. **Nothing pins that `sample()`'s global half survives a null `streamId`.**
+   The code is correct — `fps`, `decodeMs`, `ageMs` and `rttMs` are computed
+   outside the per-stream chain — but no test would notice if that stopped. A
+   future "blank everything when there is no stream" simplification would pass
+   all 195 tests while destroying the pre-bootstrap and post-`Ended`
+   diagnostic the overlay exists for: a healthy `RTT` beside a climbing `AGE`.
+   Costs one assertion on a sample already in hand.
+6. **`gate.primary` is read outside `lock` while the sample is taken inside
+   it.** A reconfigure landing in that window yields one sample whose
+   per-stream figures describe the outgoing stream, self-correcting on the
+   next tick. Not fixable by widening the lock — `StreamGate` is guarded by
+   its own `@Volatile`, not by `SessionController.lock`.
+7. **`SessionHud`'s zero-span `rate()` regression test pins `fps` but not
+   `bitrateBps`**, though both go through the same function.
+8. **`startDecoder` last-writer-wins ordering race — found late, fixed, not
+   carried.** Listed here rather than silently closed because of how it was
+   found: an independent Codex review, run after this branch's own nine
+   reviews had all passed, spotted it. `startDecoder` is reachable from two
+   threads and has two lock windows with a gap between them; an older call
+   resuming inside either window would stop the newer decoder — via window
+   1's unconditional capture, or via window 2's `superseded` — and either
+   publish its own stale stream or leave the Surface with nothing until the
+   next reconfigure. Every call now claims a generation under `lock` before
+   touching anything, and both windows stand down for a superseded claim, so
+   the newest call wins rather than whichever resumes last. Both halves are
+   guarded; no residual window is known. Both checks sit inside existing lock
+   windows and move no boundary — the constraint that matters on this
+   function, where the two rounds that moved a boundary each traded one race
+   for another, and the two that only added a check inside an existing window
+   introduced nothing. The claim itself is a third, disjoint critical section:
+   a single `Long` increment, no call-out while held, no nesting with
+   `H264Decoder`'s own lock, and neither caller holds `lock` at the call site.
+   It also stops an older call from blanking `contentSize` after a newer
+   decoder has already reported its frame size — a second, smaller defect the
+   fix was not aimed at.
+
+   The `superseded` capture in window 2 is now provably unreachable (any call
+   that publishes held the highest claim, and a lower claim returns before
+   publishing) and is kept anyway, because a future edit could break that
+   invariant with nothing to notice. That redundancy is the argument for item
+   3 above rather than a defect on its own: confining `startDecoder` to one
+   thread would delete the generation counter and the `superseded` capture
+   both, and is still the shape this function wants.
+
+Two deliberate non-changes, so nobody "fixes" them later:
+
+- **`KBPS` counts payload bytes; the desktop viewer counts payload plus the
+  44-byte header** (`client.rs:342`). Under 1% at real bitrates. The Kotlin
+  matches this design's own metrics table, and changing it would make the
+  measured figures recorded above non-reproducible.
+- **The design spec contradicts itself about `KBPS`'s source** (its metrics
+  table says `payload_len`; its parity paragraph says "exactly as `hud.rs`").
+  Left as an honest artefact of the design pass rather than rewritten after
+  the fact; the truth lives in `android/README.md`'s Known limitations, which
+  is where anyone comparing the two clients will actually look.

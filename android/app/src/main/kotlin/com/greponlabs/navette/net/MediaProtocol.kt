@@ -369,6 +369,10 @@ sealed interface MediaInput {
     @Serializable
     @SerialName("request_keyframe")
     data object RequestKeyframe : MediaInput
+
+    @Serializable
+    @SerialName("ping")
+    data class Ping(val nonce: ULong) : MediaInput
 }
 
 sealed interface InputValidationError {
@@ -413,6 +417,7 @@ fun MediaInput.validate(): InputValidationError? =
                 null
             }
         MediaInput.RequestKeyframe -> null
+        is MediaInput.Ping -> null
     }
 
 /** The bridge reports protocol problems as JSON text frames; they are informational. */
@@ -421,6 +426,10 @@ sealed interface MediaServerMessage {
     @Serializable
     @SerialName("error")
     data class Error(val code: String, val message: String) : MediaServerMessage
+
+    @Serializable
+    @SerialName("pong")
+    data class Pong(val nonce: ULong) : MediaServerMessage
 }
 
 /**

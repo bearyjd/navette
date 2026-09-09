@@ -60,9 +60,12 @@ internal fun packetBudgetKib(packet: MediaPacket, budgetKib: Int): Int {
  * user re-attaches from the drawer.
  *
  * **Thread-confined, not thread-safe**, on the same terms as [NavetteClient]:
- * [connect] and [close] belong to a single dispatcher. [sendInput] is the one
- * exception and is safe from any thread, because it only touches OkHttp's own
- * thread-safe [WebSocket.send].
+ * [connect] and [close] belong to a single dispatcher. [sendInput] -- and
+ * [sendPing], which is built on it -- is the exception and is safe from any
+ * thread, because it only touches OkHttp's own thread-safe [WebSocket.send].
+ * [onPong] is different again: it is set from the connecting dispatcher
+ * before [connect] but invoked on OkHttp's reader thread, so whatever it does
+ * must itself be safe to run there.
  */
 class MediaClient(private val webSocketUrl: String) {
     private val httpClient =
@@ -73,9 +76,14 @@ class MediaClient(private val webSocketUrl: String) {
             // not close the TCP socket, and nothing else here would detect it.
             // The session screen retries on that failure, so a shorter interval
             // is what turns a frozen picture into a "Reconnecting..." within
-            // seconds. Pongs are answered on OkHttp's own I/O thread, not the
-            // main thread, so app jank cannot cause a false timeout; only a
-            // genuine [PING_INTERVAL_SECONDS]-long network stall can.
+            // seconds. OkHttp answers its own pings on this same reader
+            // thread, which also runs onMessage -- and onMessage's onPong
+            // hook now takes a lock shared with the main thread. That wait is
+            // bounded by whatever section of [SessionController] holds the
+            // lock, and every one of those is a brief field read or write,
+            // never a codec teardown -- so a false timeout still tracks a
+            // genuine [PING_INTERVAL_SECONDS]-long network stall, not
+            // main-thread jank or a MediaCodec.release().
             .pingInterval(PING_INTERVAL_SECONDS, TimeUnit.SECONDS)
             .build()
 
@@ -317,6 +325,16 @@ class MediaClient(private val webSocketUrl: String) {
         }
     }
 
+    /** Sends one ping. The caller owns the nonce, so it can time the answer. */
+    fun sendPing(nonce: ULong) = sendInput(MediaInput.Ping(nonce))
+
+    /**
+     * Told about each pong, so a caller can time it against its own ping.
+     * Set before [connect]; called on OkHttp's reader thread.
+     */
+    @Volatile
+    var onPong: ((ULong) -> Unit)? = null
+
     private val listener =
         object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: OkHttpResponse) {
@@ -353,11 +371,17 @@ class MediaClient(private val webSocketUrl: String) {
 
             override fun onMessage(webSocket: WebSocket, text: String) {
                 // The bridge reports protocol problems as JSON text; they are
-                // informational and must not take the connection down.
+                // informational and must not take the connection down. An
+                // unparseable body includes an old daemon's reply to a message
+                // it does not know -- a ping, for one -- which is exactly why
+                // this logs rather than fails.
                 val reported =
                     runCatching { mediaJson.decodeFromString(MediaServerMessage.serializer(), text) }
                         .getOrNull()
-                Log.w(TAG, "media server reported: ${reported ?: text}")
+                when (reported) {
+                    is MediaServerMessage.Pong -> onPong?.invoke(reported.nonce)
+                    is MediaServerMessage.Error, null -> Log.w(TAG, "media server reported: ${reported ?: text}")
+                }
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: OkHttpResponse?) {

@@ -88,6 +88,15 @@ sealed interface GestureEffect {
 
     /** Scroll the guest by a screen-space finger delta. */
     data class Scroll(val dx: Float, val dy: Float) : GestureEffect
+
+    /**
+     * Show or hide the performance HUD. Two still fingers held past
+     * [TAP_TIMEOUT_MS]: too slow to be the right-click tap, too still to be a
+     * pinch, so this gesture was previously inert. It cannot be a one-finger
+     * long-press because the left press arms at [PRESS_ARM_MS] and would have
+     * clicked the guest long before any hold threshold elapsed.
+     */
+    data object ToggleHud : GestureEffect
 }
 
 /** Whether a two-finger drag moves the view or the guest's content. Latched for the gesture. */
@@ -180,7 +189,7 @@ object GestureInterpreter {
             TouchAction.Move -> moveTwoPointer(state, event)
             TouchAction.PointerUp ->
                 if (event.actionPointerId == state.idA || event.actionPointerId == state.idB) {
-                    GestureStep(GestureState.Suppressed, rightClickIfTap(state, event))
+                    GestureStep(GestureState.Suppressed, twoPointerLift(state, event))
                 } else {
                     // An ignored extra finger lifting changes nothing.
                     GestureStep(state, emptyList())
@@ -293,6 +302,17 @@ object GestureInterpreter {
             ),
             effects,
         )
+    }
+
+    /**
+     * A two-finger lift is one of three things: a right-click (quick, still),
+     * a HUD toggle (slow, still), or nothing at all (moved).
+     */
+    private fun twoPointerLift(state: GestureState.TwoPointer, event: TouchEvent): List<GestureEffect> {
+        if (state.movedBeyondSlop || state.pinching) return emptyList()
+        val held = event.eventTimeMs - state.startTimeMs
+        if (held > TAP_TIMEOUT_MS) return listOf(GestureEffect.ToggleHud)
+        return rightClickIfTap(state, event)
     }
 
     private fun rightClickIfTap(state: GestureState.TwoPointer, event: TouchEvent): List<GestureEffect> {

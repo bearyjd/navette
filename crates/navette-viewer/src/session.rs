@@ -493,7 +493,9 @@ mod tests {
                 surface_id,
                 ..
             } => Some((*client_id, *surface_id)),
-            MediaInput::ViewportResize { .. } | MediaInput::RequestKeyframe => None,
+            MediaInput::ViewportResize { .. }
+            | MediaInput::RequestKeyframe
+            | MediaInput::Ping { .. } => None,
         }
     }
 
