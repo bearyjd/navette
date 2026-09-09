@@ -495,7 +495,8 @@ mod tests {
             } => Some((*client_id, *surface_id)),
             MediaInput::ViewportResize { .. }
             | MediaInput::RequestKeyframe
-            | MediaInput::Ping { .. } => None,
+            | MediaInput::Ping { .. }
+            | MediaInput::SetClipboard { .. } => None,
         }
     }
 
