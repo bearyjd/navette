@@ -149,6 +149,13 @@ async fn handle_media_socket(socket: WebSocket, attachment: crate::media::MediaA
                     break;
                 }
             }
+            message = attachment.recv_message() => {
+                let Some(message) = message else { break; };
+                let Ok(encoded) = serde_json::to_string(&message) else { break; };
+                if sender.send(Message::Text(encoded.into())).await.is_err() {
+                    break;
+                }
+            }
             incoming = receiver.next() => {
                 let Some(incoming) = incoming else {
                     break;
@@ -813,6 +820,48 @@ mod tests {
                 input: MediaInput::RequestKeyframe,
                 queued_at: std::time::Instant::now()
             })
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn published_server_messages_reach_the_socket_as_text() {
+        let temp = TempDir::new().unwrap();
+        let state = test_state(&temp);
+        add_running_session(&state, "work");
+        let hub = state.media.clone();
+        let _input = state.media.register_session("work");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(state)).await.unwrap();
+        });
+        let mut request = format!("ws://{address}/v1/sessions/work/media")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            MEDIA_WEBSOCKET_SUBPROTOCOL.parse().unwrap(),
+        );
+        let (mut socket, _response) = connect_async(request).await.unwrap();
+
+        hub.publish_message(
+            "work",
+            MediaServerMessage::Clipboard {
+                text: "hello".into(),
+            },
+        );
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("a clipboard message should arrive before the timeout")
+            .expect("socket should stay open")
+            .unwrap();
+
+        assert_eq!(
+            received,
+            ClientMessage::Text(r#"{"type":"clipboard","text":"hello"}"#.into())
         );
         server.abort();
     }
