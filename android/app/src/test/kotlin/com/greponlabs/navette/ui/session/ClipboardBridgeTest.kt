@@ -183,4 +183,43 @@ class ClipboardBridgeTest {
             bridge.onLocalClipboardResume("A"),
         )
     }
+
+    /**
+     * The mirror of the regression just above, on `lastSent` instead of
+     * `lastRemote` -- a second-opinion review found this one four lines
+     * away from the fix for the first, in the same file, after the same
+     * question had just been asked and answered for the other field.
+     *
+     * Trace: phone sends A (`markSent` commits `lastSent = A`); guest
+     * copies B (`onRemoteClipboard` sets `echoFromLocal`/`lastRemote` to B,
+     * but until this fix left `lastSent` alone); the push's own
+     * `setPrimaryClip(B)` fires the listener, which consumes the echo
+     * token and returns *before* ever touching `lastSent`. The user now
+     * genuinely re-copies A: `echoFromLocal` is spent, but `lastSent` still
+     * equals A, so the `lastSent == text` check in `onLocalClipboard`
+     * silently drops a real, new copy -- the guest is stuck on B until some
+     * other text is successfully sent. A remote push means the phone's
+     * clipboard no longer holds whatever we last sent, so `lastSent` must
+     * be cleared, not merely left stale.
+     */
+    @Test
+    fun `a genuine re-copy of a sent value is not dropped as stale after an intervening remote push`() {
+        val bridge = ClipboardBridge()
+        assertEquals("A", bridge.onLocalClipboard("A"))
+        bridge.markSent("A")
+
+        bridge.onRemoteClipboard("B")
+        // The remote write's own setPrimaryClip fires the listener,
+        // consuming the echo token before lastSent is ever touched.
+        assertNull(bridge.onLocalClipboard("B"))
+
+        // The user genuinely re-copies A. Without clearing lastSent in
+        // onRemoteClipboard, this equals the stale lastSent from step one
+        // and is wrongly dropped.
+        assertEquals(
+            "a genuine copy of a previously-sent value must reach the guest after an intervening remote push",
+            "A",
+            bridge.onLocalClipboard("A"),
+        )
+    }
 }

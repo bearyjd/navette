@@ -74,8 +74,21 @@ impl ClipboardSync {
                         SyncAction::AskGuestFor { mime }
                     }
                     // The guest offered no text form. That is a real
-                    // state, not an empty string.
-                    None => SyncAction::Nothing,
+                    // state, not an empty string -- but it still supersedes
+                    // any outstanding request the same way a re-offer with
+                    // a text form does (see `a_re_offer_supersedes_the_
+                    // previous_request` below): a selection that had text
+                    // and was replaced by one that does not must not leave
+                    // `awaiting_guest_transfer` set. Left set, a transfer
+                    // that lands late for the *old*, superseded selection
+                    // passes the `!awaiting_guest_transfer` guard below and
+                    // overwrites the phone's clipboard from a selection
+                    // that, by the time those bytes arrive, has no text
+                    // form at all.
+                    None => {
+                        self.awaiting_guest_transfer = false;
+                        SyncAction::Nothing
+                    }
                 }
             }
             GuestEvent::TransferFromGuest { bytes } => {
@@ -125,6 +138,29 @@ impl ClipboardSync {
                     .unwrap_or_default(),
             },
         }
+    }
+
+    /// Undoes the echo token a [`SyncAction::PushToPhone`] just installed,
+    /// for when the caller learns the push reached nobody.
+    ///
+    /// `on_guest`'s `TransferFromGuest` arm sets `echo_from_phone`
+    /// unconditionally before returning `PushToPhone`, anticipating that
+    /// the phone might echo the value straight back
+    /// through `on_phone_clipboard`. But the actual delivery -- fanning the
+    /// message out to attached media clients -- is transport work this
+    /// state machine deliberately knows nothing about (see the module
+    /// comment), and that fan-out is a silent no-op when no client is
+    /// attached. Left installed, a token for a push nobody received sits
+    /// waiting for the *next* genuine phone copy of that same text -- which
+    /// may arrive long after the phone actually attaches -- and discards it
+    /// as if it were the echo of a push the guest never saw.
+    ///
+    /// The caller (`bridge.rs`) is the one with transport knowledge, via
+    /// `MediaHub::publish_message`'s return value; this method exists so
+    /// that knowledge can correct this state machine's guess without this
+    /// module ever importing hub or client types itself.
+    pub fn forget_phone_echo(&mut self) {
+        self.echo_from_phone = None;
     }
 
     pub fn on_phone_clipboard(&mut self, text: String) -> SyncAction {
@@ -217,6 +253,29 @@ mod tests {
         let mut sync = ClipboardSync::new();
         assert_eq!(
             sync.on_guest(offer(&["image/png", "application/pdf"])),
+            SyncAction::Nothing
+        );
+    }
+
+    /// A second-opinion review found this: the `None` branch of
+    /// `SelectionOffered` left `awaiting_guest_transfer` set, so a transfer
+    /// that lands late for a selection the guest has already replaced with
+    /// one carrying no text form is answered as if it belonged to a live
+    /// request, overwriting the phone's clipboard from a selection that no
+    /// longer has any text.
+    #[test]
+    fn a_non_text_offer_disarms_a_transfer_still_in_flight_for_the_selection_it_replaced() {
+        let mut sync = ClipboardSync::new();
+        sync.on_guest(offer(&["text/plain"]));
+        // The guest replaces its selection with an image before the
+        // transfer for the old, text-bearing offer lands.
+        assert_eq!(sync.on_guest(offer(&["image/png"])), SyncAction::Nothing);
+        // Bytes belonging to the superseded offer arrive late. They must
+        // be dropped, not answered as though a request were still live.
+        assert_eq!(
+            sync.on_guest(GuestEvent::TransferFromGuest {
+                bytes: b"stale".to_vec()
+            }),
             SyncAction::Nothing
         );
     }
@@ -345,6 +404,46 @@ mod tests {
             sync.on_phone_clipboard("hello".into()),
             SyncAction::Nothing,
             "the value we just pushed to the phone must not bounce back"
+        );
+    }
+
+    /// A second-opinion review found this: `echo_from_phone` is set
+    /// unconditionally before `PushToPhone` is returned, but the daemon's
+    /// own fan-out is a silent no-op when no phone client is attached. A
+    /// guest copy made while the phone is disconnected installs a token
+    /// nobody will ever consume as an echo -- and the next genuine phone
+    /// copy of that same text, however much later, is mistaken for that
+    /// phantom echo and silently discarded instead of reaching the guest.
+    /// `forget_phone_echo` is what `bridge.rs` calls once it learns the
+    /// push reached zero clients, undoing the guess this state machine had
+    /// to make before that was known.
+    #[test]
+    fn forgetting_an_unreceived_push_lets_the_next_genuine_phone_copy_through() {
+        let mut sync = ClipboardSync::new();
+        sync.on_guest(offer(&["text/plain"]));
+        assert_eq!(
+            sync.on_guest(GuestEvent::TransferFromGuest {
+                bytes: b"hello".to_vec()
+            }),
+            SyncAction::PushToPhone {
+                text: "hello".into()
+            }
+        );
+        // The caller learns no client was attached to receive it.
+        sync.forget_phone_echo();
+
+        // The phone later attaches and the user genuinely copies "hello".
+        // Without forgetting the token above, this would be mistaken for
+        // the echo of a push the phone never actually received.
+        assert_eq!(
+            sync.on_phone_clipboard("hello".into()),
+            SyncAction::OfferToGuest {
+                mime_types: OFFERED_MIME_TYPES
+                    .iter()
+                    .map(|m| (*m).to_string())
+                    .collect()
+            },
+            "a genuine phone copy must not be mistaken for the echo of a push nobody received"
         );
     }
 

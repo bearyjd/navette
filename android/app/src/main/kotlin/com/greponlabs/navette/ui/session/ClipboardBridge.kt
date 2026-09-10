@@ -47,7 +47,11 @@ class ClipboardBridge {
      * The last value actually confirmed sent, so a resume read of unchanged
      * content does not resend it. Set only by [markSent], once delivery is
      * confirmed -- never by the decision methods themselves, which merely
-     * decide a send is warranted and may still fail or be retried.
+     * decide a send is warranted and may still fail or be retried. Cleared
+     * by [onRemoteClipboard]: once the daemon pushes something here, this
+     * value no longer describes what the phone's clipboard holds, so
+     * comparing a later local read against it is meaningless -- see that
+     * method for the regression a stale value here caused.
      */
     private var lastSent: String? = null
 
@@ -130,11 +134,28 @@ class ClipboardBridge {
     /** A push from the daemon. Returns the text to write locally, or null. */
     fun onRemoteClipboard(text: String): String? {
         if (text.isEmpty()) return null
-        // Deliberately does NOT touch lastSent. Setting it here would make a
-        // genuine later local copy of this same text look like an unchanged
-        // resend and get dropped after the one-shot echo token above is
-        // already spent -- exactly the failure the one-shot test below
-        // exists to catch.
+        // Deliberately does NOT SET lastSent to this text. Doing that would
+        // make a genuine later local copy of this same text look like an
+        // unchanged resend and get dropped after the one-shot echo token
+        // above is already spent -- exactly the failure the one-shot test
+        // below exists to catch.
+        //
+        // It IS cleared, though: a controller review caught the mirror bug
+        // this asymmetry left behind. Trace: phone sends A (markSent sets
+        // lastSent = A); guest copies B; this method fires, setting
+        // echoFromLocal and lastRemote to B but leaving lastSent = A
+        // untouched; the write of B to the system clipboard fires the
+        // listener, which consumes the echo and returns before ever
+        // touching lastSent. The user then genuinely re-copies A:
+        // echoFromLocal is spent, but lastSent still equals A, so
+        // onLocalClipboard's `lastSent == text` check silently drops it --
+        // a real, later copy discarded because of a send from before an
+        // intervening remote push. A remote push means the phone's
+        // clipboard no longer holds whatever we last sent, so lastSent's
+        // value is meaningless from here on; clearing it is what keeps a
+        // later genuine copy of that same text from being mistaken for an
+        // unchanged resend.
+        lastSent = null
         echoFromLocal = text
         lastRemote = text
         return text

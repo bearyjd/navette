@@ -486,7 +486,8 @@ fn handle_guest_data(clipboard: &mut ClipboardSync, request: DataRequest, io: &S
         _ => return,
     };
 
-    apply_sync_action(clipboard.on_guest(event), io);
+    let action = clipboard.on_guest(event);
+    apply_sync_action(clipboard, action, io);
 }
 
 /// Carries out one decision.
@@ -501,7 +502,13 @@ fn handle_guest_data(clipboard: &mut ClipboardSync, request: DataRequest, io: &S
 /// leaves that pipe unwritten and unclosed, and the pasting guest
 /// application blocks on read forever. Hence no `?` and no early return on
 /// this path.
-fn apply_sync_action(action: SyncAction, io: &SessionIo<'_>) {
+///
+/// `clipboard` is only otherwise done deciding by the time this runs --
+/// `on_guest`/`on_phone_clipboard` have already returned `action` -- so
+/// this is the one place left to correct a guess `ClipboardSync` had to
+/// make with the transport knowledge it deliberately does not have. See
+/// `PushToPhone`'s arm and `ClipboardSync::forget_phone_echo`.
+fn apply_sync_action(clipboard: &mut ClipboardSync, action: SyncAction, io: &SessionIo<'_>) {
     match action {
         SyncAction::Nothing => {}
         SyncAction::AskGuestFor { mime } => {
@@ -510,8 +517,17 @@ fn apply_sync_action(action: SyncAction, io: &SessionIo<'_>) {
             )));
         }
         SyncAction::PushToPhone { text } => {
-            io.media
+            let reached = io
+                .media
                 .publish_message(io.session, MediaServerMessage::Clipboard { text });
+            // ClipboardSync installed an echo token anticipating the phone
+            // would receive this and might echo it straight back. Nobody
+            // did, so there is nothing to echo -- undo the guess, or the
+            // next genuine phone copy of this same text is mistaken for
+            // that phantom echo and silently dropped.
+            if reached == 0 {
+                clipboard.forget_phone_echo();
+            }
         }
         SyncAction::OfferToGuest { mime_types } => {
             io.transport.send(Event::Data(DataEvent::DestinationEvent(
@@ -625,7 +641,8 @@ fn pump_input(
                 input: MediaInput::SetClipboard { text },
                 ..
             } => {
-                apply_sync_action(clipboard.on_phone_clipboard(text), io);
+                let action = clipboard.on_phone_clipboard(text);
+                apply_sync_action(clipboard, action, io);
             }
             MediaCommand::Input {
                 attachment_id,
@@ -1934,7 +1951,11 @@ mod tests {
         transport: WprsTransport,
         wprsd: FakeWprsd,
         media: MediaHub,
-        client: MediaAttachment,
+        // `Option` so a test can simulate nobody being attached (`self.client
+        // = None`) without the partial-move `ClipboardFixture` would suffer
+        // as a plain `MediaAttachment` field -- every other method here
+        // takes `&mut self`, which needs the whole struct initialized.
+        client: Option<MediaAttachment>,
         commands: tokio::sync::mpsc::Receiver<MediaCommand>,
     }
 
@@ -1949,7 +1970,7 @@ mod tests {
                 transport,
                 wprsd,
                 media,
-                client,
+                client: Some(client),
                 commands,
             }
         }
@@ -2021,11 +2042,72 @@ mod tests {
         ))]);
 
         assert_eq!(
-            recv_message(&fixture.client).await,
+            recv_message(fixture.client.as_ref().expect("fixture client attached")).await,
             MediaServerMessage::Clipboard {
                 text: "hello".into()
             },
             "the guest's clipboard text must reach the media hub"
+        );
+    }
+
+    /// The `bridge.rs` wiring for `ClipboardSync::forget_phone_echo`:
+    /// `clipboard.rs`'s own unit test proves the state machine method,
+    /// `media.rs`'s proves `publish_message`'s return value, and this
+    /// proves the two are actually connected. With nobody attached to
+    /// receive a guest copy, a later genuine phone copy of the same text
+    /// must still reach the guest -- not be mistaken for the echo of a
+    /// push that, in fact, nobody ever received.
+    #[test]
+    fn a_guest_push_reaching_nobody_forgets_its_echo_so_the_same_text_reaches_the_guest_later() {
+        let mut fixture = ClipboardFixture::new();
+        // Nobody is attached to receive the push about to happen. An
+        // assignment, not `drop(fixture.client)`: the latter partially
+        // moves the field out, and every method below takes `&mut self`,
+        // which needs `fixture` whole.
+        fixture.client = None;
+
+        fixture.send_requests(vec![data_request(DataRequest::SourceRequest(
+            DataSourceRequest::SetSelection(
+                DataSource::Selection,
+                SourceMetadata::from_mime_types(vec!["text/plain".to_string()]),
+            ),
+        ))]);
+        assert!(matches!(
+            fixture.wprsd.recv(),
+            Event::Data(DataEvent::SourceEvent(
+                DataSourceEvent::MimeTypeSendRequestedByDestination(DataSource::Selection, _)
+            ))
+        ));
+
+        fixture.send_requests(vec![data_request(DataRequest::TransferData(
+            DataSource::Selection,
+            DataToTransfer(b"hello".to_vec()),
+        ))]);
+
+        // The phone attaches later and genuinely copies the same text.
+        let client = fixture
+            .media
+            .attach("s1")
+            .expect("re-attach to the fixture session");
+        client
+            .submit_input(MediaInput::SetClipboard {
+                text: "hello".into(),
+            })
+            .expect("the fixture session accepts input");
+        fixture.pump();
+
+        let offered: Vec<String> = OFFERED_MIME_TYPES
+            .iter()
+            .map(|mime| (*mime).to_string())
+            .collect();
+        assert!(
+            matches!(
+                fixture.wprsd.recv(),
+                Event::Data(DataEvent::DestinationEvent(
+                    DataDestinationEvent::SelectionSet(DataSource::Selection, metadata)
+                )) if metadata.mime_types == offered
+            ),
+            "a genuine phone copy must not be mistaken for the echo of a push nobody received"
         );
     }
 
@@ -2037,6 +2119,8 @@ mod tests {
 
         fixture
             .client
+            .as_ref()
+            .expect("fixture client attached")
             .submit_input(MediaInput::SetClipboard {
                 text: "hello".into(),
             })

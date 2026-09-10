@@ -238,9 +238,12 @@ impl MediaHub {
         Ok(stats)
     }
 
-    /// Fan a server message out to every client attached to `session`.
-    /// Unlike `publish`, this is infallible and silent: a clipboard push
-    /// to a session nobody is watching is a no-op, not an error.
+    /// Fan a server message out to every client attached to `session`,
+    /// returning how many it reached. Unlike `publish`, this is infallible
+    /// and silent: a clipboard push to a session nobody is watching is a
+    /// no-op, not an error -- but it is a no-op the caller may need to know
+    /// about (see `ClipboardSync::forget_phone_echo`), which is what the
+    /// return value is for.
     ///
     /// Collects the client handles and releases the hub lock *before*
     /// cloning and pushing: this lock also serializes the video publish
@@ -249,19 +252,21 @@ impl MediaHub {
     /// holding it would put an unbounded-by-client-count deep copy on the
     /// video path's critical section, which is exactly the kind of latency
     /// regression this project keeps having to fix.
-    pub fn publish_message(&self, session: &str, message: MediaServerMessage) {
+    pub fn publish_message(&self, session: &str, message: MediaServerMessage) -> usize {
         let queues: Vec<Arc<ClientQueue>> = {
             let Ok(state) = self.inner.lock() else {
-                return;
+                return 0;
             };
             let Some(session_state) = state.sessions.get(session) else {
-                return;
+                return 0;
             };
             session_state.clients.values().cloned().collect()
         };
+        let reached = queues.len();
         for queue in queues {
             queue.push_message(message.clone());
         }
+        reached
     }
 
     pub fn active_clients(&self, session: &str) -> usize {
@@ -668,11 +673,15 @@ mod tests {
         let first = hub.attach("one").unwrap();
         let second = hub.attach("one").unwrap();
 
-        hub.publish_message(
+        let reached = hub.publish_message(
             "one",
             MediaServerMessage::Clipboard {
                 text: "hello".into(),
             },
+        );
+        assert_eq!(
+            reached, 2,
+            "both attached clients must be counted as reached"
         );
 
         assert_eq!(
@@ -687,6 +696,24 @@ mod tests {
                 text: "hello".into()
             })
         );
+    }
+
+    /// The return value `bridge.rs`'s `ClipboardSync::forget_phone_echo`
+    /// wiring depends on: a session nobody is attached to must report zero
+    /// reached, not merely stay silent, so the caller can tell "delivered
+    /// to nobody" apart from "delivered to somebody" and correct the guess
+    /// `on_guest`'s `TransferFromGuest` arm made before it knew.
+    #[tokio::test]
+    async fn publishing_to_a_session_with_no_attached_client_reaches_zero() {
+        let hub = MediaHub::default();
+        let _input = hub.register_session("one");
+        let reached = hub.publish_message(
+            "one",
+            MediaServerMessage::Clipboard {
+                text: "hello".into(),
+            },
+        );
+        assert_eq!(reached, 0);
     }
 
     /// A spurious wake on the packet queue is harmless -- `recv` just loops
