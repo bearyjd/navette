@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Json;
@@ -32,7 +32,6 @@ pub struct ApiState<R: ProcessRunner> {
     pub supervisor: Arc<Supervisor<R>>,
     pub media: MediaHub,
     pub bridges: BridgeManager,
-    clipboard: Arc<Mutex<Option<String>>>,
 }
 
 impl<R: ProcessRunner> Clone for ApiState<R> {
@@ -42,7 +41,6 @@ impl<R: ProcessRunner> Clone for ApiState<R> {
             supervisor: Arc::clone(&self.supervisor),
             media: self.media.clone(),
             bridges: self.bridges.clone(),
-            clipboard: Arc::clone(&self.clipboard),
         }
     }
 }
@@ -55,7 +53,6 @@ impl<R: ProcessRunner> ApiState<R> {
             supervisor,
             bridges: BridgeManager::new(media.clone()),
             media,
-            clipboard: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -146,6 +143,13 @@ async fn handle_media_socket(socket: WebSocket, attachment: crate::media::MediaA
                     break;
                 };
                 if sender.send(Message::Binary(encoded.into())).await.is_err() {
+                    break;
+                }
+            }
+            message = attachment.recv_message() => {
+                let Some(message) = message else { break; };
+                let Ok(encoded) = serde_json::to_string(&message) else { break; };
+                if sender.send(Message::Text(encoded.into())).await.is_err() {
                     break;
                 }
             }
@@ -375,21 +379,6 @@ pub async fn dispatch<R: ProcessRunner>(state: &ApiState<R>, request: Request) -
             .map_err(|_| ApiFailure::internal("session registry lock is poisoned"))
             .and_then(|mut registry| registry.mark_detached(&session).map_err(ApiFailure::from))
             .map(|_| ResponseResult::Ack),
-        RequestCommand::SetClipboard { text } => state
-            .clipboard
-            .lock()
-            .map_err(|_| ApiFailure::internal("clipboard lock is poisoned"))
-            .map(|mut clipboard| {
-                *clipboard = Some(text);
-                ResponseResult::Ack
-            }),
-        RequestCommand::GetClipboard => state
-            .clipboard
-            .lock()
-            .map_err(|_| ApiFailure::internal("clipboard lock is poisoned"))
-            .map(|clipboard| ResponseResult::Clipboard {
-                text: clipboard.clone(),
-            }),
     };
 
     match result {
@@ -565,43 +554,6 @@ mod tests {
             vec![sequence as u8],
         )
         .unwrap()
-    }
-
-    #[tokio::test]
-    async fn clipboard_round_trip() {
-        let temp = TempDir::new().unwrap();
-        let state = test_state(&temp);
-        let set = dispatch(
-            &state,
-            Request {
-                request_id: 1,
-                command: RequestCommand::SetClipboard {
-                    text: "hello".into(),
-                },
-            },
-        )
-        .await;
-        assert!(matches!(
-            set.outcome,
-            ResponseOutcome::Ok {
-                result: ResponseResult::Ack
-            }
-        ));
-
-        let get = dispatch(
-            &state,
-            Request {
-                request_id: 2,
-                command: RequestCommand::GetClipboard,
-            },
-        )
-        .await;
-        assert!(matches!(
-            get.outcome,
-            ResponseOutcome::Ok {
-                result: ResponseResult::Clipboard { text: Some(text) }
-            } if text == "hello"
-        ));
     }
 
     #[tokio::test]
@@ -813,6 +765,48 @@ mod tests {
                 input: MediaInput::RequestKeyframe,
                 queued_at: std::time::Instant::now()
             })
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn published_server_messages_reach_the_socket_as_text() {
+        let temp = TempDir::new().unwrap();
+        let state = test_state(&temp);
+        add_running_session(&state, "work");
+        let hub = state.media.clone();
+        let _input = state.media.register_session("work");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(state)).await.unwrap();
+        });
+        let mut request = format!("ws://{address}/v1/sessions/work/media")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            MEDIA_WEBSOCKET_SUBPROTOCOL.parse().unwrap(),
+        );
+        let (mut socket, _response) = connect_async(request).await.unwrap();
+
+        hub.publish_message(
+            "work",
+            MediaServerMessage::Clipboard {
+                text: "hello".into(),
+            },
+        );
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("a clipboard message should arrive before the timeout")
+            .expect("socket should stay open")
+            .unwrap();
+
+        assert_eq!(
+            received,
+            ClientMessage::Text(r#"{"type":"clipboard","text":"hello"}"#.into())
         );
         server.abort();
     }

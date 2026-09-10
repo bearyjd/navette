@@ -373,6 +373,10 @@ sealed interface MediaInput {
     @Serializable
     @SerialName("ping")
     data class Ping(val nonce: ULong) : MediaInput
+
+    @Serializable
+    @SerialName("set_clipboard")
+    data class SetClipboard(val text: String) : MediaInput
 }
 
 sealed interface InputValidationError {
@@ -418,6 +422,7 @@ fun MediaInput.validate(): InputValidationError? =
             }
         MediaInput.RequestKeyframe -> null
         is MediaInput.Ping -> null
+        is MediaInput.SetClipboard -> null
     }
 
 /** The bridge reports protocol problems as JSON text frames; they are informational. */
@@ -430,6 +435,10 @@ sealed interface MediaServerMessage {
     @Serializable
     @SerialName("pong")
     data class Pong(val nonce: ULong) : MediaServerMessage
+
+    @Serializable
+    @SerialName("clipboard")
+    data class Clipboard(val text: String) : MediaServerMessage
 }
 
 /**

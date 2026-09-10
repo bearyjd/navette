@@ -1,5 +1,8 @@
 package com.greponlabs.navette.ui.session
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.Surface
@@ -34,10 +37,12 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
 import com.greponlabs.navette.media.DecoderEvent
@@ -128,9 +133,18 @@ fun SessionScreen(
     // Zoom and pan outlive a rebuild too: a retry the user never noticed must
     // not snap a zoomed, panned view back to the corner.
     val transformHolder = remember(host, sessionName) { ViewTransformHolder() }
+    // Keyed on the session, not the nonce, like transformHolder above: a
+    // reconnect rebuilds SessionController, but the bridge's one-shot echo
+    // and last-remote state must survive it. A fresh bridge per reconnect
+    // forgets what the daemon last pushed here, and the lifecycle observer
+    // re-added below re-syncs to ON_RESUME immediately on every rebuild --
+    // without this, that resume would re-forward the daemon's own stale
+    // push as if the phone had copied it new, clobbering whatever the guest
+    // copied while the socket was down.
+    val clipboardBridge = remember(host, sessionName) { ClipboardBridge() }
     val controller =
         remember(host, sessionName, reconnectNonce) {
-            SessionController(mediaWebSocketUrl(host, sessionName), transformHolder)
+            SessionController(mediaWebSocketUrl(host, sessionName), transformHolder, clipboardBridge)
         }
     val state by controller.state.collectAsState()
     val focusRequester = remember { FocusRequester() }
@@ -140,6 +154,9 @@ fun SessionScreen(
     val fieldFocus = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val context = LocalContext.current
+    val clipboard =
+        remember(context) { context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager }
     // Keyed on the session, not the nonce, like the retry counters above: a
     // reconnect must not silently drop the user out of the on-screen
     // keyboard they had raised.
@@ -150,12 +167,45 @@ fun SessionScreen(
 
     LockLandscapeWhileAttached()
 
+    // Clipboard listener and lifecycle observer registered and torn down here,
+    // in the same effect that opens and closes the controller -- so a leaked
+    // OnPrimaryClipChangedListener cannot outlive the session. The ON_RESUME
+    // read is not a fallback for the listener: since Android 10
+    // getPrimaryClip() returns null when the app is not focused, and copying
+    // from another app necessarily unfocuses Navette, so the listener alone
+    // would miss the case this feature exists for.
     DisposableEffect(controller) {
+        fun readLocalClipboard(): String? = clipboard.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()
+        val clipboardListener =
+            ClipboardManager.OnPrimaryClipChangedListener {
+                readLocalClipboard()?.let { controller.onLocalClipboard(it) }
+            }
+        clipboard.addPrimaryClipChangedListener(clipboardListener)
+        // Goes through onLocalClipboardResume, not onLocalClipboard: this
+        // observer is re-added on every reconnect and syncs to the current
+        // RESUMED state immediately, so it can fire on a resume that is
+        // really "the socket just reopened", not just "the user switched
+        // apps and back" -- see clipboardBridge's comment above for why that
+        // case needs its own suppression.
+        val clipboardObserver =
+            LifecycleEventObserver { _, event ->
+                if (event == Lifecycle.Event.ON_RESUME) {
+                    readLocalClipboard()?.let { controller.onLocalClipboardResume(it) }
+                }
+            }
+        lifecycleOwner.lifecycle.addObserver(clipboardObserver)
         controller.open()
-        onDispose { controller.close() }
+        onDispose {
+            clipboard.removePrimaryClipChangedListener(clipboardListener)
+            lifecycleOwner.lifecycle.removeObserver(clipboardObserver)
+            controller.close()
+        }
     }
 
-    LaunchedEffect(controller) { controller.onToggleHud = { hudVisible = !hudVisible } }
+    LaunchedEffect(controller) {
+        controller.onToggleHud = { hudVisible = !hudVisible }
+        controller.onClipboardPush = { text -> clipboard.setPrimaryClip(ClipData.newPlainText("navette", text)) }
+    }
 
     // Re-asserts whichever focus target is correct, every time this effect
     // reruns (keyed on the controller, so every reconnect). Merely skipping
@@ -387,7 +437,18 @@ private fun BoxScope.ImeLayer(
  * down and recreating a `MediaCodec` per recomposition would be a black
  * flash per frame of UI state change.
  */
-private class SessionController(mediaUrl: String, private val transformHolder: ViewTransformHolder) {
+private class SessionController(
+    mediaUrl: String,
+    private val transformHolder: ViewTransformHolder,
+    // Passed in rather than owned, on the same terms as transformHolder:
+    // remembered by the screen keyed on the session, not the reconnect
+    // nonce, so a rebuilt controller does not start the bridge's one-shot
+    // echo and last-remote state over from scratch. Reached from the same
+    // two threads as `hud` -- the main thread via onLocalClipboard/
+    // onLocalClipboardResume, OkHttp's reader thread via client.onClipboard
+    // in open() -- so it is guarded by `lock` rather than getting its own.
+    private val bridge: ClipboardBridge,
+) {
     private val client = MediaClient(mediaUrl)
     private val gate = StreamGate()
     private val scope = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
@@ -446,6 +507,14 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
     var onToggleHud: (() -> Unit)? = null
 
     /**
+     * Set by the screen, which owns the `ClipboardManager` call. Invoked on
+     * [scope] (Main.immediate) from [client]'s `onClipboard`, which itself
+     * runs on OkHttp's reader thread -- `ClipboardManager.setPrimaryClip`
+     * must not be called from there.
+     */
+    var onClipboardPush: ((String) -> Unit)? = null
+
+    /**
      * The surface the most recent successfully-sent motion was addressed to.
      *
      * The bridge dispatches a button or axis at the pointer's *current*
@@ -501,6 +570,13 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
         // Installed before connect(), not after: connect() starts OkHttp's
         // reader thread, and that thread is what delivers pongs.
         client.onPong = { nonce -> synchronized(lock) { hud.recordPong(nonce, System.currentTimeMillis()) } }
+        // Dispatched onto `scope` rather than invoked inline: this callback
+        // runs on OkHttp's reader thread, and onClipboardPush ends in a
+        // ClipboardManager call the screen must make from the main thread.
+        client.onClipboard = { text ->
+            val toWrite = synchronized(lock) { bridge.onRemoteClipboard(text) }
+            if (toWrite != null) scope.launch { onClipboardPush?.invoke(toWrite) }
+        }
         // connect() before the state collector, not after. The client's flow
         // starts at Disconnected; connect() moves it to Connecting
         // synchronously. Collecting first, on Main.immediate, would publish
@@ -546,6 +622,7 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
         connectionJob?.cancel()
         hudJob?.cancel()
         client.onPong = null
+        client.onClipboard = null
         // Clear the surface BEFORE stopping the decoder. Cancelling
         // packetsJob above does not preempt a route() already inside
         // startDecoder, and with the old order that call could publish a
@@ -895,6 +972,84 @@ private class SessionController(mediaUrl: String, private val transformHolder: V
         for (input in InputMapper.imeTextDelta(stream.clientId, stream.surfaceId, previous, current)) {
             client.sendInput(input)
         }
+    }
+
+    /**
+     * A local clipboard read from the listener firing. [bridge] decides
+     * whether it is our own echo, unchanged, or genuinely new; only a
+     * genuinely new value reaches [client].
+     */
+    fun onLocalClipboard(text: String) {
+        val forward = synchronized(lock) { bridge.onLocalClipboard(text) } ?: return
+        sendClipboardOrRetryOnConnect(forward)
+    }
+
+    /**
+     * A local clipboard read from an `ON_RESUME`. Not routed through
+     * [onLocalClipboard]: see [ClipboardBridge.onLocalClipboardResume] for
+     * why a resume needs a suppression the listener path does not.
+     */
+    fun onLocalClipboardResume(text: String) {
+        val forward = synchronized(lock) { bridge.onLocalClipboardResume(text) } ?: return
+        sendClipboardOrRetryOnConnect(forward)
+    }
+
+    /**
+     * Tracks a clipboard send retried after [sendClipboardOrRetryOnConnect]
+     * lost the race against the socket, so a second one can replace it
+     * rather than the two eventually racing each other.
+     */
+    private var pendingClipboardResend: Job? = null
+
+    /**
+     * Sends now, or -- if [client] has no socket yet -- waits for the first
+     * [ConnectionState.Connected] and sends then.
+     *
+     * Exists because `onLocalClipboardResume` is called from a
+     * `LifecycleEventObserver` that is added to an already-resumed
+     * lifecycle: per `androidx.lifecycle`, that add synchronously replays
+     * the missed `ON_RESUME`, so the very first resume-triggered send on
+     * every reattach happens before [open]'s `client.connect()` has run.
+     * `MediaClient.sendInput` drops silently when that happens (logged
+     * client-side as `"no socket"`) and nothing retried it -- confirmed on
+     * a real device, 3/3 reconnects, before this existed. `client.connect()`
+     * itself is likewise no guarantee: the handshake it starts is
+     * asynchronous, so even a send issued after it returns is not
+     * guaranteed to reach an open socket. Waiting on [ConnectionState]
+     * rather than on any particular call having returned is what makes this
+     * correct regardless of where in that async sequence the first attempt
+     * landed.
+     *
+     * At most one retry is ever pending: a second call here (a genuine new
+     * copy arriving while the first retry is still waiting) cancels the
+     * older one, so only the latest text is the one that eventually goes
+     * out. `pendingClipboardResend` is a child of `scope`, so `close()`'s
+     * `scope.cancel()` already tears it down; no explicit cancel is needed
+     * there.
+     *
+     * [ClipboardBridge.markSent] is called only where a send is actually
+     * confirmed -- on both the immediate and the retried attempt -- never
+     * merely because one was decided. A controller review caught the
+     * earlier shape, where the decision methods wrote `lastSent`
+     * themselves: a decision that lost the race here and then had its
+     * retry cancelled too (a `close()` mid-wait) left `lastSent` already
+     * holding the text, so the next resume of the same still-undelivered
+     * clipboard saw a false match and silently gave up on it for the rest
+     * of the session.
+     */
+    private fun sendClipboardOrRetryOnConnect(text: String) {
+        if (client.sendInput(MediaInput.SetClipboard(text))) {
+            synchronized(lock) { bridge.markSent(text) }
+            return
+        }
+        pendingClipboardResend?.cancel()
+        pendingClipboardResend =
+            scope.launch {
+                client.connectionState.first { it is ConnectionState.Connected }
+                if (client.sendInput(MediaInput.SetClipboard(text))) {
+                    synchronized(lock) { bridge.markSent(text) }
+                }
+            }
     }
 
     /**

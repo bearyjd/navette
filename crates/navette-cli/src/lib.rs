@@ -97,7 +97,6 @@ pub fn render_result(result: &ResponseResult) -> String {
         ResponseResult::Session { session } => session.name.clone(),
         ResponseResult::Attach { attach } => attach.socket_path.clone(),
         ResponseResult::Ack => String::new(),
-        ResponseResult::Clipboard { text } => text.clone().unwrap_or_default(),
     }
 }
 

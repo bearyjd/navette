@@ -169,7 +169,9 @@ class MediaClient(private val webSocketUrl: String) {
      * Always returns `false`, so callers can tail-call it as their failure path.
      */
     private fun logDropped(input: MediaInput, reason: String): Boolean {
-        Log.d(TAG, "dropped $input: $reason")
+        // Variant name only: MediaInput.SetClipboard is a data class, so the
+        // naive "$input" would render the user's clipboard text into logcat.
+        Log.d(TAG, "dropped ${input::class.simpleName}: $reason")
         return false
     }
 
@@ -335,6 +337,15 @@ class MediaClient(private val webSocketUrl: String) {
     @Volatile
     var onPong: ((ULong) -> Unit)? = null
 
+    /**
+     * Told about each guest clipboard push. Same contract as [onPong]: set
+     * before [connect], called on OkHttp's reader thread, so whatever it does
+     * must itself be safe to run there. Never logged past here -- the text
+     * is clipboard content.
+     */
+    @Volatile
+    var onClipboard: ((String) -> Unit)? = null
+
     private val listener =
         object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: OkHttpResponse) {
@@ -380,7 +391,12 @@ class MediaClient(private val webSocketUrl: String) {
                         .getOrNull()
                 when (reported) {
                     is MediaServerMessage.Pong -> onPong?.invoke(reported.nonce)
-                    is MediaServerMessage.Error, null -> Log.w(TAG, "media server reported: ${reported ?: text}")
+                    is MediaServerMessage.Clipboard -> onClipboard?.invoke(reported.text)
+                    is MediaServerMessage.Error -> Log.w(TAG, "media server reported: $reported")
+                    // Never `text` itself: an unparseable frame that was meant
+                    // to be a Clipboard message has clipboard content
+                    // embedded in this raw, undecoded body.
+                    null -> Log.w(TAG, "media server sent an undecodable ${text.length}-char text frame")
                 }
             }
 

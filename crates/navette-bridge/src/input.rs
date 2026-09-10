@@ -245,6 +245,21 @@ impl InputState {
             }
             MediaInput::RequestKeyframe => {}
             MediaInput::Ping { .. } => {}
+            // Clipboard is intercepted in navetted's bridge loop before
+            // `InputState::apply` is reached (Task 6), so this arm should be
+            // unreachable at runtime. It exists to keep the match
+            // exhaustive: that exhaustiveness is exactly what surfaced this
+            // build break, and a catch-all would have hidden it. If the
+            // interception is ever incomplete for some path, fail loudly
+            // rather than silently swallowing real user input -- name only
+            // the variant, never the clipboard text.
+            MediaInput::SetClipboard { .. } => {
+                tracing::warn!(
+                    variant = "SetClipboard",
+                    "unhandled MediaInput reached InputState::apply; \
+                     Task 6's interception must have missed a path"
+                );
+            }
         }
         Ok(())
     }

@@ -13,6 +13,11 @@ pub const STREAM_CONFIG_PREFIX_LEN: usize = 21;
 /// Number of keyboard layouts a client may index into, matching the ceiling
 /// common desktop layout switchers impose. Valid indices are `0..MAX_LAYOUTS`.
 pub const MAX_LAYOUTS: u32 = 16;
+/// Largest clipboard payload accepted in either direction, in UTF-8 bytes.
+/// Clipboards reach megabytes and arrive from outside the trust boundary;
+/// an over-cap paste is refused rather than silently truncated, because a
+/// half-pasted document is worse than a refused one.
+pub const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -280,6 +285,9 @@ pub enum MediaInput {
         height: u32,
     },
     RequestKeyframe,
+    SetClipboard {
+        text: String,
+    },
     Ping {
         nonce: u64,
     },
@@ -312,6 +320,9 @@ impl MediaInput {
             {
                 Err(InputValidationError::ViewportOutOfRange)
             }
+            Self::SetClipboard { text } if text.len() > MAX_CLIPBOARD_BYTES => {
+                Err(InputValidationError::ClipboardTooLarge(text.len()))
+            }
             _ => Ok(()),
         }
     }
@@ -324,6 +335,7 @@ pub enum InputValidationError {
     KeyOutOfRange(u32),
     LayoutOutOfRange(u32),
     ViewportOutOfRange,
+    ClipboardTooLarge(usize),
 }
 
 impl fmt::Display for InputValidationError {
@@ -339,6 +351,7 @@ impl std::error::Error for InputValidationError {}
 pub enum MediaServerMessage {
     Error { code: String, message: String },
     Pong { nonce: u64 },
+    Clipboard { text: String },
 }
 
 #[cfg(test)]
@@ -478,5 +491,59 @@ mod tests {
     fn pong_serialises_with_the_nonce_it_answers() {
         let encoded = serde_json::to_string(&MediaServerMessage::Pong { nonce: 7 }).unwrap();
         assert_eq!(encoded, r#"{"type":"pong","nonce":7}"#);
+    }
+
+    #[test]
+    fn oversized_clipboard_is_rejected() {
+        let input = MediaInput::SetClipboard {
+            text: "a".repeat(MAX_CLIPBOARD_BYTES + 1),
+        };
+        assert_eq!(
+            input.validate(),
+            Err(InputValidationError::ClipboardTooLarge(
+                MAX_CLIPBOARD_BYTES + 1
+            ))
+        );
+    }
+
+    #[test]
+    fn clipboard_at_the_cap_is_accepted() {
+        let input = MediaInput::SetClipboard {
+            text: "a".repeat(MAX_CLIPBOARD_BYTES),
+        };
+        assert_eq!(input.validate(), Ok(()));
+    }
+
+    #[test]
+    fn clipboard_cap_counts_utf8_bytes_not_chars() {
+        // A 3-byte character: MAX/3 + 1 of them exceeds the cap on bytes
+        // while being far under it on character count.
+        let text = "\u{2603}".repeat(MAX_CLIPBOARD_BYTES / 3 + 1);
+        assert!(text.chars().count() < MAX_CLIPBOARD_BYTES);
+        assert!(matches!(
+            MediaInput::SetClipboard { text }.validate(),
+            Err(InputValidationError::ClipboardTooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn set_clipboard_deserializes_from_wire() {
+        let input: MediaInput =
+            serde_json::from_str(r#"{"type":"set_clipboard","text":"hello"}"#).unwrap();
+        assert_eq!(
+            input,
+            MediaInput::SetClipboard {
+                text: "hello".into()
+            }
+        );
+    }
+
+    #[test]
+    fn clipboard_server_message_serializes_to_wire() {
+        let encoded = serde_json::to_string(&MediaServerMessage::Clipboard {
+            text: "hello".into(),
+        })
+        .unwrap();
+        assert_eq!(encoded, r#"{"type":"clipboard","text":"hello"}"#);
     }
 }

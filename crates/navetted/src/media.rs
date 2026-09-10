@@ -3,12 +3,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
-use navette_protocol::media::{MediaInput, MediaKind, MediaPacket};
+use navette_protocol::media::{MediaInput, MediaKind, MediaPacket, MediaServerMessage};
 use thiserror::Error;
 use tokio::sync::{Notify, mpsc};
 
 const DEFAULT_CLIENT_QUEUE_CAPACITY: usize = 8;
 const INPUT_QUEUE_CAPACITY: usize = 256;
+/// Server messages are small, rare, and order-sensitive only in that the
+/// newest clipboard value wins. A backlog means the socket is not
+/// draining, so the oldest is dropped rather than the newest.
+const MESSAGE_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Clone)]
 pub struct MediaHub {
@@ -234,6 +238,37 @@ impl MediaHub {
         Ok(stats)
     }
 
+    /// Fan a server message out to every client attached to `session`,
+    /// returning how many it reached. Unlike `publish`, this is infallible
+    /// and silent: a clipboard push to a session nobody is watching is a
+    /// no-op, not an error -- but it is a no-op the caller may need to know
+    /// about (see `ClipboardSync::forget_phone_echo`), which is what the
+    /// return value is for.
+    ///
+    /// Collects the client handles and releases the hub lock *before*
+    /// cloning and pushing: this lock also serializes the video publish
+    /// path, whose fan-out only bumps an `Arc` refcount per client. Cloning
+    /// a message (a `String` up to `MAX_CLIPBOARD_BYTES`) per client while
+    /// holding it would put an unbounded-by-client-count deep copy on the
+    /// video path's critical section, which is exactly the kind of latency
+    /// regression this project keeps having to fix.
+    pub fn publish_message(&self, session: &str, message: MediaServerMessage) -> usize {
+        let queues: Vec<Arc<ClientQueue>> = {
+            let Ok(state) = self.inner.lock() else {
+                return 0;
+            };
+            let Some(session_state) = state.sessions.get(session) else {
+                return 0;
+            };
+            session_state.clients.values().cloned().collect()
+        };
+        let reached = queues.len();
+        for queue in queues {
+            queue.push_message(message.clone());
+        }
+        reached
+    }
+
     pub fn active_clients(&self, session: &str) -> usize {
         self.inner
             .lock()
@@ -253,6 +288,10 @@ pub struct MediaAttachment {
 impl MediaAttachment {
     pub async fn recv(&self) -> Option<Arc<MediaPacket>> {
         self.queue.recv().await
+    }
+
+    pub async fn recv_message(&self) -> Option<MediaServerMessage> {
+        self.queue.recv_message().await
     }
 
     pub fn submit_input(&self, input: MediaInput) -> Result<(), MediaHubError> {
@@ -298,6 +337,7 @@ impl Drop for MediaAttachment {
 struct ClientQueue {
     state: Mutex<ClientQueueState>,
     notify: Notify,
+    message_notify: Notify,
     capacity: usize,
 }
 
@@ -305,6 +345,7 @@ struct ClientQueue {
 struct ClientQueueState {
     packets: VecDeque<Arc<MediaPacket>>,
     needs_keyframe: HashSet<u64>,
+    messages: VecDeque<MediaServerMessage>,
     closed: bool,
 }
 
@@ -319,6 +360,7 @@ impl ClientQueue {
         Self {
             state: Mutex::new(ClientQueueState::default()),
             notify: Notify::new(),
+            message_notify: Notify::new(),
             capacity,
         }
     }
@@ -384,11 +426,48 @@ impl ClientQueue {
         }
     }
 
+    fn push_message(&self, message: MediaServerMessage) {
+        let mut state = self.state.lock().expect("media queue lock poisoned");
+        if state.closed {
+            return;
+        }
+        let mut dropped = 0;
+        while state.messages.len() >= MESSAGE_QUEUE_CAPACITY {
+            state.messages.pop_front();
+            dropped += 1;
+        }
+        state.messages.push_back(message);
+        drop(state);
+        if dropped > 0 {
+            // Content never appears in a log line, only a count: a
+            // backlog this deep means the socket is not draining.
+            tracing::warn!(dropped, "server message queue saturated; dropped oldest");
+        }
+        self.message_notify.notify_one();
+    }
+
+    async fn recv_message(&self) -> Option<MediaServerMessage> {
+        loop {
+            let notified = self.message_notify.notified();
+            {
+                let mut state = self.state.lock().expect("media queue lock poisoned");
+                if let Some(message) = state.messages.pop_front() {
+                    return Some(message);
+                }
+                if state.closed {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+
     fn close(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.closed = true;
         }
         self.notify.notify_waiters();
+        self.message_notify.notify_waiters();
     }
 }
 
@@ -582,6 +661,183 @@ mod tests {
                 .await
                 .is_err(),
             "the replay must end with the live stream's keyframe"
+        );
+    }
+
+    #[tokio::test]
+    async fn published_messages_reach_every_attached_client() {
+        let hub = MediaHub::default();
+        // register_session returns the command receiver; it must stay alive
+        // for the session to remain registered.
+        let _input = hub.register_session("one");
+        let first = hub.attach("one").unwrap();
+        let second = hub.attach("one").unwrap();
+
+        let reached = hub.publish_message(
+            "one",
+            MediaServerMessage::Clipboard {
+                text: "hello".into(),
+            },
+        );
+        assert_eq!(
+            reached, 2,
+            "both attached clients must be counted as reached"
+        );
+
+        assert_eq!(
+            first.recv_message().await,
+            Some(MediaServerMessage::Clipboard {
+                text: "hello".into()
+            })
+        );
+        assert_eq!(
+            second.recv_message().await,
+            Some(MediaServerMessage::Clipboard {
+                text: "hello".into()
+            })
+        );
+    }
+
+    /// The return value `bridge.rs`'s `ClipboardSync::forget_phone_echo`
+    /// wiring depends on: a session nobody is attached to must report zero
+    /// reached, not merely stay silent, so the caller can tell "delivered
+    /// to nobody" apart from "delivered to somebody" and correct the guess
+    /// `on_guest`'s `TransferFromGuest` arm made before it knew.
+    #[tokio::test]
+    async fn publishing_to_a_session_with_no_attached_client_reaches_zero() {
+        let hub = MediaHub::default();
+        let _input = hub.register_session("one");
+        let reached = hub.publish_message(
+            "one",
+            MediaServerMessage::Clipboard {
+                text: "hello".into(),
+            },
+        );
+        assert_eq!(reached, 0);
+    }
+
+    /// A spurious wake on the packet queue is harmless -- `recv` just loops
+    /// and re-parks. A *lost* wake is the real failure mode a shared
+    /// `Notify` would produce: `notify_one()` wakes the FIFO-first waiter,
+    /// which would be the parked packet reader, and it consumes the only
+    /// permit before looping back to sleep on an empty `packets` queue,
+    /// leaving the message reader asleep forever. This test parks both
+    /// readers before publishing so a shared `Notify` would starve the
+    /// message reader; separate `Notify`s (what `push_message` actually
+    /// uses) let it wake regardless of what else is parked.
+    ///
+    /// The `yield_now` calls are load-bearing: on `#[tokio::test]`'s
+    /// current-thread runtime, a spawned task only reaches its `.await`
+    /// park point once the spawning task yields. Without them, whether
+    /// either reader is registered with its `Notify` before `publish_message`
+    /// runs is racy, and the test would fail intermittently instead of
+    /// deterministically.
+    #[tokio::test]
+    async fn a_message_wake_reaches_the_message_reader_despite_a_pending_packet_read() {
+        let hub = MediaHub::default();
+        let _input = hub.register_session("one");
+        let client = Arc::new(hub.attach("one").unwrap());
+
+        let packet_reader = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.recv().await })
+        };
+        tokio::task::yield_now().await;
+
+        let message_reader = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.recv_message().await })
+        };
+        tokio::task::yield_now().await;
+
+        hub.publish_message(
+            "one",
+            MediaServerMessage::Clipboard {
+                text: "hello".into(),
+            },
+        );
+
+        let received = tokio::time::timeout(std::time::Duration::from_millis(200), message_reader)
+            .await
+            .expect("message reader must be woken by a published message")
+            .expect("message reader task must not panic");
+        assert_eq!(
+            received,
+            Some(MediaServerMessage::Clipboard {
+                text: "hello".into()
+            })
+        );
+
+        packet_reader.abort();
+    }
+
+    /// `close()` must wake a parked message reader, or a client that
+    /// disconnects while nothing has been published leaves the reader
+    /// hanging forever, holding its `Arc<ClientQueue>` alive with it.
+    #[tokio::test]
+    async fn closing_the_session_wakes_a_parked_message_reader() {
+        let hub = MediaHub::default();
+        let _input = hub.register_session("one");
+        let client = Arc::new(hub.attach("one").unwrap());
+
+        let message_reader = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.recv_message().await })
+        };
+        tokio::task::yield_now().await;
+
+        // `unregister_session` drives every attached client's `ClientQueue::close`.
+        hub.unregister_session("one");
+
+        let received = tokio::time::timeout(std::time::Duration::from_millis(200), message_reader)
+            .await
+            .expect("close must wake a parked message reader")
+            .expect("message reader task must not panic");
+        assert_eq!(received, None);
+    }
+
+    #[tokio::test]
+    async fn message_queue_drops_oldest_when_saturated() {
+        let hub = MediaHub::default();
+        let _input = hub.register_session("one");
+        let client = hub.attach("one").unwrap();
+
+        for index in 0..MESSAGE_QUEUE_CAPACITY + 1 {
+            hub.publish_message(
+                "one",
+                MediaServerMessage::Clipboard {
+                    text: format!("value-{index}"),
+                },
+            );
+        }
+
+        let mut received = Vec::new();
+        for _ in 0..MESSAGE_QUEUE_CAPACITY {
+            received.push(client.recv_message().await.unwrap());
+        }
+
+        // The oldest entry (value-0) was dropped; the second-oldest is now
+        // at the head.
+        assert_eq!(
+            received.first(),
+            Some(&MediaServerMessage::Clipboard {
+                text: "value-1".into()
+            })
+        );
+        // The newest entry survives -- the whole point of dropping the
+        // oldest rather than the newest.
+        assert_eq!(
+            received.last(),
+            Some(&MediaServerMessage::Clipboard {
+                text: format!("value-{MESSAGE_QUEUE_CAPACITY}"),
+            })
+        );
+        assert_eq!(received.len(), MESSAGE_QUEUE_CAPACITY);
+        // Nothing beyond the newest MESSAGE_QUEUE_CAPACITY entries remains.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), client.recv_message())
+                .await
+                .is_err()
         );
     }
 
