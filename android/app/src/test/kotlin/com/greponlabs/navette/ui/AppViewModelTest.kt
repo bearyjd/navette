@@ -69,9 +69,19 @@ private class FakeNavetteApi : NavetteApi {
 private class FakePairingStore(initial: Pairing? = null) : PairingStore {
     private var stored: Pairing? = initial
 
-    override fun load(): Pairing? = stored
+    // Models EncryptedPairingStore under a failed keystore. `by lazy` does not
+    // memoize a thrown initializer, so the real store re-throws on every
+    // touch rather than failing once -- hence a sticky flag, not a one-shot.
+    var failOnSave = false
+    var failOnLoad = false
+
+    override fun load(): Pairing? {
+        if (failOnLoad) throw IllegalStateException("keystore unavailable")
+        return stored
+    }
 
     override fun save(pairing: Pairing) {
+        if (failOnSave) throw IllegalStateException("keystore unavailable")
         stored = pairing
     }
 
@@ -164,6 +174,61 @@ class AppViewModelTest {
             firstClient.emit(ConnectionState.Failed("stale, should be ignored"))
             testScheduler.advanceUntilIdle()
             assertEquals(ConnectionState.Disconnected, vm.state.value.connection)
+        }
+
+    @Test
+    fun `a pairing that cannot be saved still connects, and says so`() =
+        runTest {
+            // The crash path this guards: keystore fails, init catches it and
+            // shows ConnectScreen, the user scans a QR, and save() throws out
+            // of the scanner's main-thread success callback. `by lazy` does not
+            // memoize a thrown initializer, so the real store throws here even
+            // though init already absorbed one failure.
+            val store = FakePairingStore().apply { failOnSave = true }
+            val vm = AppViewModel(pairingStore = store, clientFactory = { fake })
+
+            vm.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.advanceUntilIdle()
+
+            assertEquals(testPairing, vm.state.value.pairing)
+            val message = vm.state.value.snackbarMessage
+            assertTrue("a pairing that was not saved must say so, got: $message", message != null)
+            assertTrue("the message must be about saving, got: $message", message!!.contains("could not be saved"))
+        }
+
+    @Test
+    fun `a reconnect whose stored pairing cannot be read reports it instead of throwing`() =
+        runTest {
+            // init's load() is already guarded; this is the second touch, on a
+            // user-initiated Retry, which was not.
+            val store = FakePairingStore(testPairing)
+            val vm = AppViewModel(pairingStore = store, clientFactory = { fake })
+            store.failOnLoad = true
+
+            vm.onEvent(AppEvent.Reconnect)
+            testScheduler.advanceUntilIdle()
+
+            val message = vm.state.value.snackbarMessage
+            assertTrue("a failed read must be surfaced, got: $message", message != null)
+            assertTrue("the message must point at re-pairing, got: $message", message!!.contains("pairing code"))
+        }
+
+    @Test
+    fun `a store that fails on every touch does not crash construction or pairing`() =
+        runTest {
+            // Both guards together, in the order the broken-keystore device
+            // actually hits them: construction, then a scan.
+            val store = FakePairingStore().apply {
+                failOnLoad = true
+                failOnSave = true
+            }
+            val vm = AppViewModel(pairingStore = store, clientFactory = { fake })
+
+            vm.onEvent(AppEvent.Paired(testPairing))
+            vm.onEvent(AppEvent.Reconnect)
+            testScheduler.advanceUntilIdle()
+
+            assertEquals(testPairing, vm.state.value.pairing)
         }
 
     @Test

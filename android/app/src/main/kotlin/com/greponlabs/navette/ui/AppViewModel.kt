@@ -140,13 +140,54 @@ class AppViewModel(
         }
     }
 
+    /**
+     * Guarded for the same reason `init`'s [PairingStore.load] is, and it is
+     * the more dangerous of the two: `by lazy` does not memoize a thrown
+     * initializer, so [EncryptedPairingStore]'s prefs re-throw on every touch
+     * once the keystore has failed. This call runs on the main thread inside
+     * the QR scanner's success callback, where an escaping exception is a
+     * crash immediately after a successful scan.
+     *
+     * A pairing that could not be stored must not read as one that succeeded,
+     * so the failure is surfaced rather than logged and swallowed. The
+     * connection still goes ahead: the scanned pairing is good for this
+     * session, and refusing to use it would make a device with a broken
+     * keystore unusable rather than merely forgetful.
+     */
     private fun pair(pairing: Pairing) {
-        pairingStore.save(pairing)
+        val stored =
+            runCatching { pairingStore.save(pairing) }
+                .onFailure { Log.w(TAG, "failed to save the pairing: ${it.message}") }
+                .isSuccess
         connectWithPairing(pairing)
+        if (!stored) {
+            _state.update {
+                it.copy(
+                    snackbarMessage =
+                        "Paired, but this pairing could not be saved — you will have to pair again next launch.",
+                )
+            }
+        }
     }
 
+    /**
+     * Guarded like [pair]: this is a user-initiated retry, so a keystore
+     * failure here would crash on a button press. A reconnect with nothing to
+     * reconnect *with* is a dead end the user has to be told about — silently
+     * doing nothing would leave the Retry button looking broken.
+     */
     private fun reconnect() {
-        pairingStore.load()?.let { connectWithPairing(it) }
+        runCatching { pairingStore.load() }
+            .onFailure { error ->
+                Log.w(TAG, "failed to load a stored pairing: ${error.message}")
+                _state.update {
+                    it.copy(
+                        snackbarMessage = "Could not read the saved pairing. Scan the pairing code again.",
+                    )
+                }
+            }
+            .getOrNull()
+            ?.let { connectWithPairing(it) }
     }
 
     private fun connectWithPairing(pairing: Pairing) {
