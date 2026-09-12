@@ -1177,9 +1177,17 @@ pub fn resolve_token(
         return Ok(token.to_owned());
     }
     let parsed = url::Url::parse(url).context("could not parse --url")?;
-    let host = parsed.host_str().unwrap_or("");
-    let is_local = host == "localhost"
-        || host.parse::<std::net::IpAddr>().map(|a| a.is_loopback()).unwrap_or(false);
+    // Match on `url::Host`, not on `host_str()`. For an IPv6 URL `host_str()`
+    // returns the *bracketed* form `[::1]`, which `IpAddr::parse` rejects — so a
+    // string-parsing check silently classifies a genuinely local `ws://[::1]:9417`
+    // as remote and demands an explicit --token. `host()` hands back the parsed
+    // address with no brackets to strip.
+    let is_local = match parsed.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
     if !is_local {
         bail!("--url points at a remote daemon; pass --token or set NAVETTE_TOKEN (the local token file belongs to this host and must not be sent elsewhere)");
     }
