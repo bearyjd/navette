@@ -1476,8 +1476,13 @@ data class Pairing(val host: String, val port: Int, val token: String)
  */
 fun parsePairingUri(raw: String): Pairing? {
     val uri = runCatching { URI(raw) }.getOrNull() ?: return null
-    if (uri.scheme != "navette" || uri.authority != "pair") return null
-    val fields = (uri.query ?: return null)
+    // rawAuthority/rawQuery, NOT authority/query: the getters without `raw`
+    // silently percent-decode, and the Rust producer deliberately does not
+    // percent-encode -- it validates the host charset instead, so neither side
+    // needs a shared decoding convention. Decoding here would corrupt any
+    // literal `%` the moment that charset grew.
+    if (uri.scheme != "navette" || uri.rawAuthority != "pair") return null
+    val fields = (uri.rawQuery ?: return null)
         .split('&')
         .mapNotNull { part ->
             val index = part.indexOf('=').takeIf { it > 0 } ?: return@mapNotNull null
