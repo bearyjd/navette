@@ -22,7 +22,7 @@ class EncryptedPairingStore(context: Context) : PairingStore {
             .build()
         EncryptedSharedPreferences.create(
             context,
-            "navette_pairing",
+            PREFS_NAME,
             key,
             EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
             EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
@@ -45,4 +45,21 @@ class EncryptedPairingStore(context: Context) : PairingStore {
     }
 
     override fun clear() = prefs.edit().clear().apply()
+
+    companion object {
+        /**
+         * Also named in `res/xml/backup_rules.xml` and
+         * `res/xml/data_extraction_rules.xml`, which exclude `$PREFS_NAME.xml`
+         * from backup: this store is keystore-encrypted, and a backup carries
+         * the ciphertext but not the non-exportable master key, so a restored
+         * file can never be decrypted and every touch of the store throws.
+         *
+         * Android resource XML cannot reference a Kotlin constant, so the name
+         * genuinely lives in three files. `PairingBackupRulesTest` reads the
+         * two XMLs and asserts they exclude this exact value, because a rename
+         * here that silently unprotects the store would present as "pairing
+         * broken after switching phones" and nothing else.
+         */
+        const val PREFS_NAME = "navette_pairing"
+    }
 }

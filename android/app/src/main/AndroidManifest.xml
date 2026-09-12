@@ -4,8 +4,18 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!--
+        Backup stays on, but the pairing store is excluded from it by both rule
+        files below. It is EncryptedSharedPreferences: the ciphertext backs up,
+        the Android Keystore master key cannot, and a restored file is
+        undecryptable forever. Both attributes are required — fullBackupContent
+        covers API 23-30 and dataExtractionRules covers 31+, and minSdk 26 with
+        targetSdk 36 means devices in the field use each.
+    -->
     <application
         android:allowBackup="true"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:networkSecurityConfig="@xml/network_security_config"

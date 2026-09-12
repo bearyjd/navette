@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    API 31+ backup rules (`android:dataExtractionRules`). The pre-31 equivalent
+    is backup_rules.xml, and BOTH are needed: minSdk is 26 and targetSdk is 36,
+    so a rule on only one of them leaves the other path live.
+
+    Both sections exclude the pairing store, for the reason spelled out in
+    backup_rules.xml: EncryptedSharedPreferences ciphertext survives a backup
+    but its Android Keystore master key cannot, so a restored file is
+    undecryptable forever and every touch of the store throws.
+
+    <device-transfer> matters as much as <cloud-backup> here — a direct
+    phone-to-phone transfer moves the file without the keystore just as a cloud
+    restore does, and excluding only the cloud path would leave the commonest
+    upgrade route broken.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude
+            domain="sharedpref"
+            path="navette_pairing.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude
+            domain="sharedpref"
+            path="navette_pairing.xml" />
+    </device-transfer>
+</data-extraction-rules>
