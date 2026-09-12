@@ -1,7 +1,9 @@
 package com.greponlabs.navette.net
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PairingUriTest {
@@ -69,5 +71,32 @@ class PairingUriTest {
         val pairing =
             parsePairingUri("navette://pair?host=[fd7a:115c:a1e0::1]&port=9417&token=ABCD1234ABCD1234ABCD1234")
         assertEquals(Pairing("[fd7a:115c:a1e0::1]", 9417, "ABCD1234ABCD1234ABCD1234"), pairing)
+    }
+}
+
+class PairingRedactionTest {
+    @Test
+    fun `toString never reveals the token`() {
+        // Mirrors the Rust `secret_string_debug_never_reveals_the_value` test.
+        // A data class's derived toString prints every field, and AppUiState
+        // holds a Pairing -- so one `Log.d(TAG, "$state")` would put the
+        // credential in logcat.
+        val token = "ABCD1234ABCD1234ABCD1234"
+        val rendered = Pairing("tower.ts.net", 9417, token).toString()
+        assertFalse("toString leaked the token: $rendered", rendered.contains(token))
+        assertTrue(rendered.contains("REDACTED"))
+        // Host and port are not secrets, and a log line without them is useless
+        // for diagnosing a connection.
+        assertTrue(rendered.contains("tower.ts.net"))
+        assertTrue(rendered.contains("9417"))
+    }
+
+    @Test
+    fun `a container's toString does not leak it either`() {
+        // The realistic leak is indirect: something else renders a field that
+        // happens to hold a Pairing.
+        val token = "ABCD1234ABCD1234ABCD1234"
+        val rendered = listOf(Pairing("tower", 9417, token)).toString()
+        assertFalse("a containing toString leaked the token: $rendered", rendered.contains(token))
     }
 }

@@ -2,7 +2,19 @@ package com.greponlabs.navette.net
 
 import java.net.URI
 
-data class Pairing(val host: String, val port: Int, val token: String)
+data class Pairing(val host: String, val port: Int, val token: String) {
+    /**
+     * Overridden because the derived one prints the token. `AppUiState` holds a
+     * `Pairing`, so any `Log.d(TAG, "$state")`, any crash report rendering a
+     * ViewModel field, or any `toString` on a containing data class would put
+     * the credential in a log. Rust's `SecretString` exists for exactly this
+     * hazard (crates/navette-auth); this is the Kotlin half of it.
+     *
+     * Host and port stay visible: they are what makes a log line useful for
+     * diagnosing a connection, and neither is a secret.
+     */
+    override fun toString(): String = "Pairing(host=$host, port=$port, token=REDACTED)"
+}
 
 /**
  * Parses the `navette://pair?host=&port=&token=` URI the daemon renders as a QR
