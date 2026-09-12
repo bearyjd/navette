@@ -35,7 +35,7 @@ Recorded here so a reviewer does not read them as defects:
 
 | File | Responsibility |
 |---|---|
-| `crates/navetted/src/auth.rs` (new) | `AuthToken` value type: generation, Crockford base32 render/parse, constant-time compare, file persistence. No axum types. |
+| `crates/navette-auth/src/lib.rs` (new) | `AuthToken` value type: generation, Crockford base32 render/parse, constant-time compare, file persistence. No axum types. |
 | `crates/navetted/src/guard.rs` (new) | The axum middleware: `Origin` rejection then bearer verification. No token internals. |
 | `crates/navetted/src/api.rs` | `ApiState` gains `auth`; `router()` applies the guard. Signature of `router()` unchanged. |
 | `crates/navetted/src/main.rs` | Loads or creates the token at startup; updated `--allow-remote` help. |
@@ -51,24 +51,50 @@ Recorded here so a reviewer does not read them as defects:
 ### Task 1: `AuthToken` — value type and persistence
 
 **Files:**
-- Create: `crates/navetted/src/auth.rs`
-- Modify: `crates/navetted/src/lib.rs` (add `pub mod auth;`), `crates/navetted/Cargo.toml`
+- Create: `crates/navette-auth/src/lib.rs`, `crates/navette-auth/Cargo.toml`
+- Modify: `Cargo.toml` (workspace members), `crates/navetted/Cargo.toml`
+
+**Why its own crate.** `navette-cli` and `navette-viewer` both need `AuthToken`,
+and neither depends on `navetted` — they depend on `navette-protocol`. Making the
+CLI depend on `navetted` would drag axum, the supervisor and wprs into a client
+binary. Putting file I/O into `navette-protocol` would give the wire-format crate
+filesystem concerns it has no business holding. A small dedicated crate is the
+boundary that costs least.
 
 **Interfaces:**
 - Produces: `AuthToken::generate() -> AuthToken`, `AuthToken::render(&self) -> String` (24 chars, ungrouped), `AuthToken::render_grouped(&self) -> String` (`XXXX-XXXX-…`), `AuthToken::parse(&str) -> Result<AuthToken, AuthError>`, `AuthToken::matches(&self, presented: &str) -> bool`, `AuthToken::load_or_create(path: &Path) -> Result<AuthToken, AuthError>`, `AuthToken::rotate(path: &Path) -> Result<AuthToken, AuthError>`, `default_token_path() -> Option<PathBuf>`.
 
-- [ ] **Step 1: Add dependencies**
+- [ ] **Step 1: Create the crate**
 
-In `crates/navetted/Cargo.toml` under `[dependencies]`:
+`crates/navette-auth/Cargo.toml`:
 
 ```toml
+[package]
+name = "navette-auth"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
 rand = "0.8"
 subtle = "2.6"
+thiserror = "2"
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
 ```
+
+Copy `edition` from `crates/navette-protocol/Cargo.toml` rather than trusting the
+value above — the workspace must stay on one edition.
+
+Add `"crates/navette-auth"` to the workspace `members` list in the root
+`Cargo.toml`, and add `navette-auth = { path = "../navette-auth" }` to the
+`[dependencies]` of `crates/navetted/Cargo.toml`. Tasks 5 and 6 add the same line
+to `navette-cli` and `navette-viewer`; do not add it for them here.
 
 - [ ] **Step 2: Write the failing tests**
 
-Create `crates/navetted/src/auth.rs` with only the test module first:
+Create `crates/navette-auth/src/lib.rs` with only the test module first:
 
 ```rust
 #[cfg(test)]
@@ -173,12 +199,12 @@ mod tests {
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
-Run: `cargo test -p navetted auth::`
+Run: `cargo test -p navette-auth`
 Expected: FAIL to compile — `AuthToken` not found.
 
 - [ ] **Step 4: Implement the module**
 
-Write above the test module in `crates/navetted/src/auth.rs`:
+Write above the test module in `crates/navette-auth/src/lib.rs`:
 
 ```rust
 use std::fs::{self, OpenOptions};
@@ -358,18 +384,17 @@ pub fn default_token_path() -> Option<PathBuf> {
 }
 ```
 
-Add `pub mod auth;` to `crates/navetted/src/lib.rs`.
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cargo test -p navetted auth::`
+Run: `cargo test -p navette-auth`
 Expected: PASS, 9 tests.
 
 - [ ] **Step 6: Run the full gate and commit**
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo fmt --check
-git add crates/navetted/src/auth.rs crates/navetted/src/lib.rs crates/navetted/Cargo.toml Cargo.lock
+git add crates/navette-auth Cargo.toml crates/navetted/Cargo.toml Cargo.lock
 git commit -m "feat(auth): add the AuthToken value type and its private persistence"
 ```
 
@@ -386,7 +411,16 @@ This task is deliberately shippable on its own: it closes the vulnerability with
 **Interfaces:**
 - Produces: `guard::reject_browser_origin(request: Request, next: Next) -> Response`.
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Add the test dependency**
+
+`oneshot` comes from tower's `ServiceExt`, which navetted does not currently
+depend on. Add to `crates/navetted/Cargo.toml` under `[dev-dependencies]`:
+
+```toml
+tower = { version = "0.5", features = ["util"] }
+```
+
+- [ ] **Step 2: Write the failing tests**
 
 Create `crates/navetted/src/guard.rs` with the test module. These are HTTP-level tests against the real router:
 
@@ -604,7 +638,7 @@ async fn rejects_a_request_with_no_authorization_header() {
 #[tokio::test]
 async fn rejects_a_wrong_token() {
     let router = test_router();
-    let wrong = crate::auth::AuthToken::generate().render();
+    let wrong = navette_auth::AuthToken::generate().render();
     let response = router
         .oneshot(
             Request::builder()
@@ -670,7 +704,7 @@ pub struct ApiState<R: ProcessRunner> {
     pub supervisor: Arc<Supervisor<R>>,
     pub media: MediaHub,
     pub bridges: BridgeManager,
-    pub auth: Arc<crate::auth::AuthToken>,
+    pub auth: Arc<navette_auth::AuthToken>,
 }
 ```
 
@@ -680,7 +714,7 @@ Add `auth: Arc::clone(&self.auth)` to the `Clone` impl, and change the construct
 pub fn new(
     apps: Arc<AppIndex>,
     supervisor: Arc<Supervisor<R>>,
-    auth: Arc<crate::auth::AuthToken>,
+    auth: Arc<navette_auth::AuthToken>,
 ) -> Self {
 ```
 
@@ -714,7 +748,7 @@ use std::sync::Arc;
 
 use axum::extract::State;
 
-use crate::auth::AuthToken;
+use navette_auth::AuthToken;
 
 /// Requires `Authorization: Bearer <token>` on every route.
 ///
@@ -813,10 +847,10 @@ After the registry is opened in `main`:
 ```rust
 let token_path = match arguments.token_file {
     Some(path) => path,
-    None => navetted::auth::default_token_path().context("cannot determine a token path")?,
+    None => navette_auth::default_token_path().context("cannot determine a token path")?,
 };
 let auth = Arc::new(
-    navetted::auth::AuthToken::load_or_create(&token_path)
+    navette_auth::AuthToken::load_or_create(&token_path)
         .context("failed to load the API token")?,
 );
 // Never log the value itself.
@@ -871,7 +905,13 @@ git commit -m "feat(navetted): load or create the API token at startup"
 
 - [ ] **Step 1: Add the dependency**
 
-`crates/navette-cli/Cargo.toml`: `qrcode = { version = "0.14", default-features = false }`
+`crates/navette-cli/Cargo.toml`:
+
+```toml
+qrcode = { version = "0.14", default-features = false }
+url = "2"
+navette-auth = { path = "../navette-auth" }
+```
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -968,14 +1008,14 @@ And the handler:
 
 ```rust
 Command::Token { qr, rotate, advertise_host } => {
-    let path = navetted::auth::default_token_path().context("cannot determine a token path")?;
+    let path = navette_auth::default_token_path().context("cannot determine a token path")?;
     let token = if rotate {
-        let token = navetted::auth::AuthToken::rotate(&path)?;
+        let token = navette_auth::AuthToken::rotate(&path)?;
         eprintln!("Token rotated. Every paired client must pair again.");
         eprintln!("Restart navetted for this to take effect: it holds the value in memory.");
         token
     } else {
-        navetted::auth::AuthToken::load_or_create(&path)?
+        navette_auth::AuthToken::load_or_create(&path)?
     };
 
     if qr {
@@ -1017,14 +1057,16 @@ git commit -m "feat(cli): add navette token with QR pairing output"
 
 - [ ] **Step 1: Write the failing test**
 
-In `crates/navette-cli/src/lib.rs`'s test module:
+In `crates/navette-auth/src/lib.rs`'s test module. **`resolve_token` lives in
+`navette-auth`, not in `navette-cli`**: the viewer needs it too and does not depend
+on the CLI.
 
 ```rust
 #[test]
 fn resolves_the_local_token_file_for_a_loopback_url() {
     let temp = tempfile::TempDir::new().unwrap();
     let path = temp.path().join("token");
-    let token = navetted::auth::AuthToken::load_or_create(&path).unwrap();
+    let token = navette_auth::AuthToken::load_or_create(&path).unwrap();
     let resolved = resolve_token("ws://127.0.0.1:9417/v1/ws", None, Some(&path)).unwrap();
     assert_eq!(resolved, token.render());
 }
@@ -1035,7 +1077,7 @@ fn refuses_to_send_the_local_token_to_a_remote_daemon() {
     // would hand our credential to whatever is listening there.
     let temp = tempfile::TempDir::new().unwrap();
     let path = temp.path().join("token");
-    navetted::auth::AuthToken::load_or_create(&path).unwrap();
+    navette_auth::AuthToken::load_or_create(&path).unwrap();
     let error = resolve_token("ws://tower:9417/v1/ws", None, Some(&path)).unwrap_err();
     assert!(error.to_string().contains("--token"));
 }
@@ -1049,10 +1091,13 @@ fn an_explicit_token_is_used_for_any_url() {
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `cargo test -p navette-cli resolve_token`
+Run: `cargo test -p navette-auth resolve_token`
 Expected: FAIL — `resolve_token` not defined.
 
-- [ ] **Step 3: Implement `resolve_token` and send the header**
+- [ ] **Step 3: Implement `resolve_token` in `navette-auth` and send the header**
+
+Add `navette-auth = { path = "../navette-auth" }` to `crates/navette-viewer/Cargo.toml`
+(Task 5 already added it to `navette-cli`).
 
 ```rust
 pub fn resolve_token(
@@ -1072,9 +1117,9 @@ pub fn resolve_token(
     }
     let path = match token_file {
         Some(path) => path.to_path_buf(),
-        None => navetted::auth::default_token_path().context("cannot determine a token path")?,
+        None => navette_auth::default_token_path().context("cannot determine a token path")?,
     };
-    Ok(navetted::auth::AuthToken::load_or_create(&path)?.render())
+    Ok(navette_auth::AuthToken::load_or_create(&path)?.render())
 }
 ```
 
@@ -1193,7 +1238,26 @@ sealed interface ConnectionState {
 }
 ```
 
-- [ ] **Step 4: Map 401 in both clients**
+- [ ] **Step 4: Add the token constructor parameter to both clients**
+
+Task 7's tests construct `MediaClient(url, token = "...")`, so the parameter lands
+here rather than in Task 9. Both `MediaClient` and `NavetteClient` take
+`private val token: String` and add the header beside the existing subprotocol
+header:
+
+```kotlin
+Request.Builder()
+    .url(webSocketUrl)
+    .addHeader("Sec-WebSocket-Protocol", MEDIA_WEBSOCKET_SUBPROTOCOL)
+    .addHeader("Authorization", "Bearer $token")
+    .build()
+```
+
+Every existing construction site in `SessionScreen.kt`, `AppViewModel.kt` and the
+test suites must pass a token. Until Task 9 wires the store, pass a literal
+placeholder at the production call sites and let Task 9 replace it.
+
+- [ ] **Step 5: Map 401 in both clients**
 
 In `MediaClient.kt:403` and the matching handler in `NavetteClient.kt`:
 
@@ -1211,7 +1275,7 @@ override fun onFailure(webSocket: WebSocket, t: Throwable, response: OkHttpRespo
 
 `NavetteClient` has no reconnect loop to stop (`NavetteClient.kt:62` defers reconnection), so for the control socket this is purely about surfacing: the user must see "pairing rejected", not a generic connection failure they will blame on the network. **When reconnection is added there, it inherits the terminal rule.**
 
-- [ ] **Step 5: Make 401 terminal in the policy**
+- [ ] **Step 6: Make 401 terminal in the policy**
 
 In `ReconnectPolicy.kt`, add the parameter and the early return:
 
@@ -1230,20 +1294,20 @@ fun shouldRetry(
 Update the two call sites in `SessionScreen.kt:268` and `:278` to pass
 `state.connection is ConnectionState.Unauthorized`.
 
-- [ ] **Step 6: Update the two exhaustive `when` sites**
+- [ ] **Step 7: Update the two exhaustive `when` sites**
 
 In `NavetteApp.kt` and `SessionOverlay.kt`, add an explicit `ConnectionState.Unauthorized ->` arm. In `SessionOverlay.kt` the copy is `"Pairing rejected — scan the QR code again"` with the re-pair action. Do not add `else`.
 
-- [ ] **Step 7: Run to verify pass**
+- [ ] **Step 8: Run to verify pass**
 
 Run: `./gradlew :app:testDebugUnitTest`
 Expected: PASS, all existing tests plus the new ones.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 git add -A
-git commit -m "feat(android): treat a 401 as terminal rather than retrying forever"
+git commit -m "feat(android): send the bearer token and treat a 401 as terminal"
 ```
 
 ---
@@ -1431,17 +1495,12 @@ code-scanner = { module = "com.google.android.gms:play-services-code-scanner", v
 
 This needs **no camera permission** — scanning runs in Play Services' own UI — so no manifest permission and no runtime permission flow. It does require Play Services, which is why manual entry stays.
 
-- [ ] **Step 2: Thread the token into both clients**
+- [ ] **Step 2: Replace the placeholder token with the stored one**
 
-Both take a `token: String` constructor parameter and add the header beside the existing subprotocol header:
-
-```kotlin
-Request.Builder()
-    .url(webSocketUrl)
-    .addHeader("Sec-WebSocket-Protocol", MEDIA_WEBSOCKET_SUBPROTOCOL)
-    .addHeader("Authorization", "Bearer $token")
-    .build()
-```
+Task 7 already added the `token` constructor parameter and the `Authorization`
+header to both clients. This step only replaces the placeholder passed at the
+production construction sites with `PairingStore.load()?.token`, and routes the
+host and port from the same `Pairing` rather than from the typed host field.
 
 - [ ] **Step 3: Add a test that the header is sent**
 
