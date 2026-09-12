@@ -162,6 +162,36 @@ InputValidationError::UnsupportedClipboardMime  // mime outside the allowlist
 Clipboard mime allowlist: `image/png`, `image/jpeg`, `image/webp`. Nothing else is
 accepted for a clipboard blob, in either direction.
 
+### Fetch failure and supersession
+
+Splitting announcement from fetch creates a window, and the window will be hit
+routinely — most often by the single-slot replacement itself. The rules:
+
+- **Announcement supersedes.** The phone tracks only the most recently announced
+  blob id. If a `ClipboardBlob` arrives while an earlier fetch is in flight, that
+  earlier fetch is abandoned and its result discarded *even if it succeeds*.
+- **A failed fetch of a superseded blob is silent.** It is the expected outcome of
+  a race the design creates deliberately, not an error, and it reaches no user.
+- **A failed fetch of the current blob drops that update and nothing more.** The
+  clipboard simply does not gain the image. **There is no retry queue.** A parked
+  retry firing after newer content has already arrived is an open defect on master
+  in the text path; this design declines to grow a second one. The next
+  announcement is the recovery mechanism.
+
+This makes the unlink race correct by rule rather than by accident. Guest copies A,
+the daemon announces A, the phone begins fetching; the guest copies B, `bridge.rs`
+commits B and unlinks A. The in-flight `GET` of A either completes (the handler
+already holds the fd, and POSIX keeps the inode alive) or returns 404 (it had not
+opened yet). The phone discards A's result in both cases, because B's announcement
+superseded it. The outcome does not depend on which way the race lands — which is
+the point, since relying on the fd-holding path would be depending on an accident.
+
+**Across a reconnect:** an announcement whose fetch never completed is lost, and
+nothing is replayed on attach. That is consistent with the deliberate no-replay
+choice in the text clipboard design. The observable consequence, which §8 asserts:
+after a reconnect the phone does *not* hold the image, and a fresh copy on the
+guest delivers normally.
+
 ## 5. ClipboardSync changes
 
 ```rust
@@ -188,6 +218,16 @@ Offer shape follows the payload:
   a guest wants `image/png` and the phone sent `image/jpeg`, png is simply not
   offered.
 
+**A guest may still request a mime the payload cannot satisfy** — a badly behaved
+client, or a request racing a payload that changed between the offer and the pull.
+`PasteRequested` was deliberately built with no early return so that `AnswerGuest`
+is structurally guaranteed, and that property must not be weakened here: an
+unsatisfiable request answers with an **empty transfer**, never with silence.
+Silence is what hangs a guest waiting on a pull, and an unanswered pull is already
+an open hazard on master. The same answer covers a blob whose file has gone missing
+underneath us. Adding a way to not answer would add a second door into that class
+of hang; this design closes it by construction instead.
+
 Guest → phone gains a preference order, applied to the guest's
 `SourceMetadata.mime_types`:
 
@@ -201,12 +241,35 @@ text is what is actually useful on a phone.
 
 ## 6. Limits
 
-- **Per blob: 64 MB** (`MAX_BLOB_BYTES`), enforced by counting streamed bytes. A
-  lying `Content-Length` changes nothing; on overflow the write aborts, the
-  `.part` file is unlinked, and the response is 413.
+**Both directions are bounded, and they are bounded differently because the bytes
+arrive differently.** Stating the cap only in HTTP terms would leave the guest path
+unlimited — the same one-side-of-the-pair mistake that produced the last branch's
+missed P1.
+
+- **Phone → daemon: 64 MB** (`MAX_BLOB_BYTES`), enforced by counting streamed
+  bytes. A lying `Content-Length` changes nothing; on overflow the write aborts,
+  the `.part` file is unlinked, and the response is 413.
+- **Guest → daemon: the same 64 MB**, checked against `bytes.len()` in
+  `bridge.rs::handle_guest_data` *before* any blob is written. An over-cap guest
+  transfer writes nothing and is not announced to the phone; the guest's selection
+  is simply not propagated.
+
+  The wprs path has no bound of its own: `Vec<u8>::framed_read`
+  (`wprs/src/serialization/framing.rs:101-106`) does `vec![0; len as usize]` on a
+  u32 length, so its ceiling is 4 GB and the allocation happens before navetted
+  sees the bytes. **Our cap therefore limits what we store, not what wprs
+  allocates.** That upstream spike is outside this design's reach and is recorded
+  here rather than papered over; bounding our own storage is what stops a guest
+  copy from filling tmpfs.
 - **Per session: 256 MB** across all blobs, clipboard and file alike — one budget,
   no per-kind carve-out. `POST` returns 507 when full. The budget is computed from
-  the blobs present on disk, not from a counter that could drift.
+  the blobs present on disk, not from a counter that could drift, and **`.part`
+  files count toward it**. Without that, N concurrent uploads each see room and
+  overshoot by 64N MB. Two concurrent POSTs can still each admit themselves before
+  either commits, so the budget is a bound with one blob of slack per concurrent
+  upload, not an exact ceiling. That overshoot is bounded and accepted; an exact
+  ceiling would need a lock across the admission check and the reservation, which
+  is not worth it at these sizes.
 - **Clipboard holds one blob.** A new image replaces and unlinks the previous one,
   so clipboard storage is capped at one blob however long the session runs. The
   unlink happens in `bridge.rs::apply_sync_action` when the new payload is
@@ -255,9 +318,17 @@ unchanged; the new surface is designed not to widen it.
 - Android proves the one-shot echo semantics for blobs **and** for text explicitly,
   both sides of the pair. The last branch's missed P1 lived in exactly that
   asymmetry: a guard field cleared on one path and not its twin.
+- Supersession is a unit test, not only a device check: an announcement arriving
+  mid-fetch discards the earlier result even when that fetch succeeds, and a failed
+  fetch of a superseded blob surfaces nothing.
+- An over-cap guest transfer writes no blob and announces nothing — asserted on the
+  guest side, matching the phone side's 413, so the pair is covered symmetrically.
+- An unsatisfiable `PasteRequested` answers with an empty transfer rather than
+  falling silent. This test guards a hang, so it is not optional.
 - On-device verification, which no suite substitutes for: image copy in both
-  directions, and an image pending across a reconnect. Reconnect is where the last
-  device-only bug hid.
+  directions, and an image pending across a reconnect — expected outcome per §4,
+  the phone does not hold the image afterward and a fresh guest copy delivers
+  normally. Reconnect is where the last device-only bug hid.
 
 ## 9. Deliberately not in this design
 
