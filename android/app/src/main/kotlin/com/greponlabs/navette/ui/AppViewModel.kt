@@ -154,11 +154,14 @@ class AppViewModel(
      * session, and refusing to use it would make a device with a broken
      * keystore unusable rather than merely forgetful.
      *
-     * The message deliberately does not promise "you will have to pair again".
-     * A failed `save` leaves whatever was stored before *intact*, so with a
-     * prior pairing the next launch auto-resumes — to the **old** host, which
-     * is a subtler wrong than not coming back at all. "May not return to this
-     * host" is true whether or not something was already stored.
+     * The message is about the *next launch* and nothing else, which is now the
+     * whole of what goes wrong: [reconnect] prefers the active pairing, so
+     * Retry within this session reaches the host the user just paired with
+     * rather than the stale stored one. What a failed `save` still costs is
+     * persistence — a failed save leaves whatever was stored before intact, so
+     * the next launch resumes that (or shows ConnectScreen if there was
+     * nothing). Either way this pairing is not remembered, which is what the
+     * message says and all it says.
      */
     private fun pair(pairing: Pairing) {
         val stored =
@@ -169,21 +172,36 @@ class AppViewModel(
         if (!stored) {
             _state.update {
                 it.copy(
-                    snackbarMessage =
-                        "Pairing not saved — this device may not return to this host next launch. " +
-                            "Re-pair if it doesn't.",
+                    snackbarMessage = "Pairing not saved — this device won't remember it next launch.",
                 )
             }
         }
     }
 
     /**
-     * Guarded like [pair]: this is a user-initiated retry, so a keystore
-     * failure here would crash on a button press. A reconnect with nothing to
-     * reconnect *with* is a dead end the user has to be told about — silently
-     * doing nothing would leave the Retry button looking broken.
+     * Retries the pairing currently in use, falling back to storage only when
+     * there is none.
+     *
+     * The order matters. The active pairing and the stored one diverge exactly
+     * when a `save` failed — [pair] deliberately carries on with the new
+     * pairing — so reloading from storage first would silently reconnect to the
+     * *old* host, or, with an empty store, do nothing at all and leave Retry
+     * looking broken. Retrying what the user is actually connected with is both
+     * the obvious reading of the button and the only one that is right in that
+     * case.
+     *
+     * The storage path stays for the launch where `init`'s load failed or found
+     * nothing: a keystore that recovers between then and the button press is
+     * worth a second attempt. It is guarded like [pair] — a user-initiated
+     * retry must not crash on a button press — and a failure there is surfaced,
+     * since a Retry that silently does nothing is indistinguishable from a
+     * broken button.
      */
     private fun reconnect() {
+        _state.value.pairing?.let {
+            connectWithPairing(it)
+            return
+        }
         runCatching { pairingStore.load() }
             .onFailure { error ->
                 Log.w(TAG, "failed to load a stored pairing: ${error.message}")

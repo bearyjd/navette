@@ -194,10 +194,13 @@ class AppViewModelTest {
             val message = vm.state.value.snackbarMessage
             assertTrue("a pairing that was not saved must say so, got: $message", message != null)
             assertTrue("the message must be about saving, got: $message", message!!.contains("not saved"))
-            // Must NOT promise a re-pair: a failed save leaves any prior
-            // pairing intact, so the next launch auto-resumes it -- to the old
-            // host. "You will have to pair again" would be plainly false there.
+            // The message is about the next launch and nothing else. It must
+            // not claim the user has to pair again (a prior pairing survives a
+            // failed save, so the next launch resumes that), nor say anything
+            // about this session -- Retry now prefers the active pairing, so
+            // reconnecting here reaches the right host.
             assertTrue("must not promise re-pairing is required, got: $message", !message.contains("will have to"))
+            assertTrue("must scope the warning to the next launch, got: $message", message.contains("next launch"))
         }
 
     @Test
@@ -267,9 +270,11 @@ class AppViewModelTest {
     @Test
     fun `a reconnect whose stored pairing cannot be read reports it instead of throwing`() =
         runTest {
-            // init's load() is already guarded; this is the second touch, on a
-            // user-initiated Retry, which was not.
-            val store = FakePairingStore(testPairing)
+            // Reaches the storage path only because there is no active pairing:
+            // an empty store means init connected to nothing, so Retry has
+            // nothing in state to prefer. init's load() is already guarded;
+            // this is the second touch, on a user-initiated Retry, which was not.
+            val store = FakePairingStore()
             val vm = AppViewModel(pairingStore = store, clientFactory = { fake })
             store.failOnLoad = true
 
@@ -279,6 +284,57 @@ class AppViewModelTest {
             val message = vm.state.value.snackbarMessage
             assertTrue("a failed read must be surfaced, got: $message", message != null)
             assertTrue("the message must point at re-pairing, got: $message", message!!.contains("pairing code"))
+        }
+
+    @Test
+    fun `retry after a failed save reconnects to the new host, not the stored one`() =
+        runTest {
+            // The trap this closes: pair() deliberately carries on with the new
+            // pairing when save fails, but Retry used to reload from storage --
+            // so it silently reconnected to the OLD host, with no indication
+            // that it had gone somewhere other than where the user just paired.
+            val previous = Pairing(host = "old-tower", port = 9417, token = "old-token")
+            val store = FakePairingStore(previous)
+            val clients = mutableListOf<Pairing>()
+            val vm =
+                AppViewModel(
+                    pairingStore = store,
+                    clientFactory = { pairing ->
+                        clients.add(pairing)
+                        FakeNavetteApi()
+                    },
+                )
+            store.failOnSave = true
+
+            vm.onEvent(AppEvent.Paired(testPairing))
+            vm.onEvent(AppEvent.Reconnect)
+            testScheduler.advanceUntilIdle()
+
+            assertEquals(testPairing, vm.state.value.pairing)
+            assertEquals(
+                "Retry must redial the pairing in use, not the stale stored one",
+                testPairing,
+                clients.last(),
+            )
+            assertTrue(
+                "the stale pairing must never be dialled after the new one",
+                clients.indexOf(previous) < clients.indexOf(testPairing),
+            )
+        }
+
+    @Test
+    fun `retry with an empty store and no active pairing does nothing but say so`() =
+        runTest {
+            // The other half of the old trap: with nothing on disk, Retry was
+            // a no-op button. It still cannot connect -- there is genuinely
+            // nothing to connect to -- but it must not look broken.
+            val store = FakePairingStore()
+            val vm = AppViewModel(pairingStore = store, clientFactory = { fake })
+
+            vm.onEvent(AppEvent.Reconnect)
+            testScheduler.advanceUntilIdle()
+
+            assertEquals(null, vm.state.value.pairing)
         }
 
     @Test
