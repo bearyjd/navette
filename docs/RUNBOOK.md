@@ -195,9 +195,25 @@ curl -fsS -H "Authorization: Bearer $(navette token)" http://127.0.0.1:9417/heal
 ```
 
 `navette token` prints the grouped form (`ABCD-1234-…`); the daemon strips the
-dashes before comparing, so it can be passed through as-is. On a host where
-`navetted` runs with `--token-file`, pass the same path: `navette token
---token-file <path>`.
+dashes before comparing, so it can be passed through as-is.
+
+**Run this as the user `navetted` runs as.** `navette token` resolves the token
+from `$XDG_STATE_HOME`/`$HOME`, so a liveness check running under a monitoring
+service account reads *that* account's state directory, creates a fresh token
+there, and 401s — reporting a healthy daemon as dead, which is the whole
+failure this check exists to avoid. Under a different account, name the file
+explicitly instead:
+
+```bash
+curl -fsS -H "Authorization: Bearer $(sudo -u navette navette token)" \
+  http://127.0.0.1:9417/healthz
+# or, reading the daemon's token file directly:
+curl -fsS -H "Authorization: Bearer $(cat /var/lib/navette/.local/state/navette/token)" \
+  http://127.0.0.1:9417/healthz
+```
+
+If `navetted` was started with `--token-file`, pass the same path to the
+client: `navette token --token-file <path>`.
 
 There is no metrics endpoint, no Prometheus scrape, and no alerting
 integration. Observability is `RUST_LOG` output plus the client-side HUD.

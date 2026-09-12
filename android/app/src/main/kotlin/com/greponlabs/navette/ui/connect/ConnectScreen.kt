@@ -63,9 +63,16 @@ import com.greponlabs.navette.net.parsePairingUri
 internal fun manualPairing(host: String, port: String, token: String): Pairing? {
     val trimmedHost = host.trim().takeIf { it.isNotBlank() } ?: return null
     val trimmedToken = token.trim().takeIf { it.isNotBlank() } ?: return null
-    val parsedPort = port.trim().toIntOrNull()?.takeIf { it in 1..65535 } ?: return null
-    return Pairing(trimmedHost, parsedPort, trimmedToken)
+    return Pairing(trimmedHost, parsePort(port) ?: return null, trimmedToken)
 }
+
+/**
+ * The single definition of an acceptable port, so the field's error state and
+ * the Pair button cannot disagree about one. `PairingUri.kt` declines to
+ * duplicate the token's shape for the same reason: a second definition is a
+ * second thing to drift.
+ */
+internal fun parsePort(raw: String): Int? = raw.trim().toIntOrNull()?.takeIf { it in 1..65535 }
 
 @Composable
 fun ConnectScreen(
@@ -170,7 +177,7 @@ fun ConnectScreen(
                 onValueChange = { manualPort = it },
                 label = { Text("Port") },
                 singleLine = true,
-                isError = manualPort.isNotBlank() && manualPort.trim().toIntOrNull()?.takeIf { it in 1..65535 } == null,
+                isError = manualPort.isNotBlank() && parsePort(manualPort) == null,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Next),
                 modifier = Modifier.fillMaxWidth(),
             )

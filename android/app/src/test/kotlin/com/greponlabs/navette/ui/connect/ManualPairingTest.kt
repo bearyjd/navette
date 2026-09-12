@@ -47,6 +47,20 @@ class ManualPairingTest {
     }
 
     @Test
+    fun `the field's error state and the pair button agree on every port`() {
+        // Both read `parsePort`; this pins that they cannot diverge. A field
+        // that rejected what the button accepts (or vice versa) is a dead-end
+        // form with no visible reason.
+        for (port in listOf("9417", "1", "65535", "0", "65536", "", "x", " 9417 ")) {
+            assertEquals(
+                "port $port: field validity and pairing validity must agree",
+                parsePort(port) != null,
+                manualPairing("tower", port, "token") != null,
+            )
+        }
+    }
+
+    @Test
     fun `rejects a blank host or token`() {
         assertNull(manualPairing("", "9417", "token"))
         assertNull(manualPairing("   ", "9417", "token"))
