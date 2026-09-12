@@ -986,6 +986,17 @@ fn pairing_uri(host: &str, port: u16, token: &str) -> String {
 /// already a specific non-loopback address, and otherwise refuse.
 fn resolve_advertise_host(url: &str, advertise: Option<&str>) -> Result<String> {
     if let Some(host) = advertise {
+        // Validate rather than percent-encode. `pairing_uri` interpolates this
+        // straight into a query string, so a host containing `&`, `#`, `?` or
+        // `/` would produce an ambiguous URI that the Android parser reads
+        // differently than intended. Encoding here would force matching decoding
+        // on the phone side; rejecting instead keeps both sides literal and
+        // needs no agreement between them. No real hostname or IP contains
+        // these characters — brackets and colons are allowed for IPv6.
+        let legal = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']');
+        if host.is_empty() || !host.chars().all(legal) {
+            bail!("--advertise-host {host:?} is not a valid hostname or address");
+        }
         return Ok(host.to_owned());
     }
     let parsed = url::Url::parse(url).context("could not parse --url")?;
@@ -1029,6 +1040,22 @@ And the handler:
 ```rust
 Command::Token { qr, rotate, advertise_host } => {
     let path = navette_auth::default_token_path().context("cannot determine a token path")?;
+
+    // Resolve the advertised host BEFORE touching the token file. Resolving
+    // after rotation means `token --rotate --qr` against a default loopback
+    // --url invalidates every paired client, prints the rotation notice, and
+    // only then errors on the missing --advertise-host -- leaving the operator
+    // with no working pairings and no sight of the replacement token.
+    let advertised = if qr {
+        let parsed = url::Url::parse(&cli.url)?;
+        Some((
+            resolve_advertise_host(&cli.url, advertise_host.as_deref())?,
+            parsed.port().unwrap_or(9417),
+        ))
+    } else {
+        None
+    };
+
     let token = if rotate {
         let token = navette_auth::AuthToken::rotate(&path)?;
         eprintln!("Token rotated. Every paired client must pair again.");
@@ -1038,10 +1065,7 @@ Command::Token { qr, rotate, advertise_host } => {
         navette_auth::AuthToken::load_or_create(&path)?
     };
 
-    if qr {
-        let parsed = url::Url::parse(&cli.url)?;
-        let port = parsed.port().unwrap_or(9417);
-        let host = resolve_advertise_host(&cli.url, advertise_host.as_deref())?;
+    if let Some((host, port)) = advertised {
         let uri = pairing_uri(&host, port, &token.render());
         let code = qrcode::QrCode::new(uri.as_bytes())?;
         println!("{}", code.render::<qrcode::render::unicode::Dense1x2>().build());
