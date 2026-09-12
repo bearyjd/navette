@@ -201,6 +201,43 @@ pub fn default_token_path() -> Option<PathBuf> {
         .map(|base| base.join("navette/token"))
 }
 
+/// A secret that cannot print itself. Wraps the raw token string as it
+/// arrives from a flag or an environment variable, before it is parsed --
+/// so the redaction [`AuthToken`] already provides for a validated token is
+/// not lost by the copies that live in argument structs on the way to it.
+#[derive(Clone)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Hand-written for the same reason as `AuthToken`'s: a derived `Debug`
+/// would print the raw token the moment anyone logs the struct that holds
+/// this field.
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretString(redacted)")
+    }
+}
+
+/// Lets clap parse `--token` / `NAVETTE_TOKEN` directly into a
+/// [`SecretString`] instead of a plain `String`.
+impl std::str::FromStr for SecretString {
+    type Err = std::convert::Infallible;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_owned()))
+    }
+}
+
+impl From<String> for SecretString {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
 /// Resolves the bearer token a client should send for `url`.
 ///
 /// An explicit token (`--token` / `NAVETTE_TOKEN`) always wins. Otherwise the
@@ -217,12 +254,17 @@ pub fn resolve_token(
         return Ok(token.to_owned());
     }
     let parsed = url::Url::parse(url).context("could not parse --url")?;
-    let host = parsed.host_str().unwrap_or("");
-    let is_local = host == "localhost"
-        || host
-            .parse::<std::net::IpAddr>()
-            .map(|address| address.is_loopback())
-            .unwrap_or(false);
+    // Match on `url::Host`, not on `host_str()`. For an IPv6 URL `host_str()`
+    // returns the *bracketed* form `[::1]`, which `IpAddr::parse` rejects -- so a
+    // string-parsing check silently classifies a genuinely local `ws://[::1]:9417`
+    // as remote and demands an explicit --token. `host()` hands back the parsed
+    // address with no brackets to strip.
+    let is_local = match parsed.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
     if !is_local {
         bail!(
             "--url points at a remote daemon; pass --token or set NAVETTE_TOKEN (the local token file belongs to this host and must not be sent elsewhere)"
@@ -396,6 +438,59 @@ mod tests {
         AuthToken::load_or_create(&path).unwrap();
         let error = resolve_token("ws://tower:9417/v1/ws", None, Some(&path)).unwrap_err();
         assert!(error.to_string().contains("--token"));
+    }
+
+    #[test]
+    fn resolves_the_local_token_file_for_the_ipv6_loopback_address() {
+        // `host_str()` on an IPv6 URL returns the bracketed form `[::1]`, which
+        // `IpAddr::parse` rejects -- a check built on that string would wrongly
+        // classify this as remote. Matching on `url::Host` instead is the fix
+        // this test pins.
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("token");
+        let token = AuthToken::load_or_create(&path).unwrap();
+        let resolved = resolve_token("ws://[::1]:9417/v1/ws", None, Some(&path)).unwrap();
+        assert_eq!(resolved, token.render());
+    }
+
+    #[test]
+    fn refuses_to_send_the_local_token_to_a_remote_ipv6_daemon() {
+        // The companion to the ::1 test above: a fix that treated every IPv6
+        // address as local would pass that test and still be wrong. A
+        // non-loopback IPv6 address must still be refused.
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("token");
+        AuthToken::load_or_create(&path).unwrap();
+        let error = resolve_token("ws://[fd7a::1]:9417/v1/ws", None, Some(&path)).unwrap_err();
+        assert!(error.to_string().contains("--token"));
+    }
+
+    #[test]
+    fn resolves_the_local_token_file_for_a_non_canonical_loopback_address() {
+        // The whole 127.0.0.0/8 block is loopback, not just 127.0.0.1.
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("token");
+        let token = AuthToken::load_or_create(&path).unwrap();
+        let resolved = resolve_token("ws://127.0.0.2:9417/v1/ws", None, Some(&path)).unwrap();
+        assert_eq!(resolved, token.render());
+    }
+
+    #[test]
+    fn resolves_the_local_token_file_for_localhost_regardless_of_case() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("token");
+        let token = AuthToken::load_or_create(&path).unwrap();
+        let resolved = resolve_token("ws://LOCALHOST:9417/v1/ws", None, Some(&path)).unwrap();
+        assert_eq!(resolved, token.render());
+    }
+
+    #[test]
+    fn secret_string_debug_never_reveals_the_value() {
+        use std::str::FromStr;
+        let secret = SecretString::from_str("ABCD1234ABCD1234ABCD1234").unwrap();
+        let debug = format!("{secret:?}");
+        assert!(!debug.contains("ABCD1234ABCD1234ABCD1234"));
+        assert!(debug.contains("redacted"));
     }
 
     #[test]

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use navette_auth::SecretString;
 use navette_cli::{Client, render_result};
 use navette_protocol::{AttachInfo, RequestCommand, ResponseResult};
 use nix::sys::signal::{Signal, kill};
@@ -33,7 +34,7 @@ struct Cli {
 
     /// API token. Defaults to the local token file for a loopback --url.
     #[arg(long, env = "NAVETTE_TOKEN", global = true)]
-    token: Option<String>,
+    token: Option<SecretString>,
 
     /// wprsc executable.
     #[arg(long, default_value = "wprsc", global = true)]
@@ -110,7 +111,8 @@ async fn main() -> Result<()> {
         return show_token(&cli.url, qr, rotate, advertise_host.as_deref());
     }
 
-    let token = navette_auth::resolve_token(&cli.url, cli.token.as_deref(), None)?;
+    let token =
+        navette_auth::resolve_token(&cli.url, cli.token.as_ref().map(SecretString::as_str), None)?;
     let client = Client::new(&cli.url, token);
     match cli.command {
         Command::Ls => print_result(client.call(RequestCommand::ListSessions).await?),

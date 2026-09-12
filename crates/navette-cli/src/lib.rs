@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
+use navette_auth::SecretString;
 use navette_protocol::{
     Request, RequestCommand, Response, ResponseOutcome, ResponseResult, WEBSOCKET_SUBPROTOCOL,
 };
@@ -10,11 +11,11 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 #[derive(Clone, Debug)]
 pub struct Client {
     url: String,
-    token: String,
+    token: SecretString,
 }
 
 impl Client {
-    pub fn new(url: impl Into<String>, token: impl Into<String>) -> Self {
+    pub fn new(url: impl Into<String>, token: impl Into<SecretString>) -> Self {
         Self {
             url: url.into(),
             token: token.into(),
@@ -35,7 +36,7 @@ impl Client {
         );
         upgrade.headers_mut().insert(
             "Authorization",
-            format!("Bearer {}", self.token)
+            format!("Bearer {}", self.token.as_str())
                 .parse()
                 .context("token is not a valid header value")?,
         );
