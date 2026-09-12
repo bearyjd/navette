@@ -2756,7 +2756,7 @@ build against the ceilinged wprs.
 - Why it's not pushed: a `cargo` git dependency can only name a rev that exists on a
   remote, and pushing to a remote is outside standing agent authorization. What's
   left is mechanical: push `wprs`'s local tip, then bump the rev pin in
-  `crates/navette-bridge/Cargo.toml:15` and `crates/navetted/Cargo.toml:25` to the
+  `crates/navette-bridge/Cargo.toml:15` and `crates/navetted/Cargo.toml:26` to the
   pushed SHA.
 - Until then, this branch's own workspace still builds and tests against the
   **un-ceilinged** pinned rev `5763d74` — the 4 GB-per-message allocation this fix

@@ -158,10 +158,7 @@ fn show_token(
     // host must run first. Otherwise a failure here would leave the operator
     // with an invalidated or newly-minted token they were never shown.
     let advertised_endpoint = if qr {
-        let parsed = url::Url::parse(url).context("could not parse --url")?;
-        let port = parsed.port().unwrap_or(9417);
-        let host = resolve_advertise_host(url, advertise_host)?;
-        Some((host, port))
+        Some(advertised_endpoint(url, advertise_host)?)
     } else {
         None
     };
@@ -208,6 +205,20 @@ fn show_token(
         }
     }
     Ok(())
+}
+
+/// The `(host, port)` pair the QR tells the phone to dial.
+///
+/// Both come from `--url`; `--advertise-host` overrides the host only, and
+/// carries no port of its own. That asymmetry is the thing operators get wrong
+/// — `--advertise-host tower.ts.net` against a daemon on a non-default port
+/// yields a QR saying 9417 — so it is pinned here rather than left implicit in
+/// `show_token`. The table in docs/RUNBOOK.md documents exactly this function.
+fn advertised_endpoint(url: &str, advertise_host: Option<&str>) -> Result<(String, u16)> {
+    let parsed = url::Url::parse(url).context("could not parse --url")?;
+    let port = parsed.port().unwrap_or(9417);
+    let host = resolve_advertise_host(url, advertise_host)?;
+    Ok((host, port))
 }
 
 fn pairing_uri(host: &str, port: u16, token: &str) -> String {
@@ -647,6 +658,45 @@ mod tests {
                 "expected {host} to be accepted"
             );
         }
+    }
+
+    /// Pins the table in docs/RUNBOOK.md's `navette token` section, row for
+    /// row. An operator following it must get a QR that dials the right place
+    /// on the first try, and the trap is that `--advertise-host` overrides the
+    /// host but never the port.
+    #[test]
+    fn the_qr_endpoint_matches_what_the_runbook_documents() {
+        const DEFAULT_URL: &str = "ws://127.0.0.1:9417/v1/ws";
+
+        // Loopback --url, no flag: an error naming the flag, not a guess.
+        let error = advertised_endpoint(DEFAULT_URL, None).unwrap_err();
+        assert!(error.to_string().contains("--advertise-host"));
+
+        // Loopback --url plus the flag: the flag's host, the --url port.
+        assert_eq!(
+            advertised_endpoint(DEFAULT_URL, Some("tower.ts.net")).unwrap(),
+            ("tower.ts.net".to_owned(), 9417)
+        );
+
+        // A specific non-loopback --url, no flag: both come from --url.
+        assert_eq!(
+            advertised_endpoint("ws://tower.ts.net:19417/v1/ws", None).unwrap(),
+            ("tower.ts.net".to_owned(), 19417)
+        );
+
+        // The flag wins on host, and the port still rides on --url. This is
+        // the row the runbook's worked example exists for.
+        assert_eq!(
+            advertised_endpoint("ws://127.0.0.1:19417/v1/ws", Some("tower.ts.net")).unwrap(),
+            ("tower.ts.net".to_owned(), 19417)
+        );
+
+        // A --url with no explicit port falls back to 9417, so the documented
+        // default holds even when the URL omits it.
+        assert_eq!(
+            advertised_endpoint("ws://tower.ts.net/v1/ws", None).unwrap(),
+            ("tower.ts.net".to_owned(), 9417)
+        );
     }
 
     #[test]
