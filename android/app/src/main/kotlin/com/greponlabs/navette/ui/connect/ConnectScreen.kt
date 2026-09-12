@@ -24,6 +24,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import com.greponlabs.navette.net.ConnectionState
@@ -58,6 +60,13 @@ fun ConnectScreen(
     var manualEntryShown by rememberSaveable { mutableStateOf(false) }
     var manualHost by rememberSaveable { mutableStateOf("") }
     var manualToken by rememberSaveable { mutableStateOf("") }
+    // Masked by default: this field exists to keep the token out of logs,
+    // Debug output and error strings, and a plaintext field on screen would
+    // undo that in a different medium (over-the-shoulder in public, screen
+    // recording). The toggle exists because a 24-char base32 string typed
+    // fully blind is genuinely error-prone, and a mistyped token fails at
+    // connect time looking exactly like an auth bug.
+    var tokenVisible by rememberSaveable { mutableStateOf(false) }
 
     val connecting = connection is ConnectionState.Connecting
 
@@ -127,6 +136,7 @@ fun ConnectScreen(
                 onValueChange = { manualToken = it },
                 label = { Text("Token") },
                 singleLine = true,
+                visualTransformation = if (tokenVisible) VisualTransformation.None else PasswordVisualTransformation(),
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Go),
                 keyboardActions =
                     KeyboardActions(
@@ -136,6 +146,15 @@ fun ConnectScreen(
                             }
                         },
                     ),
+                // A TextButton, not an IconButton: this project has no Material
+                // icons dependency, and its own text content ("Show"/"Hide") is
+                // what a TalkBack user hears -- an icon-only button would need a
+                // separate contentDescription to reach the same accessibility bar.
+                trailingIcon = {
+                    TextButton(onClick = { tokenVisible = !tokenVisible }) {
+                        Text(if (tokenVisible) "Hide" else "Show")
+                    }
+                },
                 modifier = Modifier.fillMaxWidth(),
             )
             Button(
