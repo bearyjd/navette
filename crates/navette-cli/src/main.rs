@@ -31,6 +31,10 @@ struct Cli {
     #[arg(long, env = "NAVETTE_SSH", global = true)]
     ssh: Option<String>,
 
+    /// API token. Defaults to the local token file for a loopback --url.
+    #[arg(long, env = "NAVETTE_TOKEN", global = true)]
+    token: Option<String>,
+
     /// wprsc executable.
     #[arg(long, default_value = "wprsc", global = true)]
     wprsc: String,
@@ -93,7 +97,21 @@ struct AttachRecord {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let client = Client::new(&cli.url);
+    // `token` is a local admin command that reads the daemon's token file
+    // directly and never dials the daemon, so it must not force token
+    // resolution: on a remote --url that would demand an explicit --token
+    // for no reason, since this command never sends one anywhere.
+    if let Command::Token {
+        qr,
+        rotate,
+        advertise_host,
+    } = cli.command
+    {
+        return show_token(&cli.url, qr, rotate, advertise_host.as_deref());
+    }
+
+    let token = navette_auth::resolve_token(&cli.url, cli.token.as_deref(), None)?;
+    let client = Client::new(&cli.url, token);
     match cli.command {
         Command::Ls => print_result(client.call(RequestCommand::ListSessions).await?),
         Command::Run { app, name } => print_result(
@@ -108,11 +126,7 @@ async fn main() -> Result<()> {
         Command::Kill { session } => {
             print_result(client.call(RequestCommand::Kill { session }).await?)
         }
-        Command::Token {
-            qr,
-            rotate,
-            advertise_host,
-        } => show_token(&cli.url, qr, rotate, advertise_host.as_deref()),
+        Command::Token { .. } => unreachable!("handled above"),
     }
 }
 

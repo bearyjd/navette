@@ -10,11 +10,15 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 #[derive(Clone, Debug)]
 pub struct Client {
     url: String,
+    token: String,
 }
 
 impl Client {
-    pub fn new(url: impl Into<String>) -> Self {
-        Self { url: url.into() }
+    pub fn new(url: impl Into<String>, token: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            token: token.into(),
+        }
     }
 
     pub async fn call(&self, command: RequestCommand) -> Result<ResponseResult> {
@@ -28,6 +32,12 @@ impl Client {
             WEBSOCKET_SUBPROTOCOL
                 .parse()
                 .expect("static subprotocol is a valid header value"),
+        );
+        upgrade.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {}", self.token)
+                .parse()
+                .context("token is not a valid header value")?,
         );
         let (mut socket, response) = connect_async(upgrade)
             .await

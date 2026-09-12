@@ -31,6 +31,10 @@ struct Cli {
     /// FFmpeg executable used for decoding.
     #[arg(long, default_value = "ffmpeg")]
     ffmpeg: String,
+
+    /// API token. Defaults to the local token file for a loopback --url.
+    #[arg(long, env = "NAVETTE_TOKEN")]
+    token: Option<String>,
 }
 
 #[tokio::main]
@@ -38,10 +42,8 @@ async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     let url = media_url(&cli.url, &cli.session);
-    // Task 6 supplies the real token (pairing/CLI resolution); an empty
-    // credential here always fails navetted's bearer check, so this build
-    // cannot reach a session until that wiring lands.
-    let mut client = MediaClient::connect(&url, "", ffmpeg_decoder_factory(cli.ffmpeg))
+    let token = navette_auth::resolve_token(&cli.url, cli.token.as_deref(), None)?;
+    let mut client = MediaClient::connect(&url, &token, ffmpeg_decoder_factory(cli.ffmpeg))
         .await
         .with_context(|| format!("failed to attach to {url}"))?;
     tracing::info!(session = %cli.session, %url, "attached to session media");

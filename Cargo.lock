@@ -1342,10 +1342,12 @@ dependencies = [
 name = "navette-auth"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "rand 0.8.8",
  "subtle",
  "tempfile",
  "thiserror 2.0.20",
+ "url",
 ]
 
 [[package]]

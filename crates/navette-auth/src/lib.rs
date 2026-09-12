@@ -3,6 +3,7 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result, bail};
 use rand::RngCore;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -200,6 +201,40 @@ pub fn default_token_path() -> Option<PathBuf> {
         .map(|base| base.join("navette/token"))
 }
 
+/// Resolves the bearer token a client should send for `url`.
+///
+/// An explicit token (`--token` / `NAVETTE_TOKEN`) always wins. Otherwise the
+/// local token file is used, but only for a loopback `url`: reading this
+/// host's token and sending it to some other machine would hand our
+/// credential to whatever is listening there, which may not be our daemon at
+/// all.
+pub fn resolve_token(
+    url: &str,
+    explicit: Option<&str>,
+    token_file: Option<&Path>,
+) -> Result<String> {
+    if let Some(token) = explicit {
+        return Ok(token.to_owned());
+    }
+    let parsed = url::Url::parse(url).context("could not parse --url")?;
+    let host = parsed.host_str().unwrap_or("");
+    let is_local = host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|address| address.is_loopback())
+            .unwrap_or(false);
+    if !is_local {
+        bail!(
+            "--url points at a remote daemon; pass --token or set NAVETTE_TOKEN (the local token file belongs to this host and must not be sent elsewhere)"
+        );
+    }
+    let path = match token_file {
+        Some(path) => path.to_path_buf(),
+        None => default_token_path().context("cannot determine a token path")?,
+    };
+    Ok(AuthToken::load_or_create(&path)?.render())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,5 +376,31 @@ mod tests {
             0x0E,
         ]);
         assert_eq!(token.render(), "000G40R40M30E209185GR38E");
+    }
+
+    #[test]
+    fn resolves_the_local_token_file_for_a_loopback_url() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("token");
+        let token = AuthToken::load_or_create(&path).unwrap();
+        let resolved = resolve_token("ws://127.0.0.1:9417/v1/ws", None, Some(&path)).unwrap();
+        assert_eq!(resolved, token.render());
+    }
+
+    #[test]
+    fn refuses_to_send_the_local_token_to_a_remote_daemon() {
+        // Reading the local host's token and sending it to some other machine
+        // would hand our credential to whatever is listening there.
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("token");
+        AuthToken::load_or_create(&path).unwrap();
+        let error = resolve_token("ws://tower:9417/v1/ws", None, Some(&path)).unwrap_err();
+        assert!(error.to_string().contains("--token"));
+    }
+
+    #[test]
+    fn an_explicit_token_is_used_for_any_url() {
+        let resolved = resolve_token("ws://tower:9417/v1/ws", Some("EXPLICIT"), None).unwrap();
+        assert_eq!(resolved, "EXPLICIT");
     }
 }
