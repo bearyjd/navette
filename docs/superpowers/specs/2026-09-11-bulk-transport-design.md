@@ -282,24 +282,32 @@ missed P1.
 
 ## 7. Security
 
-The daemon API has no authentication and the tailnet is the entire boundary. These
-routes join the same router, so the existing guard at `crates/navetted/src/main.rs:57-62`
-still refuses a non-loopback bind without `--allow-remote`.
+**Status update: the remedy this section used to point at now exists and applies to
+these routes automatically.** `docs/superpowers/specs/2026-09-12-hardening-design.md`
+landed `Origin` rejection and an API-wide bearer token on the daemon's router, with
+no loopback exemption and no per-route opt-in. Because §3 places the blob routes on
+that same router (`crates/navetted/src/api.rs`), they inherit both guards the moment
+they're registered — the same way `/healthz` and the media socket did. There is
+nothing to wire for these routes specifically: no route on this router is reachable
+without a valid `Authorization: Bearer <token>` header, and none is reachable at all
+from a request carrying an `Origin` header.
 
-**These routes do not widen that boundary, and the argument is equivalence, not
-mitigation.** A peer that can reach `POST /v1/sessions/{s}/blobs` can already attach
+That makes authentication, not equivalence, the reason this surface is safe to add,
+and the equivalence argument below is retained only as context for why the surface
+was judged acceptable *before* that branch existed — it is no longer what carries
+this section.
+
+*(Retained for context, no longer load-bearing.)* Before API-wide auth landed, the
+argument here was that these routes do not *widen* the then-unauthenticated
+boundary: a peer that could reach `POST /v1/sessions/{s}/blobs` could already attach
 to `/v1/sessions/{s}/media`, read the entire screen, and inject input — total
-compromise of every session. Blob upload and download add nothing an attacker in
-that position does not already have.
-
-The consequence worth being blunt about: **putting a token on the blob routes alone
-would be theater**, since it would leave the media socket open beside it. The actual
-remedy is API-wide session authentication, which is a larger change than this spec
-and is tracked separately in `docs/HANDOFF.md`. This design neither delivers it nor
-pretends to.
+compromise of every session — so blob upload and download added nothing such a peer
+did not already have. That reasoning was sound for its purpose (justifying new
+routes on an unauthenticated daemon) but never claimed to make the daemon itself
+safe, which is exactly the gap the hardening branch closed.
 
 The properties below are real and worth having, but they are defense in depth
-*within* that boundary — not the reason the new surface is acceptable.
+*within* the authenticated boundary — not the reason the new surface is acceptable.
 
 - **Ids are 128 CSPRNG bits, hex-encoded, generated server-side.** Never
   client-chosen, never sanitized — validated against `^[0-9a-f]{32}$` by whitelist
