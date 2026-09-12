@@ -2593,6 +2593,58 @@ verified as pre-existing or by-design, and none was introduced by the fix wave.
   teardown above 32 KiB, and a client-side guard that now keeps sends at or
   under 16 KiB so neither is reached.
 
+## CRITICAL — any web page can drive the daemon, in the default configuration (2026-09-12)
+
+Found while designing API-wide auth. **This is live in shipped code on master and
+needs no flags to reach** — it is the documented default, not a misconfiguration.
+
+`grep -rn "origin\|Origin\|cors\|Host"` across `crates/navetted/src/` returns
+nothing. The router (`api.rs:77-80`) carries no middleware of any kind.
+`media_websocket` (`api.rs:84`) validates a session name and nothing else;
+`websocket` (`api.rs:252`) requires a WebSocket subprotocol, which is **not** a
+defense because a browser sets one with `new WebSocket(url, [...])`.
+
+Browsers do not apply CORS preflight to WebSocket handshakes — they open the
+connection and leave rejection to the server. So while `navetted` runs on loopback,
+any page the user visits can attach to `/v1/sessions/{s}/media`, receive the screen,
+and inject input. Session names are user-chosen and guessable, and the control
+socket enumerates sessions anyway. The blob routes in
+`specs/2026-09-11-bulk-transport-design.md` would inherit this: a cross-origin POST
+with a simple content type fires without preflight.
+
+**Fix (item 0 of the hardening branch):** reject any request carrying an `Origin`
+header outright — navette has no browser client, so a blanket rejection is correct
+rather than a policy to tune — plus `Host` validation against the expected authority
+to blunt DNS rebinding. Router-wide middleware, small, and independent of every auth
+decision.
+
+**Design consequence, recorded because it nearly shipped:** an "unauthenticated
+loopback, token for remote" split was about to be proposed on the reasoning that a
+loopback TCP port is equivalent to a 0700 Unix socket. It is not. A 0700 socket is
+unreachable from a web page; a loopback port is not. **The token applies to every
+route with no loopback exemption.**
+
+## Hardening branch — shape agreed 2026-09-12
+
+Decided to fold all three items into one reviewed branch rather than hotfix item 0
+separately: one coherent security story, one review pass.
+
+0. `Origin` rejection + `Host` validation (above).
+1. API-wide bearer token, no loopback exemption. Its own 0600 file — **not**
+   `registry.json`, which sets no explicit mode and so lands at umask default
+   (typically 0644).
+2. `uncompressed_size` ceilings, below — two call sites, two values.
+
+Scope note found during orientation and accepted: the Android app persists
+**nothing** (no DataStore, no SharedPreferences anywhere under
+`android/app/src/main/kotlin/`), and `ConnectScreen.kt:24` explicitly defers a
+saved-host registry to M4. A token therefore means retyping it every launch unless
+this branch adds a minimal single-host credential store. Agreed approach: add the
+minimal store here, let M4 generalize it.
+
+When auth lands, `specs/2026-09-11-bulk-transport-design.md` §7 goes stale — it
+says API-wide auth is "tracked separately in docs/HANDOFF.md". Update it then.
+
 ## Two items surfaced while designing bulk transport (2026-09-11)
 
 Both were found designing `docs/superpowers/specs/2026-09-11-bulk-transport-design.md`.
