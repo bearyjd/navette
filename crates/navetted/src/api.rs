@@ -78,7 +78,24 @@ pub fn router<R: ProcessRunner>(state: ApiState<R>) -> Router {
         .route("/healthz", get(health))
         .route("/v1/ws", any(websocket::<R>))
         .route("/v1/sessions/{session}/media", any(media_websocket::<R>))
+        .layer(axum::middleware::from_fn(
+            crate::guard::reject_browser_origin,
+        ))
         .with_state(state)
+}
+
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Leaks a TempDir so the returned router owns a live registry path for the
+    /// duration of the test. Acceptable in tests; never do this in production
+    /// code.
+    pub(crate) fn test_router() -> Router {
+        let temp = Box::leak(Box::new(TempDir::new().unwrap()));
+        router(super::tests::test_state(temp))
+    }
 }
 
 async fn media_websocket<R: ProcessRunner>(
@@ -476,7 +493,7 @@ mod tests {
     use crate::supervisor::{ProcessSpec, Supervisor};
 
     #[derive(Debug, Default)]
-    struct NoopRunner {
+    pub(crate) struct NoopRunner {
         alive: Mutex<BTreeSet<u32>>,
     }
 
@@ -494,7 +511,7 @@ mod tests {
         }
     }
 
-    fn test_state(temp: &TempDir) -> ApiState<NoopRunner> {
+    pub(crate) fn test_state(temp: &TempDir) -> ApiState<NoopRunner> {
         let apps = AppIndex::from_apps([App {
             id: "firefox".into(),
             name: "Firefox".into(),
@@ -809,6 +826,30 @@ mod tests {
             ClientMessage::Text(r#"{"type":"clipboard","text":"hello"}"#.into())
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn our_own_websocket_client_sends_no_origin_header() {
+        let temp = TempDir::new().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router(test_state(&temp)))
+                .await
+                .unwrap();
+        });
+        let mut request = format!("ws://{address}/v1/ws")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            WEBSOCKET_SUBPROTOCOL.parse().unwrap(),
+        );
+        assert!(
+            !request.headers().contains_key("Origin"),
+            "our client must not send Origin, or the guard would lock us out"
+        );
+        assert!(connect_async(request).await.is_ok());
     }
 
     #[test]

@@ -27,3 +27,4 @@ wprs = { git = "https://github.com/bearyjd/wprs.git", rev = "5763d7464ac76103fd4
 
 [dev-dependencies]
 tokio-tungstenite = "0.30"
+tower = { version = "0.5", features = ["util"] }
