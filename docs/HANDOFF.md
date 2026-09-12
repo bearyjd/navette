@@ -2592,3 +2592,43 @@ verified as pre-existing or by-design, and none was introduced by the fix wave.
   governs is documented under check 5 above — refusal between 16 and 32 KiB,
   teardown above 32 KiB, and a client-side guard that now keeps sends at or
   under 16 KiB so neither is reached.
+
+## Two items surfaced while designing bulk transport (2026-09-11)
+
+Both were found designing `docs/superpowers/specs/2026-09-11-bulk-transport-design.md`.
+Neither is caused by that design, and neither is fixed by it — recorded here so the
+spec does not have to pretend otherwise.
+
+- **HIGH — a wire-declared size drives an unbounded allocation on every object
+  message.** `streaming_framed_decompress_with` reads `uncompressed_size` with
+  `usize::framed_read` (`wprs/src/serialization/framing.rs:67-75`, which is a
+  **u32** on the wire), and passes it to `decompress_impl`, which resizes its
+  buffer to that value (`wprs/src/sharding_compression.rs:434-439`). Ceiling is
+  4 GB, allocated before any content is validated. This governs **every**
+  `MessageType::Object` navetted reads today — surface commits, input, all of it —
+  not just clipboard data, and it predates all clipboard work. navetted links the
+  bridge in-process, so an OOM here takes down every session, not one.
+
+  Fix is surgical and upstreamable: bound `uncompressed_size` against a ceiling in
+  our wprs pin. 256 MB leaves roughly 8x headroom over a 4K framebuffer (~33 MB
+  uncompressed). It touches every message path, so it wants its own change and its
+  own test, not a line item inside a feature spec.
+
+  **Correction to an earlier claim:** commit `0a49236` and the first draft of the
+  bulk-transport spec cited `Vec<u8>::framed_read`
+  (`wprs/src/serialization/framing.rs:101-106`) as the unbounded path and scoped it
+  to clipboard data transfers. Both were wrong — wrong function, and far too narrow
+  a scope. The citation above is the verified one. Anyone chasing the old reference
+  should stop and read this entry instead.
+
+- **HIGH — the daemon API has no authentication at all, and blob endpoints do not
+  change that either way.** Any peer that can reach the API can attach to
+  `/v1/sessions/{s}/media`, read the whole screen, and inject input. The tailnet is
+  the only boundary; `main.rs:57-62` refuses a non-loopback bind without
+  `--allow-remote`, and that is the entire defense.
+
+  Consequence for design work: adding a token to any single route is theater while
+  the media socket stays open. API-wide session authentication is the real remedy
+  and needs its own spec. Until it exists, every new route should be justified by
+  showing it does not widen the boundary, which is what the bulk-transport spec's
+  §7 does, rather than by listing per-route mitigations.

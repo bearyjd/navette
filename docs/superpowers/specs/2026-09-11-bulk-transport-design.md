@@ -250,17 +250,15 @@ missed P1.
   bytes. A lying `Content-Length` changes nothing; on overflow the write aborts,
   the `.part` file is unlinked, and the response is 413.
 - **Guest → daemon: the same 64 MB**, checked against `bytes.len()` in
-  `bridge.rs::handle_guest_data` *before* any blob is written. An over-cap guest
-  transfer writes nothing and is not announced to the phone; the guest's selection
-  is simply not propagated.
+  `bridge.rs::handle_guest_data` *before* any blob is written, **and against the
+  same session budget below.** Both bounds apply in both directions; giving the
+  guest only the per-blob cap would repeat the one-sided mistake one level down.
+  An over-cap or over-budget guest transfer writes nothing and is not announced to
+  the phone; the guest's selection is simply not propagated.
 
-  The wprs path has no bound of its own: `Vec<u8>::framed_read`
-  (`wprs/src/serialization/framing.rs:101-106`) does `vec![0; len as usize]` on a
-  u32 length, so its ceiling is 4 GB and the allocation happens before navetted
-  sees the bytes. **Our cap therefore limits what we store, not what wprs
-  allocates.** That upstream spike is outside this design's reach and is recorded
-  here rather than papered over; bounding our own storage is what stops a guest
-  copy from filling tmpfs.
+  This bound limits what navette *stores*. How much wprs allocates while reading a
+  message is out of scope for this spec — see the tracked follow-up in
+  `docs/HANDOFF.md`.
 - **Per session: 256 MB** across all blobs, clipboard and file alike — one budget,
   no per-kind carve-out. `POST` returns 507 when full. The budget is computed from
   the blobs present on disk, not from a counter that could drift, and **`.part`
@@ -286,8 +284,22 @@ missed P1.
 
 The daemon API has no authentication and the tailnet is the entire boundary. These
 routes join the same router, so the existing guard at `crates/navetted/src/main.rs:57-62`
-still refuses a non-loopback bind without `--allow-remote`. That posture is
-unchanged; the new surface is designed not to widen it.
+still refuses a non-loopback bind without `--allow-remote`.
+
+**These routes do not widen that boundary, and the argument is equivalence, not
+mitigation.** A peer that can reach `POST /v1/sessions/{s}/blobs` can already attach
+to `/v1/sessions/{s}/media`, read the entire screen, and inject input — total
+compromise of every session. Blob upload and download add nothing an attacker in
+that position does not already have.
+
+The consequence worth being blunt about: **putting a token on the blob routes alone
+would be theater**, since it would leave the media socket open beside it. The actual
+remedy is API-wide session authentication, which is a larger change than this spec
+and is tracked separately in `docs/HANDOFF.md`. This design neither delivers it nor
+pretends to.
+
+The properties below are real and worth having, but they are defense in depth
+*within* that boundary — not the reason the new surface is acceptable.
 
 - **Ids are 128 CSPRNG bits, hex-encoded, generated server-side.** Never
   client-chosen, never sanitized — validated against `^[0-9a-f]{32}$` by whitelist
