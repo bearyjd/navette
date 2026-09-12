@@ -42,7 +42,7 @@ impl Client {
         );
         let (mut socket, response) = connect_async(upgrade)
             .await
-            .with_context(|| format!("failed to connect to {}", self.url))?;
+            .map_err(|error| connect_error(error, &self.url))?;
         if response
             .headers()
             .get("Sec-WebSocket-Protocol")
@@ -77,6 +77,27 @@ impl Client {
         }
         bail!("daemon closed the connection without a response")
     }
+}
+
+/// Turns a failed WebSocket upgrade into something an operator can act on.
+///
+/// Every route requires a bearer token, so the most likely reason a working
+/// invocation stops working is a rotated one — and tungstenite surfaces that as
+/// `HTTP error: 401`, which names neither the cause nor the remedy. Kept a free
+/// function so the mapping can be tested against a synthetic response rather
+/// than a live daemon.
+fn connect_error(error: tokio_tungstenite::tungstenite::Error, url: &str) -> anyhow::Error {
+    use tokio_tungstenite::tungstenite::Error;
+    use tokio_tungstenite::tungstenite::http::StatusCode;
+
+    if let Error::Http(response) = &error
+        && response.status() == StatusCode::UNAUTHORIZED
+    {
+        return anyhow::anyhow!(
+            "{url} rejected the token (HTTP 401). The daemon's token has probably been rotated: run `navette token` on the daemon host for the current value, then pass it as --token or NAVETTE_TOKEN"
+        );
+    }
+    anyhow::Error::new(error).context(format!("failed to connect to {url}"))
 }
 
 pub fn response_result(response: Response) -> Result<ResponseResult> {
@@ -150,5 +171,43 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("NotFound"));
         assert!(error.to_string().contains("session not found: work"));
+    }
+
+    #[test]
+    fn a_401_upgrade_names_the_command_that_shows_the_token() {
+        // Design §7: a rotated token must not present as a bare
+        // `HTTP error: 401`, which reads like the daemon is down.
+        use tokio_tungstenite::tungstenite::http::{Response as HttpResponse, StatusCode};
+
+        let refusal = HttpResponse::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .body(None)
+            .unwrap();
+        let error = connect_error(
+            tokio_tungstenite::tungstenite::Error::Http(Box::new(refusal)),
+            "ws://127.0.0.1:9417/v1/ws",
+        );
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("navette token"),
+            "a 401 must name the remedy: {rendered}"
+        );
+        assert!(rendered.contains("401"), "and the status: {rendered}");
+    }
+
+    #[test]
+    fn a_non_401_failure_keeps_the_connection_context() {
+        // The 401 branch must not swallow every other failure into an auth
+        // message: a daemon that isn't running still has to say so.
+        let error = connect_error(
+            tokio_tungstenite::tungstenite::Error::ConnectionClosed,
+            "ws://127.0.0.1:9417/v1/ws",
+        );
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("failed to connect to ws://127.0.0.1:9417/v1/ws"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("navette token"), "{rendered}");
     }
 }
