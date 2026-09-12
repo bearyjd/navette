@@ -48,6 +48,25 @@ import com.greponlabs.navette.net.parsePairingUri
  * Not a saved multi-host registry -- that's M4 (docs/ROADMAP.md, "Cloud +
  * polish"). One pairing, one slot in [com.greponlabs.navette.net.PairingStore].
  */
+/**
+ * Builds a [Pairing] from the manual-entry fields, or null when they are not
+ * yet a usable pairing.
+ *
+ * Extracted from the composable so that the "Pair" button's enabled state and
+ * the keyboard's Go action cannot drift apart -- they were already two
+ * structurally different predicates, and adding a fallible port to only one of
+ * them would give Go a path to pair on a port the button refuses.
+ *
+ * The 1..65535 bound matches `parsePairingUri`, so a typed pairing and a
+ * scanned one accept exactly the same values.
+ */
+internal fun manualPairing(host: String, port: String, token: String): Pairing? {
+    val trimmedHost = host.trim().takeIf { it.isNotBlank() } ?: return null
+    val trimmedToken = token.trim().takeIf { it.isNotBlank() } ?: return null
+    val parsedPort = port.trim().toIntOrNull()?.takeIf { it in 1..65535 } ?: return null
+    return Pairing(trimmedHost, parsedPort, trimmedToken)
+}
+
 @Composable
 fun ConnectScreen(
     connection: ConnectionState,
@@ -60,6 +79,12 @@ fun ConnectScreen(
     var scanError by rememberSaveable { mutableStateOf<String?>(null) }
     var manualEntryShown by rememberSaveable { mutableStateOf(false) }
     var manualHost by rememberSaveable { mutableStateOf("") }
+    // Manual entry is the only pairing path on a device without Play Services,
+    // so it has to reach the same daemons the QR path can: that URI carries a
+    // real port, and hardcoding the default here left those devices unable to
+    // reach a daemon bound anywhere else. Prefilled, so the common case is
+    // still no typing.
+    var manualPort by rememberSaveable { mutableStateOf(DEFAULT_NAVETTE_PORT.toString()) }
     // `remember`, deliberately not `rememberSaveable`: saved instance state is a
     // Bundle the OS holds outside our encrypted store, survives process death,
     // and can reach disk. A typed token does not belong there. The cost is that
@@ -129,12 +154,24 @@ fun ConnectScreen(
             Text(if (manualEntryShown) "Hide manual entry" else "Enter manually")
         }
         if (manualEntryShown) {
+            // One predicate for both the Go action and the Pair button, so
+            // neither can accept input the other rejects.
+            val typedPairing = manualPairing(manualHost, manualPort, manualToken)
             OutlinedTextField(
                 value = manualHost,
                 onValueChange = { manualHost = it },
                 label = { Text("Host (e.g. tower or 100.x.x.x)") },
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Next),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = manualPort,
+                onValueChange = { manualPort = it },
+                label = { Text("Port") },
+                singleLine = true,
+                isError = manualPort.isNotBlank() && manualPort.trim().toIntOrNull()?.takeIf { it in 1..65535 } == null,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Next),
                 modifier = Modifier.fillMaxWidth(),
             )
             OutlinedTextField(
@@ -146,11 +183,7 @@ fun ConnectScreen(
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Go),
                 keyboardActions =
                     KeyboardActions(
-                        onGo = {
-                            if (manualHost.isNotBlank() && manualToken.isNotBlank()) {
-                                onPaired(Pairing(manualHost.trim(), DEFAULT_NAVETTE_PORT, manualToken.trim()))
-                            }
-                        },
+                        onGo = { typedPairing?.let(onPaired) },
                     ),
                 // A TextButton, not an IconButton: this project has no Material
                 // icons dependency, and its own text content ("Show"/"Hide") is
@@ -164,8 +197,8 @@ fun ConnectScreen(
                 modifier = Modifier.fillMaxWidth(),
             )
             Button(
-                onClick = { onPaired(Pairing(manualHost.trim(), DEFAULT_NAVETTE_PORT, manualToken.trim())) },
-                enabled = manualHost.isNotBlank() && manualToken.isNotBlank() && !connecting,
+                onClick = { typedPairing?.let(onPaired) },
+                enabled = typedPairing != null && !connecting,
             ) {
                 Text("Pair")
             }
