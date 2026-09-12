@@ -64,7 +64,11 @@ fn test_state(temp: &TempDir) -> ApiState<NoopRunner> {
         Duration::from_millis(5),
         Duration::from_millis(1),
     );
-    ApiState::new(Arc::new(apps), Arc::new(supervisor))
+    ApiState::new(
+        Arc::new(apps),
+        Arc::new(supervisor),
+        Arc::new(navette_auth::AuthToken::generate()),
+    )
 }
 
 fn add_running_session(state: &ApiState<NoopRunner>, name: &str) {
@@ -183,6 +187,7 @@ async fn dropping_the_client_stops_the_decode_thread() {
         .media
         .publish("work", stream_config_packet(1, 1))
         .unwrap();
+    let token = state.auth.render();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -199,6 +204,7 @@ async fn dropping_the_client_stops_the_decode_thread() {
     let url = media_url(&format!("ws://{address}"), "work");
     let client = MediaClient::connect(
         &url,
+        &token,
         Box::new(move |config: &DecoderConfig| {
             // Announce construction, so the test waits for the decoder to
             // exist instead of sleeping and hoping.
@@ -291,6 +297,7 @@ async fn input_is_delivered_while_the_decoder_is_blocked() {
         .media
         .publish("work", stream_config_packet(1, 1))
         .unwrap();
+    let token = state.auth.render();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -305,6 +312,7 @@ async fn input_is_delivered_while_the_decoder_is_blocked() {
     let url = media_url(&format!("ws://{address}"), "work");
     let client = MediaClient::connect(
         &url,
+        &token,
         Box::new(move |config: &DecoderConfig| {
             Ok(Box::new(BlockingDecoder {
                 config: config.clone(),
@@ -384,6 +392,7 @@ async fn client_decodes_on_a_multi_thread_runtime() {
         .publish("work", stream_config_packet(1, 1))
         .unwrap();
     state.media.publish("work", video_packet(1, 2)).unwrap();
+    let token = state.auth.render();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -394,6 +403,7 @@ async fn client_decodes_on_a_multi_thread_runtime() {
     let url = media_url(&format!("ws://{address}"), "work");
     let mut client = MediaClient::connect(
         &url,
+        &token,
         Box::new(|config: &DecoderConfig| {
             Ok(Box::new(FakeDecoder::new(config.clone())?) as Box<dyn Decoder>)
         }),
@@ -419,6 +429,7 @@ async fn client_decodes_the_bootstrap_replayed_on_attach() {
         .publish("work", stream_config_packet(1, 1))
         .unwrap();
     state.media.publish("work", video_packet(1, 2)).unwrap();
+    let token = state.auth.render();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -430,6 +441,7 @@ async fn client_decodes_the_bootstrap_replayed_on_attach() {
     let url = media_url(&format!("ws://{address}"), "work");
     let mut client = MediaClient::connect(
         &url,
+        &token,
         Box::new(|config: &DecoderConfig| {
             Ok(Box::new(FakeDecoder::new(config.clone())?) as Box<dyn Decoder>)
         }),
@@ -496,6 +508,7 @@ async fn window_input_reaches_the_bridge_over_the_same_connection() {
     let state = test_state(&temp);
     add_running_session(&state, "work");
     let mut commands = state.media.register_session("work");
+    let token = state.auth.render();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -506,6 +519,7 @@ async fn window_input_reaches_the_bridge_over_the_same_connection() {
     let url = media_url(&format!("ws://{address}"), "work");
     let client = MediaClient::connect(
         &url,
+        &token,
         Box::new(|config: &DecoderConfig| {
             Ok(Box::new(FakeDecoder::new(config.clone())?) as Box<dyn Decoder>)
         }),
@@ -586,6 +600,7 @@ async fn window_input_reaches_the_bridge_over_the_same_connection() {
 async fn connect_fails_when_the_session_is_not_running() {
     let temp = TempDir::new().unwrap();
     let state = test_state(&temp);
+    let token = state.auth.render();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -595,6 +610,7 @@ async fn connect_fails_when_the_session_is_not_running() {
     let url = media_url(&format!("ws://{address}"), "missing");
     let outcome = MediaClient::connect(
         &url,
+        &token,
         Box::new(|config: &DecoderConfig| {
             Ok(Box::new(FakeDecoder::new(config.clone())?) as Box<dyn Decoder>)
         }),

@@ -38,7 +38,10 @@ async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     let url = media_url(&cli.url, &cli.session);
-    let mut client = MediaClient::connect(&url, ffmpeg_decoder_factory(cli.ffmpeg))
+    // Task 6 supplies the real token (pairing/CLI resolution); an empty
+    // credential here always fails navetted's bearer check, so this build
+    // cannot reach a session until that wiring lands.
+    let mut client = MediaClient::connect(&url, "", ffmpeg_decoder_factory(cli.ffmpeg))
         .await
         .with_context(|| format!("failed to attach to {url}"))?;
     tracing::info!(session = %cli.session, %url, "attached to session media");

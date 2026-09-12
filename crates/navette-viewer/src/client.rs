@@ -74,7 +74,16 @@ pub struct MediaClient {
 impl MediaClient {
     /// Connects to `url` (`ws://host/v1/sessions/{session}/media`), negotiates
     /// the media subprotocol and asks the bridge for an immediate keyframe.
-    pub async fn connect(url: &str, factory: DecoderFactory) -> Result<Self, ClientError> {
+    ///
+    /// `token` is required, not optional: navetted now authenticates every
+    /// route, and a caller that could silently connect without a credential
+    /// would be the client-side counterpart of the loopback exemption the
+    /// server explicitly refuses to grant.
+    pub async fn connect(
+        url: &str,
+        token: &str,
+        factory: DecoderFactory,
+    ) -> Result<Self, ClientError> {
         let mut request = url
             .into_client_request()
             .map_err(|error| ClientError::Connect(Box::new(error)))?;
@@ -82,6 +91,12 @@ impl MediaClient {
             .parse()
             .map_err(|_| ClientError::Subprotocol)?;
         request.headers_mut().insert(SUBPROTOCOL_HEADER, protocol);
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {token}")
+                .parse()
+                .expect("a bearer token renders to a valid header value"),
+        );
         let (socket, response) = connect_async(request)
             .await
             .map_err(|error| ClientError::Connect(Box::new(error)))?;

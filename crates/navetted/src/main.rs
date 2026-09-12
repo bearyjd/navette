@@ -87,7 +87,13 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("failed to bind {}", arguments.bind))?;
     tracing::info!(address = %arguments.bind, apps = app_count, "navetted listening");
-    let state = ApiState::new(apps, supervisor);
+    // Task 4 supplies the real token: `AuthToken::load_or_create` against
+    // `default_token_path()` (or `--token-file`). A fresh ephemeral token
+    // here keeps every route authenticated in the meantime, at the cost of
+    // a new token -- and every paired client losing access -- on each
+    // restart.
+    let auth = Arc::new(navette_auth::AuthToken::generate());
+    let state = ApiState::new(apps, supervisor, auth);
     state.start_existing_bridges();
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())

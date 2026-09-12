@@ -32,6 +32,7 @@ pub struct ApiState<R: ProcessRunner> {
     pub supervisor: Arc<Supervisor<R>>,
     pub media: MediaHub,
     pub bridges: BridgeManager,
+    pub auth: Arc<navette_auth::AuthToken>,
 }
 
 impl<R: ProcessRunner> Clone for ApiState<R> {
@@ -41,18 +42,24 @@ impl<R: ProcessRunner> Clone for ApiState<R> {
             supervisor: Arc::clone(&self.supervisor),
             media: self.media.clone(),
             bridges: self.bridges.clone(),
+            auth: Arc::clone(&self.auth),
         }
     }
 }
 
 impl<R: ProcessRunner> ApiState<R> {
-    pub fn new(apps: Arc<AppIndex>, supervisor: Arc<Supervisor<R>>) -> Self {
+    pub fn new(
+        apps: Arc<AppIndex>,
+        supervisor: Arc<Supervisor<R>>,
+        auth: Arc<navette_auth::AuthToken>,
+    ) -> Self {
         let media = MediaHub::default();
         Self {
             apps,
             supervisor,
             bridges: BridgeManager::new(media.clone()),
             media,
+            auth,
         }
     }
 
@@ -74,10 +81,15 @@ impl<R: ProcessRunner> ApiState<R> {
 }
 
 pub fn router<R: ProcessRunner>(state: ApiState<R>) -> Router {
+    let auth = Arc::clone(&state.auth);
     Router::new()
         .route("/healthz", get(health))
         .route("/v1/ws", any(websocket::<R>))
         .route("/v1/sessions/{session}/media", any(media_websocket::<R>))
+        .layer(axum::middleware::from_fn_with_state(
+            auth,
+            crate::guard::authenticate,
+        ))
         .layer(axum::middleware::from_fn(
             crate::guard::reject_browser_origin,
         ))
@@ -86,15 +98,23 @@ pub fn router<R: ProcessRunner>(state: ApiState<R>) -> Router {
 
 #[cfg(test)]
 pub(crate) mod tests_support {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
+    use navette_auth::AuthToken;
 
     /// Leaks a TempDir so the returned router owns a live registry path for the
     /// duration of the test. Acceptable in tests; never do this in production
     /// code.
     pub(crate) fn test_router() -> Router {
+        test_router_with_token().0
+    }
+
+    pub(crate) fn test_router_with_token() -> (Router, Arc<AuthToken>) {
         let temp = Box::leak(Box::new(TempDir::new().unwrap()));
-        router(super::tests::test_state(temp))
+        let state = super::tests::test_state(temp);
+        let token = Arc::clone(&state.auth);
+        (router(state), token)
     }
 }
 
@@ -532,7 +552,11 @@ mod tests {
             Duration::from_millis(5),
             Duration::from_millis(1),
         );
-        ApiState::new(Arc::new(apps), Arc::new(supervisor))
+        ApiState::new(
+            Arc::new(apps),
+            Arc::new(supervisor),
+            Arc::new(navette_auth::AuthToken::generate()),
+        )
     }
 
     fn add_running_session(state: &ApiState<NoopRunner>, name: &str) {
@@ -601,12 +625,12 @@ mod tests {
     #[tokio::test]
     async fn websocket_lists_apps_and_echoes_request_id() {
         let temp = TempDir::new().unwrap();
+        let state = test_state(&temp);
+        let token = state.auth.render();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            axum::serve(listener, router(test_state(&temp)))
-                .await
-                .unwrap();
+            axum::serve(listener, router(state)).await.unwrap();
         });
 
         let mut request = format!("ws://{address}/v1/ws")
@@ -616,6 +640,9 @@ mod tests {
             "Sec-WebSocket-Protocol",
             WEBSOCKET_SUBPROTOCOL.parse().unwrap(),
         );
+        request
+            .headers_mut()
+            .insert("Authorization", format!("Bearer {token}").parse().unwrap());
         let (mut socket, response) = connect_async(request).await.unwrap();
         assert_eq!(
             response.headers()["Sec-WebSocket-Protocol"],
@@ -647,17 +674,24 @@ mod tests {
     #[tokio::test]
     async fn websocket_requires_v1_subprotocol() {
         let temp = TempDir::new().unwrap();
+        let state = test_state(&temp);
+        let token = state.auth.render();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            axum::serve(listener, router(test_state(&temp)))
-                .await
-                .unwrap();
+            axum::serve(listener, router(state)).await.unwrap();
         });
 
-        let error = connect_async(format!("ws://{address}/v1/ws"))
-            .await
-            .unwrap_err();
+        // A valid Authorization header but no subprotocol: a 400 here (not a
+        // 401) is what proves this rejection is about the missing
+        // subprotocol, not the credential.
+        let mut request = format!("ws://{address}/v1/ws")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        let error = connect_async(request).await.unwrap_err();
         assert!(error.to_string().contains("400"));
         server.abort();
     }
@@ -677,6 +711,7 @@ mod tests {
             .publish("work", media_packet(MediaKind::Video, 2, true))
             .unwrap();
 
+        let token = state.auth.render();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -689,6 +724,9 @@ mod tests {
             "Sec-WebSocket-Protocol",
             MEDIA_WEBSOCKET_SUBPROTOCOL.parse().unwrap(),
         );
+        request
+            .headers_mut()
+            .insert("Authorization", format!("Bearer {token}").parse().unwrap());
         let (mut socket, response) = connect_async(request).await.unwrap();
         assert_eq!(
             response.headers()["Sec-WebSocket-Protocol"],
@@ -739,6 +777,7 @@ mod tests {
         add_running_session(&state, "work");
         let mut input = state.media.register_session("work");
 
+        let token = state.auth.render();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -751,6 +790,9 @@ mod tests {
             "Sec-WebSocket-Protocol",
             MEDIA_WEBSOCKET_SUBPROTOCOL.parse().unwrap(),
         );
+        request
+            .headers_mut()
+            .insert("Authorization", format!("Bearer {token}").parse().unwrap());
         let (mut socket, _response) = connect_async(request).await.unwrap();
 
         socket
@@ -793,6 +835,7 @@ mod tests {
         add_running_session(&state, "work");
         let hub = state.media.clone();
         let _input = state.media.register_session("work");
+        let token = state.auth.render();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -806,6 +849,9 @@ mod tests {
             "Sec-WebSocket-Protocol",
             MEDIA_WEBSOCKET_SUBPROTOCOL.parse().unwrap(),
         );
+        request
+            .headers_mut()
+            .insert("Authorization", format!("Bearer {token}").parse().unwrap());
         let (mut socket, _response) = connect_async(request).await.unwrap();
 
         hub.publish_message(
@@ -831,12 +877,12 @@ mod tests {
     #[tokio::test]
     async fn our_own_websocket_client_sends_no_origin_header() {
         let temp = TempDir::new().unwrap();
+        let state = test_state(&temp);
+        let token = state.auth.render();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, router(test_state(&temp)))
-                .await
-                .unwrap();
+            axum::serve(listener, router(state)).await.unwrap();
         });
         let mut request = format!("ws://{address}/v1/ws")
             .into_client_request()
@@ -845,6 +891,9 @@ mod tests {
             "Sec-WebSocket-Protocol",
             WEBSOCKET_SUBPROTOCOL.parse().unwrap(),
         );
+        request
+            .headers_mut()
+            .insert("Authorization", format!("Bearer {token}").parse().unwrap());
         assert!(
             !request.headers().contains_key("Origin"),
             "our client must not send Origin, or the guard would lock us out"
