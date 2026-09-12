@@ -37,6 +37,14 @@ pub enum AuthError {
         "token file {path} exists but is not a valid token; refusing to overwrite it — inspect it, or run `navette token --rotate` to replace it deliberately"
     )]
     CorruptFile { path: PathBuf },
+    #[error(
+        "no token file at {path}; run `navette token` on the daemon host to create or display it, or pass --token / NAVETTE_TOKEN"
+    )]
+    Missing { path: PathBuf },
+    #[error(
+        "token file {path} is mode {mode:04o}; a secret readable by group or others is not trusted — run `chmod 600 {path}`"
+    )]
+    InsecureMode { path: PathBuf, mode: u32 },
     #[error("cannot determine a token path: set XDG_STATE_HOME or HOME, or pass --token-file")]
     NoPath,
 }
@@ -125,20 +133,84 @@ impl AuthToken {
         self.0.ct_eq(&other.0).into()
     }
 
-    pub fn load_or_create(path: &Path) -> Result<Self, AuthError> {
-        match fs::read_to_string(path) {
-            Ok(contents) => Self::parse(contents.trim()).map_err(|_| AuthError::CorruptFile {
+    /// Reads an existing token file, or `Ok(None)` when there is none.
+    ///
+    /// The single read path, so the permission check below cannot be bypassed
+    /// by whichever caller happens to be used. `write_private` creates the file
+    /// at `0600`, but nothing stops a later `chmod` or a restore from a backup
+    /// that flattened modes — and a token any local account can read is not a
+    /// credential, so refuse it rather than authenticate with it.
+    ///
+    /// The mode is taken from the open handle rather than from a separate
+    /// `metadata` call on the path, so the bytes checked and the bytes read are
+    /// the same file.
+    fn read_existing(path: &Path) -> Result<Option<Self>, AuthError> {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(AuthError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        let mode = file
+            .metadata()
+            .map_err(|source| AuthError::Read {
                 path: path.to_path_buf(),
-            }),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                source,
+            })?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(AuthError::InsecureMode {
+                path: path.to_path_buf(),
+                mode,
+            });
+        }
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .map_err(|source| AuthError::Read {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        Self::parse(contents.trim())
+            .map(Some)
+            .map_err(|_| AuthError::CorruptFile {
+                path: path.to_path_buf(),
+            })
+    }
+
+    /// Reads the token file without ever creating one.
+    ///
+    /// This is what a *client* must use. [`load_or_create`](Self::load_or_create)
+    /// minting a token on a client is how an operator loses their pairings: the
+    /// daemon runs holding T1, the file is deleted, `navette ls` writes T2 and
+    /// gets a 401, and restarting the daemon to "fix" it makes it adopt T2 —
+    /// invalidating every paired device. A missing file is a startup error here.
+    pub fn load(path: &Path) -> Result<Self, AuthError> {
+        Self::read_existing(path)?.ok_or_else(|| AuthError::Missing {
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Reads the token file, creating one at `0600` if there is none.
+    ///
+    /// Only the daemon and `navette token` may do this — see [`load`](Self::load)
+    /// for why a client must not.
+    pub fn load_or_create(path: &Path) -> Result<Self, AuthError> {
+        match Self::read_existing(path)? {
+            Some(token) => Ok(token),
+            None => {
                 let token = Self::generate();
                 token.write_private(path)?;
                 Ok(token)
             }
-            Err(source) => Err(AuthError::Read {
-                path: path.to_path_buf(),
-                source,
-            }),
         }
     }
 
@@ -245,6 +317,11 @@ impl From<String> for SecretString {
 /// host's token and sending it to some other machine would hand our
 /// credential to whatever is listening there, which may not be our daemon at
 /// all.
+///
+/// Reads with [`AuthToken::load`], never `load_or_create`: a client that mints
+/// a token when the file is absent creates a credential the daemon has never
+/// heard of, and the resulting 401 looks like a rotation bug rather than a
+/// missing file.
 pub fn resolve_token(
     url: &str,
     explicit: Option<&str>,
@@ -274,7 +351,7 @@ pub fn resolve_token(
         Some(path) => path.to_path_buf(),
         None => default_token_path().context("cannot determine a token path")?,
     };
-    Ok(AuthToken::load_or_create(&path)?.render())
+    Ok(AuthToken::load(&path)?.render())
 }
 
 #[cfg(test)]
@@ -427,6 +504,83 @@ mod tests {
         let token = AuthToken::load_or_create(&path).unwrap();
         let resolved = resolve_token("ws://127.0.0.1:9417/v1/ws", None, Some(&path)).unwrap();
         assert_eq!(resolved, token.render());
+    }
+
+    #[test]
+    fn a_client_with_no_token_file_errors_instead_of_minting_one() {
+        // The failure this guards: navetted runs holding T1, the token file is
+        // deleted, and a client that calls `load_or_create` writes T2, sends it,
+        // and gets a 401. Restarting the daemon to "fix" that makes it adopt T2
+        // and invalidates the phone. The client must refuse instead.
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("token");
+        let error = resolve_token("ws://127.0.0.1:9417/v1/ws", None, Some(&path)).unwrap_err();
+        assert!(
+            error.to_string().contains("navette token"),
+            "the error must name the command that creates one: {error}"
+        );
+        assert!(
+            !path.exists(),
+            "resolving a client token must never create the file"
+        );
+    }
+
+    #[test]
+    fn load_refuses_a_missing_file_where_load_or_create_would_write_one() {
+        // The two entry points must differ in exactly this way; a `load` that
+        // quietly delegated to `load_or_create` would pass the resolve_token
+        // test above only until someone "simplified" it.
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("token");
+        assert!(AuthToken::load(&path).is_err());
+        assert!(!path.exists());
+        AuthToken::load_or_create(&path).unwrap();
+        assert!(AuthToken::load(&path).is_ok());
+    }
+
+    #[test]
+    fn refuses_a_token_file_readable_by_group_or_others() {
+        // `write_private` creates at 0600, but nothing stops a later chmod or a
+        // restore from a backup that flattened modes. A secret every local
+        // account can read is not a credential.
+        use std::os::unix::fs::PermissionsExt;
+        for mode in [0o640, 0o604, 0o644] {
+            let temp = tempfile::TempDir::new().unwrap();
+            let path = temp.path().join("token");
+            AuthToken::load_or_create(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let error = AuthToken::load(&path).unwrap_err();
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains(&path.display().to_string()),
+                "the error must name the file: {rendered}"
+            );
+            assert!(
+                rendered.contains(&format!("{mode:04o}")),
+                "the error must name the mode: {rendered}"
+            );
+            // The same refusal on the daemon's path, not just the client's.
+            assert!(AuthToken::load_or_create(&path).is_err());
+            // And it must not have been "fixed" by regenerating over the top.
+            assert!(AuthToken::load(&path).is_err());
+        }
+    }
+
+    #[test]
+    fn accepts_a_token_file_the_owner_alone_can_read() {
+        // The companion to the refusal above: a fix that rejected every mode
+        // would pass that test and break every working install.
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("token");
+        let token = AuthToken::load_or_create(&path).unwrap();
+        for mode in [0o600, 0o400] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(
+                AuthToken::load(&path).unwrap().matches(&token.render()),
+                "mode {mode:04o} is owner-only and must be accepted"
+            );
+        }
     }
 
     #[test]
