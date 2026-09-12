@@ -66,6 +66,21 @@ enum Command {
         /// Session name to kill.
         session: String,
     },
+    /// Show the API token, optionally as a QR code for phone pairing.
+    ///
+    /// Local admin command: it reads the daemon's token file directly, so it
+    /// only works on the host running navetted.
+    Token {
+        /// Render a QR code carrying host, port and token.
+        #[arg(long)]
+        qr: bool,
+        /// Generate a new token, invalidating every paired client.
+        #[arg(long)]
+        rotate: bool,
+        /// The name or address the phone should dial.
+        #[arg(long)]
+        advertise_host: Option<String>,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -93,7 +108,65 @@ async fn main() -> Result<()> {
         Command::Kill { session } => {
             print_result(client.call(RequestCommand::Kill { session }).await?)
         }
+        Command::Token {
+            qr,
+            rotate,
+            advertise_host,
+        } => show_token(&cli.url, qr, rotate, advertise_host.as_deref()),
     }
+}
+
+fn show_token(url: &str, qr: bool, rotate: bool, advertise_host: Option<&str>) -> Result<()> {
+    let path = navette_auth::default_token_path().context("cannot determine a token path")?;
+    let token = if rotate {
+        let token = navette_auth::AuthToken::rotate(&path)?;
+        eprintln!("Token rotated. Every paired client must pair again.");
+        eprintln!("Restart navetted for this to take effect: it holds the value in memory.");
+        token
+    } else {
+        navette_auth::AuthToken::load_or_create(&path)?
+    };
+
+    if qr {
+        let parsed = url::Url::parse(url)?;
+        let port = parsed.port().unwrap_or(9417);
+        let host = resolve_advertise_host(url, advertise_host)?;
+        let uri = pairing_uri(&host, port, &token.render());
+        let code = qrcode::QrCode::new(uri.as_bytes())?;
+        println!(
+            "{}",
+            code.render::<qrcode::render::unicode::Dense1x2>().build()
+        );
+    }
+    println!("{}", token.render_grouped());
+    Ok(())
+}
+
+fn pairing_uri(host: &str, port: u16, token: &str) -> String {
+    format!("navette://pair?host={host}&port={port}&token={token}")
+}
+
+/// The daemon cannot derive its own reachable name: the phone connects over the
+/// tailnet, where that is a MagicDNS name or tailnet IP, not `uname -n`, and
+/// there is no Tailscale integration to ask. So use the URL host when it is
+/// already a specific non-loopback address, and otherwise refuse.
+fn resolve_advertise_host(url: &str, advertise: Option<&str>) -> Result<String> {
+    if let Some(host) = advertise {
+        return Ok(host.to_owned());
+    }
+    let parsed = url::Url::parse(url).context("could not parse --url")?;
+    let host = parsed.host_str().context("--url has no host")?;
+    let is_loopback = host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|address| address.is_loopback())
+            .unwrap_or(false);
+    if is_loopback {
+        bail!(
+            "--url points at {host}, which the phone cannot reach; pass --advertise-host with the name or address the phone should dial"
+        );
+    }
+    Ok(host.to_owned())
 }
 
 fn print_result(result: ResponseResult) -> Result<()> {
@@ -391,5 +464,65 @@ mod tests {
     fn rejects_session_path_traversal_for_tracking() {
         assert!(validate_session_component("../../record").is_err());
         assert!(validate_session_component("work_browser-2").is_ok());
+    }
+
+    #[test]
+    fn parses_token_with_flags() {
+        let cli = Cli::try_parse_from([
+            "navette",
+            "token",
+            "--qr",
+            "--rotate",
+            "--advertise-host",
+            "tower.ts.net",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Token { qr, rotate, advertise_host }
+                if qr && rotate && advertise_host.as_deref() == Some("tower.ts.net")
+        ));
+    }
+
+    #[test]
+    fn builds_a_pairing_uri() {
+        assert_eq!(
+            pairing_uri("tower.example.ts.net", 9417, "ABCD1234ABCD1234ABCD1234"),
+            "navette://pair?host=tower.example.ts.net&port=9417&token=ABCD1234ABCD1234ABCD1234"
+        );
+    }
+
+    #[test]
+    fn uses_a_specific_non_loopback_url_host_when_no_flag_is_given() {
+        // Reachable by construction: the client is already talking to it.
+        let host = resolve_advertise_host("ws://100.64.0.3:9417/v1/ws", None).unwrap();
+        assert_eq!(host, "100.64.0.3");
+    }
+
+    #[test]
+    fn requires_the_flag_when_the_url_host_is_loopback() {
+        // A QR saying 127.0.0.1 scans cleanly and then fails to connect, which
+        // presents as an auth bug. Refuse rather than guess.
+        let error = resolve_advertise_host("ws://127.0.0.1:9417/v1/ws", None).unwrap_err();
+        assert!(error.to_string().contains("--advertise-host"));
+    }
+
+    #[test]
+    fn the_flag_always_wins() {
+        let host =
+            resolve_advertise_host("ws://127.0.0.1:9417/v1/ws", Some("tower.ts.net")).unwrap();
+        assert_eq!(host, "tower.ts.net");
+    }
+
+    #[test]
+    fn qr_encoder_accepts_a_realistic_pairing_uri() {
+        // This is what catches a payload the encoder rejects outright, distinct
+        // from the string-building checked by `builds_a_pairing_uri`.
+        let uri = pairing_uri(
+            "tower.example.ts.net",
+            9417,
+            "000G40R40M30E209185GR38E-ABCD",
+        );
+        assert!(qrcode::QrCode::new(uri.as_bytes()).is_ok());
     }
 }
