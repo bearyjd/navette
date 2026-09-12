@@ -214,9 +214,18 @@ fn show_token(
 /// — `--advertise-host tower.ts.net` against a daemon on a non-default port
 /// yields a QR saying 9417 — so it is pinned here rather than left implicit in
 /// `show_token`. The table in docs/RUNBOOK.md documents exactly this function.
+///
+/// The port is `port_or_known_default()`, not `port().unwrap_or(9417)`. The QR
+/// must describe the endpoint `--url` describes, and `ws://tower/v1/ws` means
+/// port 80 to every WebSocket client alive — substituting 9417 there would have
+/// the QR quietly advertise somewhere `--url` does not point. A user who typed
+/// that has a broken URL, and it should fail where they can see it rather than
+/// be rewritten into a QR that scans and then cannot connect.
 fn advertised_endpoint(url: &str, advertise_host: Option<&str>) -> Result<(String, u16)> {
     let parsed = url::Url::parse(url).context("could not parse --url")?;
-    let port = parsed.port().unwrap_or(9417);
+    let port = parsed
+        .port_or_known_default()
+        .context("--url has no port and its scheme has no default; give it an explicit port")?;
     let host = resolve_advertise_host(url, advertise_host)?;
     Ok((host, port))
 }
@@ -235,14 +244,27 @@ fn resolve_advertise_host(url: &str, advertise: Option<&str>) -> Result<String> 
         None => {
             let parsed = url::Url::parse(url).context("could not parse --url")?;
             let host = parsed.host_str().context("--url has no host")?;
-            let is_loopback = host == "localhost"
-                || host
-                    .parse::<std::net::IpAddr>()
-                    .map(|address| address.is_loopback())
-                    .unwrap_or(false);
-            if is_loopback {
+            // Match on `url::Host`, not on `host_str()` — the same fix
+            // `resolve_token` carries in navette-auth, for the same reason: for
+            // an IPv6 URL `host_str()` returns the *bracketed* form `[::1]`,
+            // which `IpAddr::parse` rejects, so a string-parsing check quietly
+            // classifies `ws://[::1]:9417/...` as a reachable address and emits
+            // a QR pointing the phone at its own loopback.
+            //
+            // Unspecified addresses are refused alongside loopback: `0.0.0.0`
+            // and `::` name what the daemon binds, not somewhere a phone can
+            // dial. They are the more likely mistake of the two, since that is
+            // exactly what an operator exposing the daemon to a tailnet puts in
+            // `--bind`.
+            let is_undialable = match parsed.host() {
+                Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+                Some(url::Host::Ipv4(address)) => address.is_loopback() || address.is_unspecified(),
+                Some(url::Host::Ipv6(address)) => address.is_loopback() || address.is_unspecified(),
+                None => false,
+            };
+            if is_undialable {
                 bail!(
-                    "--url points at {host}, which the phone cannot reach; pass --advertise-host with the name or address the phone should dial"
+                    "--url points at {host}, which the phone cannot dial — loopback and unspecified addresses describe this host's own binding, not a reachable destination; pass --advertise-host with the name or address the phone should dial"
                 );
             }
             host.to_owned()
@@ -599,6 +621,93 @@ mod tests {
     }
 
     #[test]
+    fn requires_the_flag_for_the_ipv6_loopback_address() {
+        // The sibling of the `resolve_token` bug in navette-auth: `host_str()`
+        // on an IPv6 URL returns the bracketed `[::1]`, which `IpAddr::parse`
+        // rejects -- so the old string-parsing check called this reachable and
+        // emitted a QR pointing the phone at its own loopback. This test fails
+        // against that version.
+        let error = resolve_advertise_host("ws://[::1]:9417/v1/ws", None).unwrap_err();
+        assert!(error.to_string().contains("--advertise-host"), "{error}");
+    }
+
+    #[test]
+    fn requires_the_flag_for_unspecified_addresses() {
+        // `0.0.0.0` and `::` name what the daemon binds, not somewhere a phone
+        // can dial -- and they are what an operator exposing the daemon to a
+        // tailnet actually puts in --bind, so this is the likelier mistake.
+        for url in [
+            "ws://0.0.0.0:9417/v1/ws",
+            "ws://[::]:9417/v1/ws",
+            "ws://[::0]:9417/v1/ws",
+        ] {
+            let error = resolve_advertise_host(url, None).unwrap_err();
+            assert!(
+                error.to_string().contains("--advertise-host"),
+                "{url} must be refused: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn still_accepts_specific_routable_addresses() {
+        // The companion to the two refusals above: a fix that rejected every
+        // address would pass both and break the only path that works. A global
+        // IPv6 address in particular must survive the new `url::Host` match.
+        for (url, expected) in [
+            ("ws://100.64.0.3:9417/v1/ws", "100.64.0.3"),
+            ("ws://[fd7a::1]:9417/v1/ws", "[fd7a::1]"),
+            ("ws://[2606:4700::1111]:9417/v1/ws", "[2606:4700::1111]"),
+            ("ws://tower.ts.net:9417/v1/ws", "tower.ts.net"),
+        ] {
+            assert_eq!(
+                resolve_advertise_host(url, None).unwrap(),
+                expected,
+                "expected {url} to be dialable"
+            );
+        }
+    }
+
+    #[test]
+    fn the_flag_still_wins_over_an_undialable_url() {
+        // Refusing the --url host must not refuse the whole command: naming the
+        // host explicitly is exactly the documented remedy, including for the
+        // 0.0.0.0 bind that provokes it.
+        assert_eq!(
+            resolve_advertise_host("ws://0.0.0.0:9417/v1/ws", Some("tower.ts.net")).unwrap(),
+            "tower.ts.net"
+        );
+        assert_eq!(
+            resolve_advertise_host("ws://[::1]:9417/v1/ws", Some("tower.ts.net")).unwrap(),
+            "tower.ts.net"
+        );
+    }
+
+    #[test]
+    fn the_advertised_port_is_the_one_the_url_actually_means() {
+        // `ws://tower/v1/ws` dials port 80 in every WebSocket client, so that
+        // is what the QR must say. `port().unwrap_or(9417)` claimed 9417 --
+        // a QR advertising somewhere --url does not point.
+        //
+        // The 80 case looks wrong at a glance, and that is the point: a user
+        // who typed a portless --url has a broken URL, and it should fail
+        // visibly rather than be silently rewritten into a scannable QR that
+        // then cannot connect.
+        assert_eq!(
+            advertised_endpoint("ws://tower.ts.net:9417/v1/ws", None).unwrap(),
+            ("tower.ts.net".to_owned(), 9417)
+        );
+        assert_eq!(
+            advertised_endpoint("ws://tower.ts.net/v1/ws", None).unwrap(),
+            ("tower.ts.net".to_owned(), 80)
+        );
+        assert_eq!(
+            advertised_endpoint("wss://tower.ts.net/v1/ws", None).unwrap(),
+            ("tower.ts.net".to_owned(), 443)
+        );
+    }
+
+    #[test]
     fn requires_the_flag_when_the_url_host_is_loopback() {
         // A QR saying 127.0.0.1 scans cleanly and then fails to connect, which
         // presents as an auth bug. Refuse rather than guess.
@@ -691,11 +800,14 @@ mod tests {
             ("tower.ts.net".to_owned(), 19417)
         );
 
-        // A --url with no explicit port falls back to 9417, so the documented
-        // default holds even when the URL omits it.
+        // A portless --url means the scheme's default port, not 9417. This row
+        // asserted 9417 when it was first written, which encoded the bug in
+        // `port().unwrap_or(9417)`: `ws://tower.ts.net/v1/ws` dials 80 in every
+        // WebSocket client, so a QR saying 9417 described an endpoint --url did
+        // not point at. See `the_advertised_port_is_the_one_the_url_actually_means`.
         assert_eq!(
             advertised_endpoint("ws://tower.ts.net/v1/ws", None).unwrap(),
-            ("tower.ts.net".to_owned(), 9417)
+            ("tower.ts.net".to_owned(), 80)
         );
     }
 

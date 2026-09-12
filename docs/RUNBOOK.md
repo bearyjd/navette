@@ -110,17 +110,22 @@ navette token --rotate --qr --advertise-host <host> # rotate and re-pair in one 
 
   | `--url` host | `--advertise-host` | QR host |
   |---|---|---|
-  | loopback (the default) | absent | **error**, naming the flag |
-  | loopback (the default) | given | the flag's value |
-  | a specific non-loopback address | absent | the `--url` host |
-  | a specific non-loopback address | given | the flag's value |
+  | loopback (the default), or `localhost` | absent | **error**, naming the flag |
+  | unspecified — `0.0.0.0`, `::` | absent | **error**, naming the flag |
+  | loopback or unspecified | given | the flag's value |
+  | a specific routable address | absent | the `--url` host |
+  | a specific routable address | given | the flag's value |
 
-  The error is deliberate: a QR saying `127.0.0.1` scans cleanly and then fails
-  to connect, which presents as an auth bug.
+  The errors are deliberate: a QR saying `127.0.0.1` scans cleanly and then
+  fails to connect, which presents as an auth bug. `0.0.0.0` and `::` are the
+  likelier mistake — they are what you put in `--bind` to expose the daemon —
+  and they name what the daemon *binds*, not anywhere a phone can dial.
 
   **`--advertise-host` does not carry a port.** The port in the QR always comes
-  from `--url` (9417 when `--url` is left at its default), so a daemon on a
-  non-default port needs `--url` set, with or without the flag:
+  from `--url`, so a daemon on a non-default port needs `--url` set, with or
+  without the flag. `--url` at its default gives 9417; a `--url` with **no**
+  port gives the scheme's default (`ws://` → 80, `wss://` → 443), not 9417,
+  because that is the endpoint such a URL actually names:
 
   ```bash
   # navetted --bind 0.0.0.0:19417 --allow-remote, phone dials tower.ts.net
