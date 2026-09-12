@@ -195,11 +195,21 @@ buffer — there is no shrink path — and `ShardingDecompressor::new`
 lives for the whole connection. Both call sites share that single buffer.
 
 The consequence is high-water-mark retention: one large message keeps the buffer
-inflated for the connection's lifetime. With the ceilings in place, worst-case
-retention becomes **the larger ceiling, 128 MB per connection**, instead of 4 GB.
-That is acceptable, and the growth-without-shrink behaviour is a deliberate
-reuse optimization for steady-size framebuffers rather than a bug. **No shrink path
-is added** — bounding the high-water mark is what the ceilings already accomplish.
+inflated for the connection's lifetime. **No shrink path is added** — bounding the
+high-water mark is what the ceilings accomplish, and the growth-without-shrink
+behaviour is a deliberate reuse optimization for steady-size framebuffers rather
+than a bug.
+
+**Correction, found in review:** an earlier draft of this section claimed worst-case
+retention becomes "the larger ceiling, 128 MB per connection". That is wrong, and
+wrong in the optimistic direction. `decompress_to_owned` uses `mem::replace`, which
+briefly holds both the new buffer and the old one, and returns a `Vec` that is
+`truncate`d rather than shrunk, so it keeps capacity equal to the declared length.
+Worst-case retention after one maximum RawBuffer message is therefore closer to
+**256 MB per connection**, not 128 MB. Still bounded, still four orders of magnitude
+better than 4 GB, but the figure to plan against is the larger one. Reducing it
+would mean changing the allocation strategy in code this design does not otherwise
+touch; it is recorded in `docs/HANDOFF.md` rather than fixed here.
 
 ## 7. Failure modes
 
