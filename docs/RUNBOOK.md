@@ -198,22 +198,32 @@ curl -fsS -H "Authorization: Bearer $(navette token)" http://127.0.0.1:9417/heal
 dashes before comparing, so it can be passed through as-is.
 
 **Run this as the user `navetted` runs as.** `navette token` resolves the token
-from `$XDG_STATE_HOME`/`$HOME`, so a liveness check running under a monitoring
-service account reads *that* account's state directory, creates a fresh token
-there, and 401s — reporting a healthy daemon as dead, which is the whole
-failure this check exists to avoid. Under a different account, name the file
-explicitly instead:
+from `$XDG_STATE_HOME`/`$HOME`, and — unlike `navette ls` — it *creates* the
+file when it finds none, because it is the local admin command that legitimately
+mints one. So a liveness check running under a monitoring service account reads
+*that* account's state directory, mints a stray token there, prints it, and
+401s: a healthy daemon reported as dead, which is the whole failure this check
+exists to avoid.
+
+The token file is `0600` and owned by the daemon user, so there is no form of
+this check that an unprivileged monitoring account can run on its own. It needs
+root or the daemon user either way:
 
 ```bash
-curl -fsS -H "Authorization: Bearer $(sudo -u navette navette token)" \
+# -i, not -u: a login shell resets HOME. With plain `sudo -u`, HOME survives
+# whenever sudoers sets always_set_home off or env_keep includes HOME, and
+# `navette token` then mints a stray token under the *invoking* user.
+curl -fsS -H "Authorization: Bearer $(sudo -iu navette navette token)" \
   http://127.0.0.1:9417/healthz
-# or, reading the daemon's token file directly:
-curl -fsS -H "Authorization: Bearer $(cat /var/lib/navette/.local/state/navette/token)" \
+
+# Or read the file directly, which mints nothing at all — the safer option for
+# a monitoring hook, and the one to prefer if the check runs unattended.
+curl -fsS -H "Authorization: Bearer $(sudo cat ~navette/.local/state/navette/token)" \
   http://127.0.0.1:9417/healthz
 ```
 
 If `navetted` was started with `--token-file`, pass the same path to the
-client: `navette token --token-file <path>`.
+client: `navette token --token-file <path>`, or read that path directly.
 
 There is no metrics endpoint, no Prometheus scrape, and no alerting
 integration. Observability is `RUST_LOG` output plus the client-side HUD.
