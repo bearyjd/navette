@@ -55,18 +55,11 @@ fun NavetteApp(
                 onAttachSession = { session -> viewModel.onEvent(AppEvent.AttachSession(session)) },
                 onSnackbarDismissed = { shown -> viewModel.onEvent(AppEvent.DismissSnackbar(shown)) },
             )
-        // Kept apart from the `else` below rather than folded into it: the
-        // daemon refused our token, which reads the same as any other
-        // connection failure on ConnectScreen today (it has no Unauthorized
-        // case of its own yet), but this arm exists so that gap has to be
-        // noticed and addressed explicitly the next time this state's
-        // handling changes, instead of silently falling through an `else`.
-        state.connection is ConnectionState.Unauthorized ->
-            ConnectScreen(
-                connection = state.connection,
-                onPaired = { pairing -> viewModel.onEvent(AppEvent.Paired(pairing)) },
-                onRetry = { viewModel.onEvent(AppEvent.Reconnect) },
-            )
+        // Unauthorized is not broken out here: ConnectScreen already handles it
+        // itself, with a "pairing rejected" message and no Retry button, since
+        // resending a token the daemon refused would just fail the same way.
+        // A separate arm rendering the identical call was only a reminder that
+        // it did not -- and now reads as a claim that it still doesn't.
         else ->
             ConnectScreen(
                 connection = state.connection,
