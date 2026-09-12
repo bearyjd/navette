@@ -246,6 +246,16 @@ not a silent unauthenticated attempt.
 - **TLS / `wss`.** The tailnet supplies WireGuard encryption in transit.
   `--allow-remote` onto a non-tailnet network stays plaintext and earns a loud
   startup warning rather than silent exposure.
+- **Ephemeral pairing codes.** Both `navette token` and `navette token --qr` display
+  the long-lived token itself, so it persists in terminal scrollback, screenshots,
+  and screen shares. This is a deliberate, recorded acceptance rather than an
+  oversight: displaying a credential on the operator's own machine is what
+  `ssh-keygen`, `gh auth token`, and every API dashboard already do, and `--rotate`
+  is the remedy when one leaks. An ephemeral code would also have to change what
+  plain `navette token` prints to be worth anything, since the scrollback exposure
+  is identical for both — closing only the QR half would be theater. Revisit if
+  navette ever grows multiple operators, where a shared screen stops being the
+  owner's own.
 - **Per-client tokens and revocation.** One daemon-wide rotatable token is
   proportionate to a single-user tool with three clients; per-client tokens need a
   management surface nothing is asking for.
