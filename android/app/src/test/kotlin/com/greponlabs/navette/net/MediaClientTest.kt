@@ -139,6 +139,24 @@ class MediaClientTest {
         awaitClientConnected()
     }
 
+    /**
+     * Task 7 added the `token` constructor parameter and the `Authorization`
+     * header; this pins that the handshake actually carries it, and that
+     * OkHttp does not also add an `Origin` header of its own -- the daemon's
+     * guard (Task 2) refuses any request carrying one, so a client that added
+     * one would be indistinguishable from a hostile browser tab.
+     */
+    @Test
+    fun `sends the bearer token on the handshake`() {
+        client.connect()
+        serverListener.awaitOpen()
+
+        val request = server.takeRequest(5, TimeUnit.SECONDS)
+        assertEquals("Bearer test-token", request?.getHeader("Authorization"))
+        assertNull("OkHttp must not add an Origin header of its own", request?.getHeader("Origin"))
+        awaitClientConnected()
+    }
+
     @Test
     fun `a keyframe request is the first frame sent after connecting`() {
         client.connect()

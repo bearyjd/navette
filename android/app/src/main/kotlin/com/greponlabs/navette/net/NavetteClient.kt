@@ -207,8 +207,17 @@ class NavetteClient(private val webSocketUrl: String, private val token: String)
 internal fun formatAuthorityHost(host: String): String =
     if (host.count { it == ':' } >= 2 && !host.startsWith("[")) "[$host]" else host
 
+/**
+ * The port `navetted` listens on by default. Shared by [controlWebSocketUrl]
+ * and [mediaWebSocketUrl] as their default, and by manual pairing entry
+ * (`ConnectScreen`) when the user has no reason to type anything but the
+ * host -- there is one definition of "default" rather than two literals that
+ * can drift apart.
+ */
+const val DEFAULT_NAVETTE_PORT = 9417
+
 /** Builds the control-channel WebSocket URL for [host]:[port]. */
-fun controlWebSocketUrl(host: String, port: Int = 9417): String =
+fun controlWebSocketUrl(host: String, port: Int = DEFAULT_NAVETTE_PORT): String =
     "ws://${formatAuthorityHost(host)}:$port$CONTROL_WEBSOCKET_PATH"
 
 /**
@@ -219,5 +228,5 @@ fun controlWebSocketUrl(host: String, port: Int = 9417): String =
  * (`validate_session_name`, `crates/navetted/src/registry.rs:267-281`), so
  * the only names that can reach here are already URL-path-safe.
  */
-fun mediaWebSocketUrl(host: String, session: String, port: Int = 9417): String =
+fun mediaWebSocketUrl(host: String, session: String, port: Int = DEFAULT_NAVETTE_PORT): String =
     "ws://${formatAuthorityHost(host)}:$port/v1/sessions/$session/media"

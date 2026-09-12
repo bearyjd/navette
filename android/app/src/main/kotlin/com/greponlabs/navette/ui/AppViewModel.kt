@@ -1,11 +1,18 @@
 package com.greponlabs.navette.ui
 
+import android.content.Context
 import android.util.Log
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import com.greponlabs.navette.net.ConnectionState
+import com.greponlabs.navette.net.EncryptedPairingStore
 import com.greponlabs.navette.net.NavetteApi
 import com.greponlabs.navette.net.NavetteClient
+import com.greponlabs.navette.net.Pairing
+import com.greponlabs.navette.net.PairingStore
 import com.greponlabs.navette.net.controlWebSocketUrl
 import com.greponlabs.navette.protocol.App
 import com.greponlabs.navette.protocol.RequestCommand
@@ -24,7 +31,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 data class AppUiState(
-    val host: String = "",
+    val pairing: Pairing? = null,
     val connection: ConnectionState = ConnectionState.Disconnected,
     val apps: List<App> = emptyList(),
     val sessions: List<Session> = emptyList(),
@@ -35,9 +42,16 @@ data class AppUiState(
 )
 
 sealed interface AppEvent {
-    data class HostChanged(val host: String) : AppEvent
+    /** A pairing was just obtained -- by scanning a QR code or by manual entry. Saves and connects. */
+    data class Paired(val pairing: Pairing) : AppEvent
 
-    data object Connect : AppEvent
+    /**
+     * Retries the current pairing without asking the user to scan or type it
+     * again. Only meaningful after a transient [ConnectionState.Failed] --
+     * [ConnectionState.Unauthorized] means the stored token was rejected, and
+     * resending it would just fail the same way.
+     */
+    data object Reconnect : AppEvent
 
     data object Refresh : AppEvent
 
@@ -61,22 +75,22 @@ sealed interface AppEvent {
 /**
  * Owns the one [NavetteApi] control connection this app uses, and which
  * session (if any) is currently attached. Single-host only, no
- * reconnect/backoff.
+ * reconnect/backoff beyond [AppEvent.Reconnect].
  *
  * Media state is deliberately not here: `SessionScreen` owns its own
  * `MediaClient` and decoder, and this ViewModel stays the control-channel
  * owner it has always been.
  *
- * [clientFactory] defaults to a real [NavetteClient] but is overridable so
- * tests can inject a fake instead of standing up real networking -- see
- * `AppViewModelTest`.
+ * [pairingStore] is the single source of truth for host, port and token --
+ * see [AppEvent.Paired] and the `init` block below, which resumes the last
+ * pairing on every fresh launch of this ViewModel. [clientFactory] defaults
+ * to a real [NavetteClient] but is overridable so tests can inject a fake
+ * instead of standing up real networking -- see `AppViewModelTest`.
  */
 class AppViewModel(
-    private val clientFactory: (host: String) -> NavetteApi = { host ->
-        // TODO(task 9): replace with the token from the stored-token source
-        // once that lands; this placeholder is what makes every 401 in the
-        // meantime exercise the Unauthorized path.
-        NavetteClient(controlWebSocketUrl(host), token = PLACEHOLDER_TOKEN)
+    private val pairingStore: PairingStore,
+    private val clientFactory: (pairing: Pairing) -> NavetteApi = { pairing ->
+        NavetteClient(controlWebSocketUrl(pairing.host, pairing.port), token = pairing.token)
     },
 ) : ViewModel() {
     private val _state = MutableStateFlow(AppUiState())
@@ -97,10 +111,24 @@ class AppViewModel(
     // which request was actually newer.
     private var refreshJob: Job? = null
 
+    init {
+        // Resumes the last pairing on every fresh launch -- this is what
+        // makes "kill the app, reopen it" retry the stored token rather than
+        // sitting on an empty ConnectScreen until the user re-scans. Guarded:
+        // EncryptedPairingStore's prefs are built lazily on first touch, and
+        // this is the first call to reach it in the app's lifetime, so a
+        // keystore failure here must yield "no pairing, show ConnectScreen"
+        // rather than crashing startup.
+        runCatching { pairingStore.load() }
+            .onFailure { Log.w(TAG, "failed to load a stored pairing: ${it.message}") }
+            .getOrNull()
+            ?.let { connectWithPairing(it) }
+    }
+
     fun onEvent(event: AppEvent) {
         when (event) {
-            is AppEvent.HostChanged -> _state.update { it.copy(host = event.host) }
-            AppEvent.Connect -> connect()
+            is AppEvent.Paired -> pair(event.pairing)
+            AppEvent.Reconnect -> reconnect()
             AppEvent.Refresh -> refresh()
             is AppEvent.RunApp -> runApp(event.appId)
             is AppEvent.AttachSession -> attachSession(event.session)
@@ -112,17 +140,23 @@ class AppViewModel(
         }
     }
 
-    private fun connect() {
-        val host = _state.value.host.trim()
-        if (host.isEmpty()) return
+    private fun pair(pairing: Pairing) {
+        pairingStore.save(pairing)
+        connectWithPairing(pairing)
+    }
 
+    private fun reconnect() {
+        pairingStore.load()?.let { connectWithPairing(it) }
+    }
+
+    private fun connectWithPairing(pairing: Pairing) {
         connectionJob?.cancel()
         refreshJob?.cancel()
         client?.close()
         // A reconnect must not leave the user on a session screen belonging to
         // the connection being replaced.
-        _state.update { it.copy(activeSession = null) }
-        val newClient = clientFactory(host)
+        _state.update { it.copy(pairing = pairing, activeSession = null) }
+        val newClient = clientFactory(pairing)
         client = newClient
 
         connectionJob =
@@ -245,15 +279,13 @@ class AppViewModel(
         client?.close()
     }
 
-    private companion object {
-        const val TAG = "AppViewModel"
+    companion object {
+        private const val TAG = "AppViewModel"
 
-        /**
-         * Stands in for a real bearer token until task 9 wires a
-         * stored-token source through to this view model. Every control
-         * socket authenticates with this literal until then, so it exists
-         * to be replaced, not extended.
-         */
-        const val PLACEHOLDER_TOKEN = "TODO-task-9-real-token"
+        /** Builds this ViewModel with a real [EncryptedPairingStore] backed by [context]. */
+        fun factory(context: Context): ViewModelProvider.Factory =
+            viewModelFactory {
+                initializer { AppViewModel(pairingStore = EncryptedPairingStore(context.applicationContext)) }
+            }
     }
 }

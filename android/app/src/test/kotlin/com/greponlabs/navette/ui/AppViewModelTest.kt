@@ -2,6 +2,8 @@ package com.greponlabs.navette.ui
 
 import com.greponlabs.navette.net.ConnectionState
 import com.greponlabs.navette.net.NavetteApi
+import com.greponlabs.navette.net.Pairing
+import com.greponlabs.navette.net.PairingStore
 import com.greponlabs.navette.protocol.ApiError
 import com.greponlabs.navette.protocol.App
 import com.greponlabs.navette.protocol.AttachInfo
@@ -63,6 +65,23 @@ private class FakeNavetteApi : NavetteApi {
     }
 }
 
+/** Hand-written fake, per this project's testing convention -- no mocking framework. */
+private class FakePairingStore(initial: Pairing? = null) : PairingStore {
+    private var stored: Pairing? = initial
+
+    override fun load(): Pairing? = stored
+
+    override fun save(pairing: Pairing) {
+        stored = pairing
+    }
+
+    override fun clear() {
+        stored = null
+    }
+}
+
+private val testPairing = Pairing(host = "tower", port = 9417, token = "test-token")
+
 private val testSession =
     Session(
         name = "work",
@@ -86,7 +105,7 @@ class AppViewModelTest {
     fun setUp() {
         Dispatchers.setMain(StandardTestDispatcher())
         fake = FakeNavetteApi()
-        viewModel = AppViewModel(clientFactory = { fake })
+        viewModel = AppViewModel(pairingStore = FakePairingStore(), clientFactory = { fake })
     }
 
     @After
@@ -106,8 +125,7 @@ class AppViewModelTest {
                 }
             }
 
-            viewModel.onEvent(AppEvent.HostChanged("tower"))
-            viewModel.onEvent(AppEvent.Connect)
+            viewModel.onEvent(AppEvent.Paired(testPairing))
             fake.emit(ConnectionState.Connected)
             testScheduler.advanceUntilIdle()
 
@@ -122,21 +140,20 @@ class AppViewModelTest {
     @Test
     fun `reconnecting closes the previous client and stops listening to its state`() =
         runTest {
-            // clientFactory is invoked once per connect() call, on the SAME
+            // clientFactory is invoked once per pairing, on the SAME
             // ViewModel instance -- this is the actual regression shape
-            // (a user retrying Connect), not two independent ViewModels.
+            // (a user re-pairing), not two independent ViewModels.
             val firstClient = FakeNavetteApi()
             val secondClient = FakeNavetteApi()
             val clients = ArrayDeque(listOf(firstClient, secondClient))
-            val vm = AppViewModel(clientFactory = { clients.removeFirst() })
+            val vm = AppViewModel(pairingStore = FakePairingStore(), clientFactory = { clients.removeFirst() })
 
-            vm.onEvent(AppEvent.HostChanged("tower"))
-            vm.onEvent(AppEvent.Connect)
+            vm.onEvent(AppEvent.Paired(testPairing))
             firstClient.emit(ConnectionState.Connected)
             testScheduler.advanceUntilIdle()
             assertEquals(ConnectionState.Connected, vm.state.value.connection)
 
-            vm.onEvent(AppEvent.Connect)
+            vm.onEvent(AppEvent.Paired(testPairing))
             testScheduler.advanceUntilIdle()
             assertTrue("connect() must close the client it is replacing", firstClient.closed)
 
@@ -152,8 +169,7 @@ class AppViewModelTest {
     @Test
     fun `dismissing an older snackbar message does not clear a newer one`() =
         runTest {
-            viewModel.onEvent(AppEvent.HostChanged("tower"))
-            viewModel.onEvent(AppEvent.Connect)
+            viewModel.onEvent(AppEvent.Paired(testPairing))
             fake.emit(ConnectionState.Failed("first error"))
             testScheduler.advanceUntilIdle()
             assertEquals("first error", viewModel.state.value.snackbarMessage)
@@ -173,8 +189,7 @@ class AppViewModelTest {
     @Test
     fun `running an app that the server rejects surfaces the server's error message`() =
         runTest {
-            viewModel.onEvent(AppEvent.HostChanged("tower"))
-            viewModel.onEvent(AppEvent.Connect)
+            viewModel.onEvent(AppEvent.Paired(testPairing))
             fake.responseFor = { Response(1, ResponseOutcome.Ok(ResponseResult.Apps(emptyList()))) }
             fake.emit(ConnectionState.Connected)
             testScheduler.advanceUntilIdle()
@@ -197,8 +212,7 @@ class AppViewModelTest {
 
     /** Connects and drains the post-Connect refresh, leaving the drawer showing. */
     private fun TestScope.connectAndSettle() {
-        viewModel.onEvent(AppEvent.HostChanged("tower"))
-        viewModel.onEvent(AppEvent.Connect)
+        viewModel.onEvent(AppEvent.Paired(testPairing))
         fake.responseFor = { Response(1, ResponseOutcome.Ok(ResponseResult.Sessions(emptyList()))) }
         fake.emit(ConnectionState.Connected)
         testScheduler.advanceUntilIdle()
@@ -317,7 +331,7 @@ class AppViewModelTest {
             testScheduler.advanceUntilIdle()
             assertEquals("work", viewModel.state.value.activeSession)
 
-            viewModel.onEvent(AppEvent.Connect)
+            viewModel.onEvent(AppEvent.Paired(testPairing))
             testScheduler.advanceUntilIdle()
 
             assertEquals(

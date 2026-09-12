@@ -56,6 +56,7 @@ import com.greponlabs.navette.net.ConnectionState
 import com.greponlabs.navette.net.MediaClient
 import com.greponlabs.navette.net.MediaInput
 import com.greponlabs.navette.net.MediaPacket
+import com.greponlabs.navette.net.Pairing
 import com.greponlabs.navette.net.mediaWebSocketUrl
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -81,13 +82,6 @@ private const val RESIZE_DEBOUNCE_MS = 150L
 
 /** How often the HUD pings and republishes. One second, matching [HUD_WINDOW_MS]. */
 private const val HUD_SAMPLE_INTERVAL_MS: Long = 1000L
-
-/**
- * Stands in for a real bearer token until task 9 wires a stored-token source
- * through to this screen. Every media socket authenticates with this literal
- * until then, so it exists to be replaced, not extended.
- */
-private const val PLACEHOLDER_TOKEN = "TODO-task-9-real-token"
 
 /** What the screen renders. */
 internal data class SessionUiState(
@@ -125,7 +119,7 @@ internal data class SessionUiState(
 @Composable
 fun SessionScreen(
     sessionName: String,
-    host: String,
+    pairing: Pairing,
     onLeave: () -> Unit,
 ) {
     // A reconnect is a clean rebuild: bumping the nonce recreates the
@@ -135,11 +129,11 @@ fun SessionScreen(
     // The counters survive the rebuild -- they are keyed on the session, not
     // the nonce -- so the retry budget is spent across attempts, not reset by
     // each one.
-    var reconnectNonce by remember(host, sessionName) { mutableIntStateOf(0) }
-    var reconnectAttempt by remember(host, sessionName) { mutableIntStateOf(0) }
+    var reconnectNonce by remember(pairing.host, sessionName) { mutableIntStateOf(0) }
+    var reconnectAttempt by remember(pairing.host, sessionName) { mutableIntStateOf(0) }
     // Zoom and pan outlive a rebuild too: a retry the user never noticed must
     // not snap a zoomed, panned view back to the corner.
-    val transformHolder = remember(host, sessionName) { ViewTransformHolder() }
+    val transformHolder = remember(pairing.host, sessionName) { ViewTransformHolder() }
     // Keyed on the session, not the nonce, like transformHolder above: a
     // reconnect rebuilds SessionController, but the bridge's one-shot echo
     // and last-remote state must survive it. A fresh bridge per reconnect
@@ -148,10 +142,15 @@ fun SessionScreen(
     // without this, that resume would re-forward the daemon's own stale
     // push as if the phone had copied it new, clobbering whatever the guest
     // copied while the socket was down.
-    val clipboardBridge = remember(host, sessionName) { ClipboardBridge() }
+    val clipboardBridge = remember(pairing.host, sessionName) { ClipboardBridge() }
     val controller =
-        remember(host, sessionName, reconnectNonce) {
-            SessionController(mediaWebSocketUrl(host, sessionName), transformHolder, clipboardBridge)
+        remember(pairing.host, pairing.port, sessionName, reconnectNonce) {
+            SessionController(
+                mediaWebSocketUrl(pairing.host, sessionName, pairing.port),
+                pairing.token,
+                transformHolder,
+                clipboardBridge,
+            )
         }
     val state by controller.state.collectAsState()
     val focusRequester = remember { FocusRequester() }
@@ -167,10 +166,10 @@ fun SessionScreen(
     // Keyed on the session, not the nonce, like the retry counters above: a
     // reconnect must not silently drop the user out of the on-screen
     // keyboard they had raised.
-    var imeRaised by remember(host, sessionName) { mutableStateOf(false) }
+    var imeRaised by remember(pairing.host, sessionName) { mutableStateOf(false) }
     // Keyed like imeRaised, not the nonce: a reconnect rebuild must not
     // silently turn the HUD off while someone is watching it.
-    var hudVisible by remember(host, sessionName) { mutableStateOf(false) }
+    var hudVisible by remember(pairing.host, sessionName) { mutableStateOf(false) }
 
     LockLandscapeWhileAttached()
 
@@ -458,6 +457,7 @@ private fun BoxScope.ImeLayer(
  */
 private class SessionController(
     mediaUrl: String,
+    token: String,
     private val transformHolder: ViewTransformHolder,
     // Passed in rather than owned, on the same terms as transformHolder:
     // remembered by the screen keyed on the session, not the reconnect
@@ -468,10 +468,7 @@ private class SessionController(
     // in open() -- so it is guarded by `lock` rather than getting its own.
     private val bridge: ClipboardBridge,
 ) {
-    // TODO(task 9): replace with the token from the stored-token source once
-    // that lands; this placeholder is what makes every 401 in the meantime
-    // exercise the Unauthorized path.
-    private val client = MediaClient(mediaUrl, token = PLACEHOLDER_TOKEN)
+    private val client = MediaClient(mediaUrl, token = token)
     private val gate = StreamGate()
     private val scope = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
 
