@@ -802,7 +802,17 @@ pub fn router<R: ProcessRunner>(state: ApiState<R>) -> Router {
 }
 ```
 
-The `origin_is_refused_before_the_token_is_checked` test from Step 1 is what pins this ordering; if the layers are swapped it fails.
+**Which test actually pins this ordering** — verified empirically by swapping the
+layers and observing which tests fail:
+
+- `rejects_any_request_carrying_an_origin_header` and `rejects_an_empty_origin_header`
+  **are** the pin. They send `Origin` with **no** `Authorization`, so the correct
+  order returns 403 and the swapped order returns 401.
+- `origin_is_refused_before_the_token_is_checked` is **not** a pin, despite its name.
+  It sends a *valid* token, and a valid token passes the auth layer either way, so
+  both orderings return 403. It still asserts a real security property — a browser
+  holding a stolen but valid token is refused — so keep it; just do not rely on it
+  to catch a reordering.
 
 - [ ] **Step 7: Update the existing WebSocket tests to send the header**
 
