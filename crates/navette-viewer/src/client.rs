@@ -91,11 +91,16 @@ impl MediaClient {
             .parse()
             .map_err(|_| ClientError::Subprotocol)?;
         request.headers_mut().insert(SUBPROTOCOL_HEADER, protocol);
+        // Not an `expect`: that claim holds for `AuthToken::render`'s output but
+        // not for what reaches here, which may have come straight from `--token`
+        // or `NAVETTE_TOKEN`. `NAVETTE_TOKEN=$'ABC\n'` is enough to make the
+        // header value invalid, and panicking on user input is a crash where the
+        // CLI reports an error.
         request.headers_mut().insert(
             "Authorization",
             format!("Bearer {token}")
                 .parse()
-                .expect("a bearer token renders to a valid header value"),
+                .map_err(|_| ClientError::InvalidToken)?,
         );
         let (socket, response) = connect_async(request)
             .await
@@ -522,6 +527,10 @@ pub enum ClientError {
     Connect(Box<tokio_tungstenite::tungstenite::Error>),
     #[error("server did not negotiate the {MEDIA_WEBSOCKET_SUBPROTOCOL} subprotocol")]
     Subprotocol,
+    #[error(
+        "the token is not a valid HTTP header value; check --token / NAVETTE_TOKEN for stray whitespace or newlines"
+    )]
+    InvalidToken,
     #[error("failed to encode input: {0}")]
     Encode(serde_json::Error),
     #[error("failed to send input: {0}")]
