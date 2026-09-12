@@ -1246,11 +1246,24 @@ git commit -m "feat(clients): send the API token from the CLI and viewer"
 **Interfaces:**
 - Produces: `ConnectionState.Unauthorized`.
 
-**Known blast radius — enumerated so it is not discovered mid-task.** Adding a variant to a sealed interface breaks every exhaustive `when`, and the Kotlin house rule forbids `else` branches. Adding one variant broke two crates on a previous branch. The `when` sites are:
-- `android/.../ui/NavetteApp.kt` (`ConnectionState.Connected ->`)
-- `android/.../ui/session/SessionOverlay.kt` (`ConnectionState.Connecting -> "Connecting..."`)
+**Blast radius — and a correction, because the obvious assumption is wrong here.**
 
-Every other reference uses `is` or `==` and will keep compiling. Update both explicitly, never with a catch-all `else`.
+An earlier draft of this plan said the compiler would find the sites that need a new
+`ConnectionState` arm, because a sealed type forces exhaustive `when`. **That is not
+true in this codebase.** Both consumer sites use a *subject-less* `when { ... }` with
+boolean `is` checks and an existing `else`, so adding a variant produces **zero
+compile errors anywhere**. Verified by grep across the whole app.
+
+The consequence is the opposite of reassuring: there is no compiler-enforced safety
+net for this sealed type at all, and a new variant silently falls into whichever
+`else` it meets. For `SessionOverlay` that means a rejected pairing would display as
+a generic "connection lost".
+
+So these two sites must be updated **by hand and on purpose**:
+- `android/.../ui/NavetteApp.kt`
+- `android/.../ui/session/SessionOverlay.kt`
+
+Do not add an `else` to "be safe" — an `else` is what created this situation.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1266,7 +1279,10 @@ fun `does not retry after an authentication failure`() {
 
 @Test
 fun `still retries an ordinary dropped connection`() {
-    assertTrue(ReconnectPolicy.shouldRetry(attempt = 0, streamEnded = true, decodeError = null, unauthorized = false))
+    // streamEnded = false: `shouldRetry` returns `!streamEnded && ...`, so passing
+    // true here would assert that a *terminated* stream retries, which contradicts
+    // the rule this test is named for.
+    assertTrue(ReconnectPolicy.shouldRetry(attempt = 0, streamEnded = false, decodeError = null, unauthorized = false))
 }
 ```
 
@@ -1352,6 +1368,10 @@ override fun onFailure(webSocket: WebSocket, t: Throwable, response: OkHttpRespo
 `NavetteClient` has no reconnect loop to stop (`NavetteClient.kt:62` defers reconnection), so for the control socket this is purely about surfacing: the user must see "pairing rejected", not a generic connection failure they will blame on the network. **When reconnection is added there, it inherits the terminal rule.**
 
 - [ ] **Step 6: Make 401 terminal in the policy**
+
+`isDropped` must also count `Unauthorized` as dropped. Without that, `SessionScreen`'s
+retry effect never observes the transition on a pure auth failure, so the
+`shouldRetry` call below is unreachable and the overlay never appears.
 
 In `ReconnectPolicy.kt`, add the parameter and the early return:
 
