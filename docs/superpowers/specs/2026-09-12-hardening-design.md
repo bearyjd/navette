@@ -100,9 +100,19 @@ running daemon holds the value in memory and does not watch the file. Adding a
 reload path would mean a config-watching mechanism nothing else needs.
 
 **QR payload** is a `navette://pair?host=…&port=…&token=…` URI, so one scan delivers
-the whole connection rather than only the secret. The daemon may be bound to
-`0.0.0.0` and so may not know its own reachable name: `--advertise-host` overrides,
-defaulting to the system hostname.
+the whole connection rather than only the secret.
+
+**The daemon usually cannot derive `host` itself, so it must not guess.** The phone
+connects over the tailnet, where the reachable name is a MagicDNS name or tailnet IP
+— not `uname -n`, and there is no Tailscale integration to ask (§9). Defaulting to
+the system hostname would produce a QR that scans cleanly and then fails to connect,
+which presents as an auth bug and is the worst possible failure for a pairing flow.
+The rule:
+
+- Bound to a specific non-loopback address → use that address; it is reachable by
+  construction.
+- Bound to `0.0.0.0` (or loopback) → **`--advertise-host` is required for `--qr`**,
+  and its absence is an error naming the flag, not a guess.
 
 **Never logged**, at any level, in either language. Startup logs that a token was
 loaded, never its value. This is the same discipline the clipboard branch
@@ -110,9 +120,13 @@ established for clipboard content, now covering a second secret.
 
 ## 4. Verification
 
-`Authorization: Bearer <token>` on every route **except** `/healthz`, which stays
-open as a liveness probe: it reveals only that navetted is running, and it is still
-`Origin`-rejected under §2.
+`Authorization: Bearer <token>` on **every** route, `/healthz` included.
+
+An earlier draft exempted `/healthz` as a liveness probe. Nothing in the repo probes
+it — the router has three routes and there is no deployment tooling referencing it —
+so the exemption would be unauthenticated surface carried for a consumer that does
+not exist. If a probe ever needs it open, reopening it is a deliberate one-line
+change with a named consumer, which is the right way round.
 
 WebSocket handshakes carry headers, so one mechanism covers `/v1/ws`, the media
 socket, and the future blob routes. `api.rs:595` already builds test requests with
@@ -189,11 +203,22 @@ is added** — bounding the high-water mark is what the ceilings already accompl
 
 ## 7. Failure modes
 
-**A 401 is terminal, not retryable.** `ReconnectPolicy.kt` backs off and retries
-today; without this distinction a rotated token produces an invisible infinite
-reconnect loop — the phone spinning forever while the daemon refuses every attempt.
-The policy must separate terminal authentication failure from transient network
-failure, surface "pairing rejected", and offer a re-scan.
+**A 401 is terminal, not retryable.** The two sockets need this stated separately,
+because they are not symmetric today and a single blanket sentence would miss one:
+
+- **Media path.** `ReconnectPolicy` (used only from `SessionScreen.kt:266-278` and
+  `SessionOverlay.kt:69`) backs off and retries. Without a terminal-401 distinction,
+  a rotated token produces an invisible infinite reconnect loop — the phone spinning
+  forever while the daemon refuses every attempt. `shouldRetry` must return false on
+  an authentication failure, and the screen must surface "pairing rejected" with a
+  re-scan action rather than the generic dropped-connection overlay.
+- **Control socket.** `NavetteClient` has **no reconnection at all** yet
+  (`NavetteClient.kt:62` defers it explicitly), so there is no loop to stop. What it
+  needs instead is correct *surfacing*: a 401 must read as "pairing rejected", not
+  as a generic connection failure, or the user sees "cannot connect" and blames the
+  network while the real cause is a rotated token. **When reconnection is added
+  there, it inherits the terminal-401 rule** — recorded here so that work does not
+  have to rediscover it.
 
 This is the integration point most likely to be got wrong and the one whose failure
 is least visible, so it carries its own tests rather than riding on the auth tests.
