@@ -117,6 +117,20 @@ async fn main() -> Result<()> {
 }
 
 fn show_token(url: &str, qr: bool, rotate: bool, advertise_host: Option<&str>) -> Result<()> {
+    // Resolve everything QR rendering needs before touching the token file:
+    // `--rotate` invalidates every paired client, and `load_or_create` may
+    // write a brand-new token to disk, so a fallible check like the advertise
+    // host must run first. Otherwise a failure here would leave the operator
+    // with an invalidated or newly-minted token they were never shown.
+    let advertised_endpoint = if qr {
+        let parsed = url::Url::parse(url).context("could not parse --url")?;
+        let port = parsed.port().unwrap_or(9417);
+        let host = resolve_advertise_host(url, advertise_host)?;
+        Some((host, port))
+    } else {
+        None
+    };
+
     let path = navette_auth::default_token_path().context("cannot determine a token path")?;
     let token = if rotate {
         let token = navette_auth::AuthToken::rotate(&path)?;
@@ -127,10 +141,7 @@ fn show_token(url: &str, qr: bool, rotate: bool, advertise_host: Option<&str>) -
         navette_auth::AuthToken::load_or_create(&path)?
     };
 
-    if qr {
-        let parsed = url::Url::parse(url)?;
-        let port = parsed.port().unwrap_or(9417);
-        let host = resolve_advertise_host(url, advertise_host)?;
+    if let Some((host, port)) = advertised_endpoint {
         let uri = pairing_uri(&host, port, &token.render());
         let code = qrcode::QrCode::new(uri.as_bytes())?;
         println!(
