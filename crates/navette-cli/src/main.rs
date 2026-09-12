@@ -141,15 +141,30 @@ fn show_token(url: &str, qr: bool, rotate: bool, advertise_host: Option<&str>) -
         navette_auth::AuthToken::load_or_create(&path)?
     };
 
+    // The token is printed BEFORE anything else that can fail. Host resolution
+    // already happens above the rotate, but `QrCode::new` is fallible too, and
+    // leaving it between the rotation and the print reopens the same hole one
+    // call later: the operator loses every pairing and never sees the
+    // replacement. The QR cannot be built earlier -- its payload contains the
+    // token -- so the ordering is the fix.
+    println!("{}", token.render_grouped());
+
     if let Some((host, port)) = advertised_endpoint {
         let uri = pairing_uri(&host, port, &token.render());
-        let code = qrcode::QrCode::new(uri.as_bytes())?;
-        println!(
-            "{}",
-            code.render::<qrcode::render::unicode::Dense1x2>().build()
-        );
+        match qrcode::QrCode::new(uri.as_bytes()) {
+            Ok(code) => {
+                println!(
+                    "{}",
+                    code.render::<qrcode::render::unicode::Dense1x2>().build()
+                );
+            }
+            // Degrade rather than fail: the token above is what pairing needs,
+            // and the QR is a convenience for typing it.
+            Err(error) => {
+                eprintln!("could not render a QR code ({error}); pair with the token above");
+            }
+        }
     }
-    println!("{}", token.render_grouped());
     Ok(())
 }
 
@@ -583,7 +598,7 @@ mod tests {
 
     #[test]
     fn accepts_ordinary_advertise_host_values() {
-        for host in ["tower.ts.net", "100.64.0.3", "[fd7a::1]"] {
+        for host in ["tower.ts.net", "my-tower.ts.net", "100.64.0.3", "[fd7a::1]"] {
             assert_eq!(
                 resolve_advertise_host("ws://127.0.0.1:9417/v1/ws", Some(host)).unwrap(),
                 host,
