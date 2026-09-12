@@ -36,6 +36,10 @@ struct Cli {
     #[arg(long, env = "NAVETTE_TOKEN", global = true)]
     token: Option<SecretString>,
 
+    /// Override the API token file path. Must match navetted's --token-file.
+    #[arg(long, global = true)]
+    token_file: Option<PathBuf>,
+
     /// wprsc executable.
     #[arg(long, default_value = "wprsc", global = true)]
     wprsc: String,
@@ -108,11 +112,20 @@ async fn main() -> Result<()> {
         advertise_host,
     } = cli.command
     {
-        return show_token(&cli.url, qr, rotate, advertise_host.as_deref());
+        return show_token(
+            &cli.url,
+            qr,
+            rotate,
+            advertise_host.as_deref(),
+            cli.token_file.as_deref(),
+        );
     }
 
-    let token =
-        navette_auth::resolve_token(&cli.url, cli.token.as_ref().map(SecretString::as_str), None)?;
+    let token = navette_auth::resolve_token(
+        &cli.url,
+        cli.token.as_ref().map(SecretString::as_str),
+        cli.token_file.as_deref(),
+    )?;
     let client = Client::new(&cli.url, token);
     match cli.command {
         Command::Ls => print_result(client.call(RequestCommand::ListSessions).await?),
@@ -132,7 +145,13 @@ async fn main() -> Result<()> {
     }
 }
 
-fn show_token(url: &str, qr: bool, rotate: bool, advertise_host: Option<&str>) -> Result<()> {
+fn show_token(
+    url: &str,
+    qr: bool,
+    rotate: bool,
+    advertise_host: Option<&str>,
+    token_file: Option<&Path>,
+) -> Result<()> {
     // Resolve everything QR rendering needs before touching the token file:
     // `--rotate` invalidates every paired client, and `load_or_create` may
     // write a brand-new token to disk, so a fallible check like the advertise
@@ -147,7 +166,14 @@ fn show_token(url: &str, qr: bool, rotate: bool, advertise_host: Option<&str>) -
         None
     };
 
-    let path = navette_auth::default_token_path().context("cannot determine a token path")?;
+    // Honours `--token-file` for the same reason the client paths do: an
+    // operator running `navetted --token-file /X` who is shown the token from
+    // the default path gets a QR the daemon rejects, which presents as a
+    // pairing bug rather than a mismatched flag.
+    let path = match token_file {
+        Some(path) => path.to_path_buf(),
+        None => navette_auth::default_token_path().context("cannot determine a token path")?,
+    };
     let token = if rotate {
         let token = navette_auth::AuthToken::rotate(&path)?;
         eprintln!("Token rotated. Every paired client must pair again.");

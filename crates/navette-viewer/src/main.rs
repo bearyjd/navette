@@ -36,6 +36,10 @@ struct Cli {
     /// API token. Defaults to the local token file for a loopback --url.
     #[arg(long, env = "NAVETTE_TOKEN")]
     token: Option<SecretString>,
+
+    /// Override the API token file path. Must match navetted's --token-file.
+    #[arg(long)]
+    token_file: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -43,8 +47,11 @@ async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     let url = media_url(&cli.url, &cli.session);
-    let token =
-        navette_auth::resolve_token(&cli.url, cli.token.as_ref().map(SecretString::as_str), None)?;
+    let token = navette_auth::resolve_token(
+        &cli.url,
+        cli.token.as_ref().map(SecretString::as_str),
+        cli.token_file.as_deref(),
+    )?;
     let mut client = MediaClient::connect(&url, &token, ffmpeg_decoder_factory(cli.ffmpeg))
         .await
         .with_context(|| format!("failed to attach to {url}"))?;
