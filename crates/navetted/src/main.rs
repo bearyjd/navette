@@ -60,10 +60,22 @@ fn init_tracing() {
 async fn main() -> Result<()> {
     init_tracing();
     let arguments = Arguments::parse();
-    if !arguments.bind.ip().is_loopback() && !arguments.allow_remote {
-        bail!(
-            "refusing non-loopback bind {}; pass --allow-remote to acknowledge the transport is plaintext",
-            arguments.bind
+    if !arguments.bind.ip().is_loopback() {
+        if !arguments.allow_remote {
+            bail!(
+                "refusing non-loopback bind {}; pass --allow-remote to acknowledge the transport is plaintext",
+                arguments.bind
+            );
+        }
+        // Design §9: the acknowledgement earns a loud startup warning rather
+        // than silent exposure. The flag is passed once and then lives in a
+        // unit file nobody rereads, so the log line is the only thing that
+        // keeps the exposure visible on every subsequent start.
+        tracing::warn!(
+            address = %arguments.bind,
+            "--allow-remote: the API is reachable beyond loopback and the transport is plaintext — \
+             the bearer token and every session's traffic cross the network unencrypted. \
+             Bind loopback and tunnel over SSH or a tailnet unless this is deliberate."
         );
     }
 
