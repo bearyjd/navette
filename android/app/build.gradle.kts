@@ -62,6 +62,7 @@ dependencies {
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.okhttp)
+    implementation(libs.security.crypto)
 
     debugImplementation(libs.compose.ui.tooling)
 
