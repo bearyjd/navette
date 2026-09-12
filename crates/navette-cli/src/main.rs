@@ -163,6 +163,17 @@ fn pairing_uri(host: &str, port: u16, token: &str) -> String {
 /// already a specific non-loopback address, and otherwise refuse.
 fn resolve_advertise_host(url: &str, advertise: Option<&str>) -> Result<String> {
     if let Some(host) = advertise {
+        // Validate rather than percent-encode. `pairing_uri` interpolates this
+        // straight into a query string, so a host containing `&`, `#`, `?` or
+        // `/` would produce an ambiguous URI that the Android parser reads
+        // differently than intended. Encoding here would force matching decoding
+        // on the phone side; rejecting instead keeps both sides literal and
+        // needs no agreement between them. No real hostname or IP contains
+        // these characters -- brackets and colons are allowed for IPv6.
+        let legal = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']');
+        if host.is_empty() || !host.chars().all(legal) {
+            bail!("--advertise-host {host:?} is not a valid hostname or address");
+        }
         return Ok(host.to_owned());
     }
     let parsed = url::Url::parse(url).context("could not parse --url")?;
@@ -523,6 +534,41 @@ mod tests {
         let host =
             resolve_advertise_host("ws://127.0.0.1:9417/v1/ws", Some("tower.ts.net")).unwrap();
         assert_eq!(host, "tower.ts.net");
+    }
+
+    #[test]
+    fn rejects_an_advertise_host_containing_an_ampersand() {
+        // `&` would let a crafted --advertise-host inject an extra query
+        // parameter into the navette://pair URI.
+        let error = resolve_advertise_host("ws://127.0.0.1:9417/v1/ws", Some("tower&evil.example"))
+            .unwrap_err();
+        assert!(error.to_string().contains("tower&evil.example"));
+    }
+
+    #[test]
+    fn rejects_an_advertise_host_containing_a_hash() {
+        // `#` would truncate the URI at the Android side's fragment parser,
+        // silently dropping the token from what gets read.
+        let error =
+            resolve_advertise_host("ws://127.0.0.1:9417/v1/ws", Some("tower#evil")).unwrap_err();
+        assert!(error.to_string().contains("tower#evil"));
+    }
+
+    #[test]
+    fn rejects_an_empty_advertise_host() {
+        let error = resolve_advertise_host("ws://127.0.0.1:9417/v1/ws", Some("")).unwrap_err();
+        assert!(error.to_string().contains("not a valid hostname"));
+    }
+
+    #[test]
+    fn accepts_ordinary_advertise_host_values() {
+        for host in ["tower.ts.net", "100.64.0.3", "[fd7a::1]"] {
+            assert_eq!(
+                resolve_advertise_host("ws://127.0.0.1:9417/v1/ws", Some(host)).unwrap(),
+                host,
+                "expected {host} to be accepted"
+            );
+        }
     }
 
     #[test]
