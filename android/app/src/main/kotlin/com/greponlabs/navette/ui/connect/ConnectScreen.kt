@@ -16,6 +16,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -59,7 +60,12 @@ fun ConnectScreen(
     var scanError by rememberSaveable { mutableStateOf<String?>(null) }
     var manualEntryShown by rememberSaveable { mutableStateOf(false) }
     var manualHost by rememberSaveable { mutableStateOf("") }
-    var manualToken by rememberSaveable { mutableStateOf("") }
+    // `remember`, deliberately not `rememberSaveable`: saved instance state is a
+    // Bundle the OS holds outside our encrypted store, survives process death,
+    // and can reach disk. A typed token does not belong there. The cost is that
+    // a rotation mid-entry clears the field, which is the right trade for a
+    // secret in a one-time pairing flow.
+    var manualToken by remember { mutableStateOf("") }
     // Masked by default: this field exists to keep the token out of logs,
     // Debug output and error strings, and a plaintext field on screen would
     // undo that in a different medium (over-the-shoulder in public, screen
