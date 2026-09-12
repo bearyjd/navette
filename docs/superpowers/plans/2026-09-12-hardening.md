@@ -344,10 +344,20 @@ impl AuthToken {
         }
     }
 
+    /// Writes to a temporary file and renames over the old one. `rename` is
+    /// atomic within a filesystem, so there is no window where the old token is
+    /// gone and the new one has not landed. Unlinking first and then writing
+    /// would leave no token file at all if the write failed, and the next
+    /// startup would silently mint a third value.
     pub fn rotate(path: &Path) -> Result<Self, AuthError> {
         let token = Self::generate();
-        let _ = fs::remove_file(path);
-        token.write_private(path)?;
+        let staging = path.with_extension("next");
+        let _ = fs::remove_file(&staging);
+        token.write_private(&staging)?;
+        fs::rename(&staging, path).map_err(|source| AuthError::Write {
+            path: path.to_path_buf(),
+            source,
+        })?;
         Ok(token)
     }
 
