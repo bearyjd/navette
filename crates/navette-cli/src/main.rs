@@ -162,33 +162,42 @@ fn pairing_uri(host: &str, port: u16, token: &str) -> String {
 /// there is no Tailscale integration to ask. So use the URL host when it is
 /// already a specific non-loopback address, and otherwise refuse.
 fn resolve_advertise_host(url: &str, advertise: Option<&str>) -> Result<String> {
-    if let Some(host) = advertise {
-        // Validate rather than percent-encode. `pairing_uri` interpolates this
-        // straight into a query string, so a host containing `&`, `#`, `?` or
-        // `/` would produce an ambiguous URI that the Android parser reads
-        // differently than intended. Encoding here would force matching decoding
-        // on the phone side; rejecting instead keeps both sides literal and
-        // needs no agreement between them. No real hostname or IP contains
-        // these characters -- brackets and colons are allowed for IPv6.
-        let legal = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']');
-        if host.is_empty() || !host.chars().all(legal) {
-            bail!("--advertise-host {host:?} is not a valid hostname or address");
+    let host = match advertise {
+        Some(host) => host.to_owned(),
+        None => {
+            let parsed = url::Url::parse(url).context("could not parse --url")?;
+            let host = parsed.host_str().context("--url has no host")?;
+            let is_loopback = host == "localhost"
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .map(|address| address.is_loopback())
+                    .unwrap_or(false);
+            if is_loopback {
+                bail!(
+                    "--url points at {host}, which the phone cannot reach; pass --advertise-host with the name or address the phone should dial"
+                );
+            }
+            host.to_owned()
         }
-        return Ok(host.to_owned());
+    };
+
+    // Validated once, at the single exit, because the property that matters is
+    // what reaches `pairing_uri` -- not which branch produced it. Validating only
+    // the explicit flag leaves the --url path open: `&` is NOT a forbidden host
+    // code point in the WHATWG URL spec the `url` crate implements, so
+    // `--url ws://tower&evil.example:9417/v1/ws` survives `host_str()` intact.
+    //
+    // Validate rather than percent-encode: `pairing_uri` interpolates this
+    // straight into a query string, so `&`, `#`, `?` or `/` would yield a URI
+    // the Android parser reads differently than intended. Encoding would force
+    // the phone side to share a decoding convention; rejecting needs no
+    // agreement between them. No real hostname or IP contains these characters
+    // -- brackets and colons are allowed for IPv6 literals.
+    let legal = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']');
+    if host.is_empty() || !host.chars().all(legal) {
+        bail!("{host:?} is not a valid hostname or address");
     }
-    let parsed = url::Url::parse(url).context("could not parse --url")?;
-    let host = parsed.host_str().context("--url has no host")?;
-    let is_loopback = host == "localhost"
-        || host
-            .parse::<std::net::IpAddr>()
-            .map(|address| address.is_loopback())
-            .unwrap_or(false);
-    if is_loopback {
-        bail!(
-            "--url points at {host}, which the phone cannot reach; pass --advertise-host with the name or address the phone should dial"
-        );
-    }
-    Ok(host.to_owned())
+    Ok(host)
 }
 
 fn print_result(result: ResponseResult) -> Result<()> {
@@ -558,6 +567,18 @@ mod tests {
     fn rejects_an_empty_advertise_host() {
         let error = resolve_advertise_host("ws://127.0.0.1:9417/v1/ws", Some("")).unwrap_err();
         assert!(error.to_string().contains("not a valid hostname"));
+    }
+
+    #[test]
+    fn rejects_an_ampersand_carried_in_via_url_when_no_flag_is_given() {
+        // Validation must apply regardless of which branch produced the host:
+        // `&` is not a forbidden host code point in the WHATWG URL spec, so it
+        // survives `Url::host_str()` intact and would otherwise reach
+        // `pairing_uri` unvalidated on this path. This is the regression this
+        // test guards -- it fails against a version that only validates the
+        // explicit `--advertise-host` branch.
+        let error = resolve_advertise_host("ws://tower&evil.example:9417/v1/ws", None).unwrap_err();
+        assert!(error.to_string().contains("tower&evil.example"));
     }
 
     #[test]
