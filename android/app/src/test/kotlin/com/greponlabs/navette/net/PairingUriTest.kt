@@ -33,6 +33,36 @@ class PairingUriTest {
     }
 
     @Test
+    fun `rejects a port of exactly zero or exactly one past the max`() {
+        assertNull(parsePairingUri("navette://pair?host=t&port=0&token=ABCD1234ABCD1234ABCD1234"))
+        assertNull(parsePairingUri("navette://pair?host=t&port=65536&token=ABCD1234ABCD1234ABCD1234"))
+    }
+
+    @Test
+    fun `accepts the port boundaries one and 65535`() {
+        assertEquals(Pairing("t", 1, "ABCD1234ABCD1234ABCD1234"), parsePairingUri("navette://pair?host=t&port=1&token=ABCD1234ABCD1234ABCD1234"))
+        assertEquals(Pairing("t", 65535, "ABCD1234ABCD1234ABCD1234"), parsePairingUri("navette://pair?host=t&port=65535&token=ABCD1234ABCD1234ABCD1234"))
+    }
+
+    @Test
+    fun `rejects an empty field value`() {
+        assertNull(parsePairingUri("navette://pair?host=&port=9417&token=ABCD1234ABCD1234ABCD1234"))
+    }
+
+    @Test
+    fun `rejects a query with a pair that has no equals sign`() {
+        assertNull(parsePairingUri("navette://pair?host=t&port&token=ABCD1234ABCD1234ABCD1234"))
+    }
+
+    @Test
+    fun `rejects a query with a duplicate key`() {
+        // Ambiguous input from a camera is refused, not guessed at -- the
+        // last-write-wins collapse of a naive `.toMap()` would otherwise hand
+        // back a Pairing that looks well-formed but reflects the wrong value.
+        assertNull(parsePairingUri("navette://pair?host=a&host=b&port=9417&token=ABCD1234ABCD1234ABCD1234"))
+    }
+
+    @Test
     fun `parses an ipv6 literal host without percent decoding it`() {
         // Brackets and colons are legal, unencoded host characters on the
         // producing side (crates/navette-cli/src/main.rs `resolve_advertise_host`).
