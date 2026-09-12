@@ -141,10 +141,20 @@ impl AuthToken {
         }
     }
 
+    /// Writes to a temporary file and renames over the old one. `rename` is
+    /// atomic within a filesystem, so there is no window where the old token is
+    /// gone and the new one has not landed. Unlinking first and then writing
+    /// would leave no token file at all if the write failed, and the next
+    /// startup would silently mint a third value.
     pub fn rotate(path: &Path) -> Result<Self, AuthError> {
         let token = Self::generate();
-        let _ = fs::remove_file(path);
-        token.write_private(path)?;
+        let staging = path.with_extension("next");
+        let _ = fs::remove_file(&staging);
+        token.write_private(&staging)?;
+        fs::rename(&staging, path).map_err(|source| AuthError::Write {
+            path: path.to_path_buf(),
+            source,
+        })?;
         Ok(token)
     }
 
@@ -168,6 +178,16 @@ impl AuthToken {
             path: path.to_path_buf(),
             source,
         })
+    }
+}
+
+#[cfg(test)]
+impl AuthToken {
+    /// Test-only: builds a token from known bytes so the codec can be
+    /// checked against a fixed vector, not just against itself. Kept
+    /// `cfg(test)` rather than widening the public API.
+    fn from_bytes(bytes: [u8; TOKEN_BYTES]) -> Self {
+        Self(bytes)
     }
 }
 
@@ -286,5 +306,40 @@ mod tests {
         assert!(!second.matches(&first.render()));
         let reloaded = AuthToken::load_or_create(&path).unwrap();
         assert!(reloaded.matches(&second.render()));
+    }
+
+    #[test]
+    fn rotate_preserves_private_permissions() {
+        // `rotate` writes to a staging file and renames it over the target.
+        // `rename` carries the source file's mode, but that's the property
+        // we depend on for the token to stay unreadable by others, so pin
+        // it rather than assume it.
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("token");
+        AuthToken::load_or_create(&path).unwrap();
+        AuthToken::rotate(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "rotated token file must still be private after the rename"
+        );
+    }
+
+    #[test]
+    fn renders_a_known_byte_sequence_to_the_expected_string() {
+        // The round-trip tests above only check self-consistency: a codec
+        // that is wrong the same way in both `render` and `parse` (e.g.
+        // consistently reversed bit order within each 5-bit group) would
+        // still pass them. This pins `render` against a value computed
+        // independently of the implementation, so that class of bug fails
+        // loudly instead of producing tokens that intermittently fail to
+        // authenticate.
+        let token = AuthToken::from_bytes([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+            0x0E,
+        ]);
+        assert_eq!(token.render(), "000G40R40M30E209185GR38E");
     }
 }
