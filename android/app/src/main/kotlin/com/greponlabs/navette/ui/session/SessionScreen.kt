@@ -82,6 +82,13 @@ private const val RESIZE_DEBOUNCE_MS = 150L
 /** How often the HUD pings and republishes. One second, matching [HUD_WINDOW_MS]. */
 private const val HUD_SAMPLE_INTERVAL_MS: Long = 1000L
 
+/**
+ * Stands in for a real bearer token until task 9 wires a stored-token source
+ * through to this screen. Every media socket authenticates with this literal
+ * until then, so it exists to be replaced, not extended.
+ */
+private const val PLACEHOLDER_TOKEN = "TODO-task-9-real-token"
+
 /** What the screen renders. */
 internal data class SessionUiState(
     // Connecting, not Disconnected: the controller opens the socket from a
@@ -265,7 +272,14 @@ fun SessionScreen(
                 controller.state.first {
                     ReconnectPolicy.isDropped(it.connection) || it.streamEnded || it.decodeError != null
                 }
-            if (ReconnectPolicy.shouldRetry(reconnectAttempt, dropped.streamEnded, dropped.decodeError)) {
+            if (
+                ReconnectPolicy.shouldRetry(
+                    reconnectAttempt,
+                    dropped.streamEnded,
+                    dropped.decodeError,
+                    dropped.connection is ConnectionState.Unauthorized,
+                )
+            ) {
                 reconnectAttempt += 1
                 delay(ReconnectPolicy.delayMs(reconnectAttempt))
                 reconnectNonce += 1
@@ -275,7 +289,12 @@ fun SessionScreen(
 
     val reconnecting =
         ReconnectPolicy.isDropped(state.connection) &&
-            ReconnectPolicy.shouldRetry(reconnectAttempt, state.streamEnded, state.decodeError)
+            ReconnectPolicy.shouldRetry(
+                reconnectAttempt,
+                state.streamEnded,
+                state.decodeError,
+                state.connection is ConnectionState.Unauthorized,
+            )
     val onReconnect = {
         reconnectAttempt = 0
         reconnectNonce += 1
@@ -449,7 +468,10 @@ private class SessionController(
     // in open() -- so it is guarded by `lock` rather than getting its own.
     private val bridge: ClipboardBridge,
 ) {
-    private val client = MediaClient(mediaUrl)
+    // TODO(task 9): replace with the token from the stored-token source once
+    // that lands; this placeholder is what makes every 401 in the meantime
+    // exercise the Unauthorized path.
+    private val client = MediaClient(mediaUrl, token = PLACEHOLDER_TOKEN)
     private val gate = StreamGate()
     private val scope = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
 

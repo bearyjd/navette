@@ -61,6 +61,17 @@ internal fun SessionOverlay(
                     if (state.decodeError != null) Button(onClick = onReconnect) { Text("Reconnect") }
                     TextButton(onClick = onLeave) { Text("Back to sessions", color = Color.White) }
                 }
+                // Checked ahead of `reconnecting` and the generic dropped
+                // branch below: the daemon refused our token, so retrying is
+                // not merely unhelpful here, it is the exact silent-loop
+                // failure mode this state exists to prevent (see
+                // ReconnectPolicy.shouldRetry). The only way out is pairing
+                // again, not a reconnect button that would just be refused
+                // the same way.
+                state.connection is ConnectionState.Unauthorized -> {
+                    OverlayText("Pairing rejected -- scan the QR code again", MaterialTheme.typography.bodyLarge)
+                    TextButton(onClick = onLeave) { Text("Back to sessions", color = Color.White) }
+                }
                 reconnecting -> {
                     CircularProgressIndicator()
                     OverlayText("Connection lost -- reconnecting...", MaterialTheme.typography.bodyMedium)

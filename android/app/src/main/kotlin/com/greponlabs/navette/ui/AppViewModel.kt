@@ -72,7 +72,12 @@ sealed interface AppEvent {
  * `AppViewModelTest`.
  */
 class AppViewModel(
-    private val clientFactory: (host: String) -> NavetteApi = { host -> NavetteClient(controlWebSocketUrl(host)) },
+    private val clientFactory: (host: String) -> NavetteApi = { host ->
+        // TODO(task 9): replace with the token from the stored-token source
+        // once that lands; this placeholder is what makes every 401 in the
+        // meantime exercise the Unauthorized path.
+        NavetteClient(controlWebSocketUrl(host), token = PLACEHOLDER_TOKEN)
+    },
 ) : ViewModel() {
     private val _state = MutableStateFlow(AppUiState())
     val state: StateFlow<AppUiState> = _state.asStateFlow()
@@ -242,5 +247,13 @@ class AppViewModel(
 
     private companion object {
         const val TAG = "AppViewModel"
+
+        /**
+         * Stands in for a real bearer token until task 9 wires a
+         * stored-token source through to this view model. Every control
+         * socket authenticates with this literal until then, so it exists
+         * to be replaced, not extended.
+         */
+        const val PLACEHOLDER_TOKEN = "TODO-task-9-real-token"
     }
 }

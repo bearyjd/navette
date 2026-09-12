@@ -3,6 +3,7 @@ package com.greponlabs.navette.net
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import okhttp3.Response
@@ -68,7 +69,7 @@ class MediaClientTest {
         serverListener = RecordingServer()
         server.enqueue(MockResponse().withWebSocketUpgrade(serverListener))
         val url = server.url("/v1/sessions/work/media").toString().replaceFirst("http://", "ws://")
-        client = MediaClient(url)
+        client = MediaClient(url, token = "test-token")
     }
 
     @After
@@ -310,10 +311,40 @@ class MediaClientTest {
 
     @Test
     fun `a malformed URL fails the connection instead of crashing the caller`() {
-        val broken = MediaClient("ws://not a host:9417/v1/sessions/work/media")
+        val broken = MediaClient("ws://not a host:9417/v1/sessions/work/media", token = "test-token")
         broken.connect()
         assertTrue(broken.connectionState.value is ConnectionState.Failed)
     }
+
+    /**
+     * A rotated token otherwise produces an invisible infinite reconnect
+     * loop: the phone spins forever while the daemon refuses every attempt,
+     * read by the user as a network problem. This is the client-layer half
+     * of that fix -- ReconnectPolicyTest pins the policy half.
+     *
+     * A second, throwaway server rather than the shared `server`/`client`
+     * fixture: `setUp` already enqueues that server's one WebSocket-upgrade
+     * response, and this test needs a plain 401 instead.
+     */
+    @Test
+    fun `a 401 handshake becomes Unauthorized, not a generic failure`() =
+        runBlocking {
+            val unauthorizedServer = MockWebServer()
+            unauthorizedServer.enqueue(MockResponse().setResponseCode(401))
+            unauthorizedServer.start()
+            val unauthorizedClient =
+                MediaClient(
+                    unauthorizedServer.url("/v1/sessions/work/media").toString().replace("http", "ws"),
+                    token = "WRONG",
+                )
+            unauthorizedClient.connect()
+            val state =
+                withTimeout(5_000) {
+                    unauthorizedClient.connectionState.first { it !is ConnectionState.Connecting }
+                }
+            assertEquals(ConnectionState.Unauthorized, state)
+            unauthorizedServer.shutdown()
+        }
 
     /**
      * The precise on-device failure behind the resume-clipboard bug:
