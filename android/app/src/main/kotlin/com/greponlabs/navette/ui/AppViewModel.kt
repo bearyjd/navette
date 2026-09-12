@@ -153,6 +153,12 @@ class AppViewModel(
      * connection still goes ahead: the scanned pairing is good for this
      * session, and refusing to use it would make a device with a broken
      * keystore unusable rather than merely forgetful.
+     *
+     * The message deliberately does not promise "you will have to pair again".
+     * A failed `save` leaves whatever was stored before *intact*, so with a
+     * prior pairing the next launch auto-resumes — to the **old** host, which
+     * is a subtler wrong than not coming back at all. "May not return to this
+     * host" is true whether or not something was already stored.
      */
     private fun pair(pairing: Pairing) {
         val stored =
@@ -164,7 +170,8 @@ class AppViewModel(
             _state.update {
                 it.copy(
                     snackbarMessage =
-                        "Paired, but this pairing could not be saved — you will have to pair again next launch.",
+                        "Pairing not saved — this device may not return to this host next launch. " +
+                            "Re-pair if it doesn't.",
                 )
             }
         }

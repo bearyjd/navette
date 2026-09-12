@@ -193,7 +193,75 @@ class AppViewModelTest {
             assertEquals(testPairing, vm.state.value.pairing)
             val message = vm.state.value.snackbarMessage
             assertTrue("a pairing that was not saved must say so, got: $message", message != null)
-            assertTrue("the message must be about saving, got: $message", message!!.contains("could not be saved"))
+            assertTrue("the message must be about saving, got: $message", message!!.contains("not saved"))
+            // Must NOT promise a re-pair: a failed save leaves any prior
+            // pairing intact, so the next launch auto-resumes it -- to the old
+            // host. "You will have to pair again" would be plainly false there.
+            assertTrue("must not promise re-pairing is required, got: $message", !message.contains("will have to"))
+        }
+
+    @Test
+    fun `a failed save leaves a prior pairing intact, so the next launch resumes the old host`() =
+        runTest {
+            // This is the fact the notice's wording rests on. A failed save is
+            // not a cleared store: the previous pairing survives, and a fresh
+            // ViewModel (the next launch) auto-resumes it -- to the OLD host.
+            // So "you will have to pair again" would be false, and the honest
+            // warning is that the device may not come back to THIS host.
+            val previous = Pairing(host = "old-tower", port = 9417, token = "old-token")
+            val store = FakePairingStore(previous).apply { failOnSave = true }
+            val vm = AppViewModel(pairingStore = store, clientFactory = { fake })
+
+            vm.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.advanceUntilIdle()
+            assertEquals(testPairing, vm.state.value.pairing)
+
+            // The next launch, same store.
+            store.failOnSave = false
+            val relaunched = AppViewModel(pairingStore = store, clientFactory = { FakeNavetteApi() })
+            testScheduler.advanceUntilIdle()
+            assertEquals(
+                "the store must still hold the pairing the failed save did not replace",
+                previous,
+                relaunched.state.value.pairing,
+            )
+        }
+
+    @Test
+    fun `the unsaved-pairing notice survives the connection succeeding`() =
+        runTest {
+            // Whether the notice can actually be READ depends on what happens
+            // to snackbarMessage next. Connected does not touch it, so on the
+            // ordinary path the user sees it.
+            val store = FakePairingStore().apply { failOnSave = true }
+            val vm = AppViewModel(pairingStore = store, clientFactory = { fake })
+
+            vm.onEvent(AppEvent.Paired(testPairing))
+            fake.emit(ConnectionState.Connected)
+            testScheduler.advanceUntilIdle()
+
+            val message = vm.state.value.snackbarMessage
+            assertTrue("connecting must not clear the notice, got: $message", message != null)
+            assertTrue(message!!.contains("not saved"))
+        }
+
+    @Test
+    fun `a connection failure replaces the unsaved-pairing notice`() =
+        runTest {
+            // Documents the one case where the notice is lost: connectWithPairing's
+            // collector overwrites snackbarMessage with the failure reason. Not
+            // treated as a defect -- a connection that failed outright is the more
+            // urgent thing to show, and the pairing was not saved either way. Pinned
+            // so that a future change to snackbar handling has to decide about it
+            // deliberately rather than by accident.
+            val store = FakePairingStore().apply { failOnSave = true }
+            val vm = AppViewModel(pairingStore = store, clientFactory = { fake })
+
+            vm.onEvent(AppEvent.Paired(testPairing))
+            fake.emit(ConnectionState.Failed("connection refused"))
+            testScheduler.advanceUntilIdle()
+
+            assertEquals("connection refused", vm.state.value.snackbarMessage)
         }
 
     @Test
