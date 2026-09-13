@@ -12,7 +12,7 @@ nix = { version = "0.30", features = ["poll", "process", "signal"] }
 navette-protocol = { path = "../navette-protocol" }
 thiserror = "2"
 tracing = "0.1"
-wprs = { git = "https://github.com/bearyjd/wprs.git", rev = "5763d7464ac76103fd407921e711b17a2aac35b3" }
+wprs = { git = "https://github.com/bearyjd/wprs.git", rev = "38c61feb7b05ad196cab95f7c66c33dfa95c8eee" }
 
 [dev-dependencies]
 tempfile = "3"

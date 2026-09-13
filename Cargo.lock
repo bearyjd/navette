@@ -3111,7 +3111,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "wprs"
 version = "0.1.0"
-source = "git+https://github.com/bearyjd/wprs.git?rev=5763d7464ac76103fd407921e711b17a2aac35b3#5763d7464ac76103fd407921e711b17a2aac35b3"
+source = "git+https://github.com/bearyjd/wprs.git?rev=38c61feb7b05ad196cab95f7c66c33dfa95c8eee#38c61feb7b05ad196cab95f7c66c33dfa95c8eee"
 dependencies = [
  "anyhow",
  "bimap",
