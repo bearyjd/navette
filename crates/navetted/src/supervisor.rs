@@ -172,13 +172,19 @@ impl<R: ProcessRunner> Supervisor<R> {
         let resources = SessionResources::new(&self.xdg_runtime_dir, &self.runtime_root, &name);
         create_private_directory(&resources.runtime_dir)?;
 
+        // Both children must resolve the Wayland socket under the same
+        // directory the supervisor polls, not whatever this process inherited.
+        let runtime_env = (
+            "XDG_RUNTIME_DIR".to_string(),
+            self.xdg_runtime_dir.to_string_lossy().into_owned(),
+        );
         let daemon_spec = ProcessSpec {
             program: self.wprsd_program.clone(),
             args: vec![
                 format!("--wayland-display={}", resources.wayland_display),
                 format!("--socket={}", resources.socket_path.display()),
             ],
-            env: BTreeMap::new(),
+            env: BTreeMap::from([runtime_env.clone()]),
         };
         let daemon_pid = self.spawn(daemon_spec)?;
 
@@ -190,10 +196,13 @@ impl<R: ProcessRunner> Supervisor<R> {
         let app_spec = ProcessSpec {
             program: app.exec[0].clone(),
             args: app.exec[1..].to_vec(),
-            env: BTreeMap::from([(
-                "WAYLAND_DISPLAY".to_string(),
-                resources.wayland_display.clone(),
-            )]),
+            env: BTreeMap::from([
+                runtime_env,
+                (
+                    "WAYLAND_DISPLAY".to_string(),
+                    resources.wayland_display.clone(),
+                ),
+            ]),
         };
         let app_pid = match self.spawn(app_spec) {
             Ok(pid) => pid,
@@ -453,6 +462,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let runtime = temp.path().join("runtime");
         fs::create_dir_all(&runtime).unwrap();
+        let runtime_env = runtime.to_string_lossy().into_owned();
         let runner = Arc::new(FakeRunner::new(runtime));
         let supervisor = harness(runner.clone(), &temp);
 
@@ -467,8 +477,36 @@ mod tests {
         assert_eq!(state.spawned[1].program, "firefox");
         assert_eq!(
             state.spawned[1].env,
-            BTreeMap::from([("WAYLAND_DISPLAY".into(), "navette-work".into())])
+            BTreeMap::from([
+                ("WAYLAND_DISPLAY".into(), "navette-work".into()),
+                ("XDG_RUNTIME_DIR".into(), runtime_env.clone()),
+            ])
         );
+    }
+
+    /// `--runtime-dir` moves where the supervisor waits for the Wayland socket;
+    /// both children must be told the same directory or wprsd creates the
+    /// socket under the inherited `XDG_RUNTIME_DIR` and readiness times out.
+    #[tokio::test]
+    async fn spawned_processes_receive_the_supervisor_runtime_dir() {
+        let temp = TempDir::new().unwrap();
+        let runtime = temp.path().join("runtime");
+        fs::create_dir_all(&runtime).unwrap();
+        let runner = Arc::new(FakeRunner::new(runtime.clone()));
+        let supervisor = harness(runner.clone(), &temp);
+
+        supervisor.start(&app(), Some("work")).await.unwrap();
+
+        let expected = runtime.to_string_lossy().into_owned();
+        let state = runner.state.lock().unwrap();
+        for spec in &state.spawned {
+            assert_eq!(
+                spec.env.get("XDG_RUNTIME_DIR"),
+                Some(&expected),
+                "{} was spawned without the supervisor's runtime dir",
+                spec.program
+            );
+        }
     }
 
     #[tokio::test]

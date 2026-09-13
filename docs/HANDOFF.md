@@ -2766,7 +2766,7 @@ un-ceilinged on its own receive side, so rebuild `../wprs` when you rebuild
 `navetted`. And the earlier sections in this file that cite `5763d74` describe the
 sessions they date from; they are history, not the current pin.
 
-## `--runtime-dir` does not reach the spawned wprsd (2026-09-13)
+## `--runtime-dir` did not reach the spawned wprsd: fixed (2026-09-13)
 
 Found while running the loopback E2E for the pin bump, cost three failed
 attempts. `navetted --runtime-dir X` changes where the supervisor *waits* for a
@@ -2778,13 +2778,14 @@ session sockets before timeout". The `wprs.sock` path *does* honor the
 override, which is why the flag looks half-working: one of the two sockets
 lands where expected.
 
-Only bites when the flag's value differs from the environment, which is
-exactly the isolated-daemon case. Workaround until fixed: set
-`XDG_RUNTIME_DIR=X` on `navetted` itself instead of passing `--runtime-dir`.
-The fix is one line in `supervisor.rs` (`.env("XDG_RUNTIME_DIR", ...)` on the
-wprsd command alongside the existing `WAYLAND_DISPLAY` at `:194`) plus a test
-that the spawned command carries it. Two more harness notes from the same
-runs: the scratchpad path is too long for a Unix socket (`SUN_LEN`, 108
+Only bit when the flag's value differed from the environment, which is
+exactly the isolated-daemon case. Fixed the same day: the supervisor now puts
+`XDG_RUNTIME_DIR=<runtime dir>` in the env of **both** children (wprsd needs
+it to place the socket, the app needs it to find `WAYLAND_DISPLAY`), pinned by
+`spawned_processes_receive_the_supervisor_runtime_dir`. Verified by rerunning
+the exact invocation that timed out: session came up, `navette-<name>` landed
+under the override, nothing leaked into the real runtime dir, viewer at ~82
+FPS. Two more harness notes from the same runs: the scratchpad path is too long for a Unix socket (`SUN_LEN`, 108
 bytes), so use a short dir under `/run/user/<uid>`; and `wprsd` execs
 `xwayland-xdg-shell` from `PATH` by default, so prepend `../wprs/target/release`
 or use a `wprsd.ron` with `enable_xwayland: false`.
