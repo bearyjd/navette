@@ -25,7 +25,8 @@ track this until merged, see that section for what to do once it lands.
 
 Ran `navetted` + a freshly-built `wprsd`/`wprsc` (pinned rev
 `5763d7464ac76103fd407921e711b17a2aac35b3`, matching `navette-bridge`'s
-`Cargo.toml`) against this machine's live KDE Plasma Wayland session, and
+`Cargo.toml` at the time; the pin has since moved to `38c61fe`, see "wprs
+allocation ceilings: landed") against this machine's live KDE Plasma Wayland session, and
 `navette run org.mozilla.firefox` for real. This is the first time any of
 this has touched real hardware.
 
@@ -1450,7 +1451,8 @@ on-device coverage until a phone was actually plugged in.
 Stood up real end-to-end test infrastructure on this machine to make that
 possible: cloned and built `wprsd`/`wprsc`/`xwayland-xdg-shell` fresh at
 `../wprs` (sibling to this repo, pinned rev `5763d746` matching
-`crates/navette-bridge/Cargo.toml`), built this repo's own
+`crates/navette-bridge/Cargo.toml` at the time; the pin has since moved to
+`38c61fe`, so rebuild `../wprs` from that rev, not this one), built this repo's own
 `navetted`/`navette` fresh (**do not use `~/.local/bin/navetted`** — that's
 an unrelated binary of the same name, a "Claude Code" pairing daemon, not
 this project's daemon; a real naming collision on this machine that cost a
@@ -2763,6 +2765,29 @@ spawns is whatever `--wprsd` points at; a `wprsd` built before `38c61fe` is
 un-ceilinged on its own receive side, so rebuild `../wprs` when you rebuild
 `navetted`. And the earlier sections in this file that cite `5763d74` describe the
 sessions they date from; they are history, not the current pin.
+
+## `--runtime-dir` does not reach the spawned wprsd (2026-09-13)
+
+Found while running the loopback E2E for the pin bump, cost three failed
+attempts. `navetted --runtime-dir X` changes where the supervisor *waits* for a
+session's Wayland socket (`supervisor.rs:271`, `resources.wayland_socket` is
+built from the override) but the spawned `wprsd` still inherits the process
+environment's `XDG_RUNTIME_DIR`, so smithay creates `navette-<name>` under the
+real runtime dir and `wait_for_ready` times out with "wprsd did not create
+session sockets before timeout". The `wprs.sock` path *does* honor the
+override, which is why the flag looks half-working: one of the two sockets
+lands where expected.
+
+Only bites when the flag's value differs from the environment, which is
+exactly the isolated-daemon case. Workaround until fixed: set
+`XDG_RUNTIME_DIR=X` on `navetted` itself instead of passing `--runtime-dir`.
+The fix is one line in `supervisor.rs` (`.env("XDG_RUNTIME_DIR", ...)` on the
+wprsd command alongside the existing `WAYLAND_DISPLAY` at `:194`) plus a test
+that the spawned command carries it. Two more harness notes from the same
+runs: the scratchpad path is too long for a Unix socket (`SUN_LEN`, 108
+bytes), so use a short dir under `/run/user/<uid>`; and `wprsd` execs
+`xwayland-xdg-shell` from `PATH` by default, so prepend `../wprs/target/release`
+or use a `wprsd.ron` with `enable_xwayland: false`.
 
 ## On-device pairing verification: not done (2026-09-12)
 
