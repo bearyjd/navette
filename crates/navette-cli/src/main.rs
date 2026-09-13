@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use navette_auth::SecretString;
 use navette_cli::{Client, render_result};
 use navette_protocol::{AttachInfo, RequestCommand, ResponseResult};
 use nix::sys::signal::{Signal, kill};
@@ -30,6 +31,14 @@ struct Cli {
     /// SSH host used to forward the wprs Unix socket for attach.
     #[arg(long, env = "NAVETTE_SSH", global = true)]
     ssh: Option<String>,
+
+    /// API token. Defaults to the local token file for a loopback --url.
+    #[arg(long, env = "NAVETTE_TOKEN", global = true)]
+    token: Option<SecretString>,
+
+    /// Override the API token file path. Must match navetted's --token-file.
+    #[arg(long, global = true)]
+    token_file: Option<PathBuf>,
 
     /// wprsc executable.
     #[arg(long, default_value = "wprsc", global = true)]
@@ -66,6 +75,21 @@ enum Command {
         /// Session name to kill.
         session: String,
     },
+    /// Show the API token, optionally as a QR code for phone pairing.
+    ///
+    /// Local admin command: it reads the daemon's token file directly, so it
+    /// only works on the host running navetted.
+    Token {
+        /// Render a QR code carrying host, port and token.
+        #[arg(long)]
+        qr: bool,
+        /// Generate a new token, invalidating every paired client.
+        #[arg(long)]
+        rotate: bool,
+        /// The name or address the phone should dial.
+        #[arg(long)]
+        advertise_host: Option<String>,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -78,7 +102,31 @@ struct AttachRecord {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let client = Client::new(&cli.url);
+    // `token` is a local admin command that reads the daemon's token file
+    // directly and never dials the daemon, so it must not force token
+    // resolution: on a remote --url that would demand an explicit --token
+    // for no reason, since this command never sends one anywhere.
+    if let Command::Token {
+        qr,
+        rotate,
+        advertise_host,
+    } = cli.command
+    {
+        return show_token(
+            &cli.url,
+            qr,
+            rotate,
+            advertise_host.as_deref(),
+            cli.token_file.as_deref(),
+        );
+    }
+
+    let token = navette_auth::resolve_token(
+        &cli.url,
+        cli.token.as_ref().map(SecretString::as_str),
+        cli.token_file.as_deref(),
+    )?;
+    let client = Client::new(&cli.url, token);
     match cli.command {
         Command::Ls => print_result(client.call(RequestCommand::ListSessions).await?),
         Command::Run { app, name } => print_result(
@@ -93,7 +141,153 @@ async fn main() -> Result<()> {
         Command::Kill { session } => {
             print_result(client.call(RequestCommand::Kill { session }).await?)
         }
+        Command::Token { .. } => unreachable!("handled above"),
     }
+}
+
+fn show_token(
+    url: &str,
+    qr: bool,
+    rotate: bool,
+    advertise_host: Option<&str>,
+    token_file: Option<&Path>,
+) -> Result<()> {
+    // Resolve everything QR rendering needs before touching the token file:
+    // `--rotate` invalidates every paired client, and `load_or_create` may
+    // write a brand-new token to disk, so a fallible check like the advertise
+    // host must run first. Otherwise a failure here would leave the operator
+    // with an invalidated or newly-minted token they were never shown.
+    let advertised_endpoint = if qr {
+        Some(advertised_endpoint(url, advertise_host)?)
+    } else {
+        None
+    };
+
+    // Honours `--token-file` for the same reason the client paths do: an
+    // operator running `navetted --token-file /X` who is shown the token from
+    // the default path gets a QR the daemon rejects, which presents as a
+    // pairing bug rather than a mismatched flag.
+    let path = match token_file {
+        Some(path) => path.to_path_buf(),
+        None => navette_auth::default_token_path().context("cannot determine a token path")?,
+    };
+    let token = if rotate {
+        let token = navette_auth::AuthToken::rotate(&path)?;
+        eprintln!("Token rotated. Every paired client must pair again.");
+        eprintln!("Restart navetted for this to take effect: it holds the value in memory.");
+        token
+    } else {
+        navette_auth::AuthToken::load_or_create(&path)?
+    };
+
+    // The token is printed BEFORE anything else that can fail. Host resolution
+    // already happens above the rotate, but `QrCode::new` is fallible too, and
+    // leaving it between the rotation and the print reopens the same hole one
+    // call later: the operator loses every pairing and never sees the
+    // replacement. The QR cannot be built earlier -- its payload contains the
+    // token -- so the ordering is the fix.
+    println!("{}", token.render_grouped());
+
+    if let Some((host, port)) = advertised_endpoint {
+        let uri = pairing_uri(&host, port, &token.render());
+        match qrcode::QrCode::new(uri.as_bytes()) {
+            Ok(code) => {
+                println!(
+                    "{}",
+                    code.render::<qrcode::render::unicode::Dense1x2>().build()
+                );
+            }
+            // Degrade rather than fail: the token above is what pairing needs,
+            // and the QR is a convenience for typing it.
+            Err(error) => {
+                eprintln!("could not render a QR code ({error}); pair with the token above");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The `(host, port)` pair the QR tells the phone to dial.
+///
+/// Both come from `--url`; `--advertise-host` overrides the host only, and
+/// carries no port of its own. That asymmetry is the thing operators get wrong
+/// — `--advertise-host tower.ts.net` against a daemon on a non-default port
+/// yields a QR saying 9417 — so it is pinned here rather than left implicit in
+/// `show_token`. The table in docs/RUNBOOK.md documents exactly this function.
+///
+/// The port is `port_or_known_default()`, not `port().unwrap_or(9417)`. The QR
+/// must describe the endpoint `--url` describes, and `ws://tower/v1/ws` means
+/// port 80 to every WebSocket client alive — substituting 9417 there would have
+/// the QR quietly advertise somewhere `--url` does not point. A user who typed
+/// that has a broken URL, and it should fail where they can see it rather than
+/// be rewritten into a QR that scans and then cannot connect.
+fn advertised_endpoint(url: &str, advertise_host: Option<&str>) -> Result<(String, u16)> {
+    let parsed = url::Url::parse(url).context("could not parse --url")?;
+    let port = parsed
+        .port_or_known_default()
+        .context("--url has no port and its scheme has no default; give it an explicit port")?;
+    let host = resolve_advertise_host(url, advertise_host)?;
+    Ok((host, port))
+}
+
+fn pairing_uri(host: &str, port: u16, token: &str) -> String {
+    format!("navette://pair?host={host}&port={port}&token={token}")
+}
+
+/// The daemon cannot derive its own reachable name: the phone connects over the
+/// tailnet, where that is a MagicDNS name or tailnet IP, not `uname -n`, and
+/// there is no Tailscale integration to ask. So use the URL host when it is
+/// already a specific non-loopback address, and otherwise refuse.
+fn resolve_advertise_host(url: &str, advertise: Option<&str>) -> Result<String> {
+    let host = match advertise {
+        Some(host) => host.to_owned(),
+        None => {
+            let parsed = url::Url::parse(url).context("could not parse --url")?;
+            let host = parsed.host_str().context("--url has no host")?;
+            // Match on `url::Host`, not on `host_str()` — the same fix
+            // `resolve_token` carries in navette-auth, for the same reason: for
+            // an IPv6 URL `host_str()` returns the *bracketed* form `[::1]`,
+            // which `IpAddr::parse` rejects, so a string-parsing check quietly
+            // classifies `ws://[::1]:9417/...` as a reachable address and emits
+            // a QR pointing the phone at its own loopback.
+            //
+            // Unspecified addresses are refused alongside loopback: `0.0.0.0`
+            // and `::` name what the daemon binds, not somewhere a phone can
+            // dial. They are the more likely mistake of the two, since that is
+            // exactly what an operator exposing the daemon to a tailnet puts in
+            // `--bind`.
+            let is_undialable = match parsed.host() {
+                Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+                Some(url::Host::Ipv4(address)) => address.is_loopback() || address.is_unspecified(),
+                Some(url::Host::Ipv6(address)) => address.is_loopback() || address.is_unspecified(),
+                None => false,
+            };
+            if is_undialable {
+                bail!(
+                    "--url points at {host}, which the phone cannot dial — loopback and unspecified addresses describe this host's own binding, not a reachable destination; pass --advertise-host with the name or address the phone should dial"
+                );
+            }
+            host.to_owned()
+        }
+    };
+
+    // Validated once, at the single exit, because the property that matters is
+    // what reaches `pairing_uri` -- not which branch produced it. Validating only
+    // the explicit flag leaves the --url path open: `&` is NOT a forbidden host
+    // code point in the WHATWG URL spec the `url` crate implements, so
+    // `--url ws://tower&evil.example:9417/v1/ws` survives `host_str()` intact.
+    //
+    // Validate rather than percent-encode: `pairing_uri` interpolates this
+    // straight into a query string, so `&`, `#`, `?` or `/` would yield a URI
+    // the Android parser reads differently than intended. Encoding would force
+    // the phone side to share a decoding convention; rejecting needs no
+    // agreement between them. No real hostname or IP contains these characters
+    // -- brackets and colons are allowed for IPv6 literals.
+    let legal = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']');
+    if host.is_empty() || !host.chars().all(legal) {
+        bail!("{host:?} is not a valid hostname or address");
+    }
+    Ok(host)
 }
 
 fn print_result(result: ResponseResult) -> Result<()> {
@@ -391,5 +585,241 @@ mod tests {
     fn rejects_session_path_traversal_for_tracking() {
         assert!(validate_session_component("../../record").is_err());
         assert!(validate_session_component("work_browser-2").is_ok());
+    }
+
+    #[test]
+    fn parses_token_with_flags() {
+        let cli = Cli::try_parse_from([
+            "navette",
+            "token",
+            "--qr",
+            "--rotate",
+            "--advertise-host",
+            "tower.ts.net",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Token { qr, rotate, advertise_host }
+                if qr && rotate && advertise_host.as_deref() == Some("tower.ts.net")
+        ));
+    }
+
+    #[test]
+    fn builds_a_pairing_uri() {
+        assert_eq!(
+            pairing_uri("tower.example.ts.net", 9417, "ABCD1234ABCD1234ABCD1234"),
+            "navette://pair?host=tower.example.ts.net&port=9417&token=ABCD1234ABCD1234ABCD1234"
+        );
+    }
+
+    #[test]
+    fn uses_a_specific_non_loopback_url_host_when_no_flag_is_given() {
+        // Reachable by construction: the client is already talking to it.
+        let host = resolve_advertise_host("ws://100.64.0.3:9417/v1/ws", None).unwrap();
+        assert_eq!(host, "100.64.0.3");
+    }
+
+    #[test]
+    fn requires_the_flag_for_the_ipv6_loopback_address() {
+        // The sibling of the `resolve_token` bug in navette-auth: `host_str()`
+        // on an IPv6 URL returns the bracketed `[::1]`, which `IpAddr::parse`
+        // rejects -- so the old string-parsing check called this reachable and
+        // emitted a QR pointing the phone at its own loopback. This test fails
+        // against that version.
+        let error = resolve_advertise_host("ws://[::1]:9417/v1/ws", None).unwrap_err();
+        assert!(error.to_string().contains("--advertise-host"), "{error}");
+    }
+
+    #[test]
+    fn requires_the_flag_for_unspecified_addresses() {
+        // `0.0.0.0` and `::` name what the daemon binds, not somewhere a phone
+        // can dial -- and they are what an operator exposing the daemon to a
+        // tailnet actually puts in --bind, so this is the likelier mistake.
+        for url in [
+            "ws://0.0.0.0:9417/v1/ws",
+            "ws://[::]:9417/v1/ws",
+            "ws://[::0]:9417/v1/ws",
+        ] {
+            let error = resolve_advertise_host(url, None).unwrap_err();
+            assert!(
+                error.to_string().contains("--advertise-host"),
+                "{url} must be refused: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn still_accepts_specific_routable_addresses() {
+        // The companion to the two refusals above: a fix that rejected every
+        // address would pass both and break the only path that works. A global
+        // IPv6 address in particular must survive the new `url::Host` match.
+        for (url, expected) in [
+            ("ws://100.64.0.3:9417/v1/ws", "100.64.0.3"),
+            ("ws://[fd7a::1]:9417/v1/ws", "[fd7a::1]"),
+            ("ws://[2606:4700::1111]:9417/v1/ws", "[2606:4700::1111]"),
+            ("ws://tower.ts.net:9417/v1/ws", "tower.ts.net"),
+        ] {
+            assert_eq!(
+                resolve_advertise_host(url, None).unwrap(),
+                expected,
+                "expected {url} to be dialable"
+            );
+        }
+    }
+
+    #[test]
+    fn the_flag_still_wins_over_an_undialable_url() {
+        // Refusing the --url host must not refuse the whole command: naming the
+        // host explicitly is exactly the documented remedy, including for the
+        // 0.0.0.0 bind that provokes it.
+        assert_eq!(
+            resolve_advertise_host("ws://0.0.0.0:9417/v1/ws", Some("tower.ts.net")).unwrap(),
+            "tower.ts.net"
+        );
+        assert_eq!(
+            resolve_advertise_host("ws://[::1]:9417/v1/ws", Some("tower.ts.net")).unwrap(),
+            "tower.ts.net"
+        );
+    }
+
+    #[test]
+    fn the_advertised_port_is_the_one_the_url_actually_means() {
+        // `ws://tower/v1/ws` dials port 80 in every WebSocket client, so that
+        // is what the QR must say. `port().unwrap_or(9417)` claimed 9417 --
+        // a QR advertising somewhere --url does not point.
+        //
+        // The 80 case looks wrong at a glance, and that is the point: a user
+        // who typed a portless --url has a broken URL, and it should fail
+        // visibly rather than be silently rewritten into a scannable QR that
+        // then cannot connect.
+        assert_eq!(
+            advertised_endpoint("ws://tower.ts.net:9417/v1/ws", None).unwrap(),
+            ("tower.ts.net".to_owned(), 9417)
+        );
+        assert_eq!(
+            advertised_endpoint("ws://tower.ts.net/v1/ws", None).unwrap(),
+            ("tower.ts.net".to_owned(), 80)
+        );
+        assert_eq!(
+            advertised_endpoint("wss://tower.ts.net/v1/ws", None).unwrap(),
+            ("tower.ts.net".to_owned(), 443)
+        );
+    }
+
+    #[test]
+    fn requires_the_flag_when_the_url_host_is_loopback() {
+        // A QR saying 127.0.0.1 scans cleanly and then fails to connect, which
+        // presents as an auth bug. Refuse rather than guess.
+        let error = resolve_advertise_host("ws://127.0.0.1:9417/v1/ws", None).unwrap_err();
+        assert!(error.to_string().contains("--advertise-host"));
+    }
+
+    #[test]
+    fn the_flag_always_wins() {
+        let host =
+            resolve_advertise_host("ws://127.0.0.1:9417/v1/ws", Some("tower.ts.net")).unwrap();
+        assert_eq!(host, "tower.ts.net");
+    }
+
+    #[test]
+    fn rejects_an_advertise_host_containing_an_ampersand() {
+        // `&` would let a crafted --advertise-host inject an extra query
+        // parameter into the navette://pair URI.
+        let error = resolve_advertise_host("ws://127.0.0.1:9417/v1/ws", Some("tower&evil.example"))
+            .unwrap_err();
+        assert!(error.to_string().contains("tower&evil.example"));
+    }
+
+    #[test]
+    fn rejects_an_advertise_host_containing_a_hash() {
+        // `#` would truncate the URI at the Android side's fragment parser,
+        // silently dropping the token from what gets read.
+        let error =
+            resolve_advertise_host("ws://127.0.0.1:9417/v1/ws", Some("tower#evil")).unwrap_err();
+        assert!(error.to_string().contains("tower#evil"));
+    }
+
+    #[test]
+    fn rejects_an_empty_advertise_host() {
+        let error = resolve_advertise_host("ws://127.0.0.1:9417/v1/ws", Some("")).unwrap_err();
+        assert!(error.to_string().contains("not a valid hostname"));
+    }
+
+    #[test]
+    fn rejects_an_ampersand_carried_in_via_url_when_no_flag_is_given() {
+        // Validation must apply regardless of which branch produced the host:
+        // `&` is not a forbidden host code point in the WHATWG URL spec, so it
+        // survives `Url::host_str()` intact and would otherwise reach
+        // `pairing_uri` unvalidated on this path. This is the regression this
+        // test guards -- it fails against a version that only validates the
+        // explicit `--advertise-host` branch.
+        let error = resolve_advertise_host("ws://tower&evil.example:9417/v1/ws", None).unwrap_err();
+        assert!(error.to_string().contains("tower&evil.example"));
+    }
+
+    #[test]
+    fn accepts_ordinary_advertise_host_values() {
+        for host in ["tower.ts.net", "my-tower.ts.net", "100.64.0.3", "[fd7a::1]"] {
+            assert_eq!(
+                resolve_advertise_host("ws://127.0.0.1:9417/v1/ws", Some(host)).unwrap(),
+                host,
+                "expected {host} to be accepted"
+            );
+        }
+    }
+
+    /// Pins the table in docs/RUNBOOK.md's `navette token` section, row for
+    /// row. An operator following it must get a QR that dials the right place
+    /// on the first try, and the trap is that `--advertise-host` overrides the
+    /// host but never the port.
+    #[test]
+    fn the_qr_endpoint_matches_what_the_runbook_documents() {
+        const DEFAULT_URL: &str = "ws://127.0.0.1:9417/v1/ws";
+
+        // Loopback --url, no flag: an error naming the flag, not a guess.
+        let error = advertised_endpoint(DEFAULT_URL, None).unwrap_err();
+        assert!(error.to_string().contains("--advertise-host"));
+
+        // Loopback --url plus the flag: the flag's host, the --url port.
+        assert_eq!(
+            advertised_endpoint(DEFAULT_URL, Some("tower.ts.net")).unwrap(),
+            ("tower.ts.net".to_owned(), 9417)
+        );
+
+        // A specific non-loopback --url, no flag: both come from --url.
+        assert_eq!(
+            advertised_endpoint("ws://tower.ts.net:19417/v1/ws", None).unwrap(),
+            ("tower.ts.net".to_owned(), 19417)
+        );
+
+        // The flag wins on host, and the port still rides on --url. This is
+        // the row the runbook's worked example exists for.
+        assert_eq!(
+            advertised_endpoint("ws://127.0.0.1:19417/v1/ws", Some("tower.ts.net")).unwrap(),
+            ("tower.ts.net".to_owned(), 19417)
+        );
+
+        // A portless --url means the scheme's default port, not 9417. This row
+        // asserted 9417 when it was first written, which encoded the bug in
+        // `port().unwrap_or(9417)`: `ws://tower.ts.net/v1/ws` dials 80 in every
+        // WebSocket client, so a QR saying 9417 described an endpoint --url did
+        // not point at. See `the_advertised_port_is_the_one_the_url_actually_means`.
+        assert_eq!(
+            advertised_endpoint("ws://tower.ts.net/v1/ws", None).unwrap(),
+            ("tower.ts.net".to_owned(), 80)
+        );
+    }
+
+    #[test]
+    fn qr_encoder_accepts_a_realistic_pairing_uri() {
+        // This is what catches a payload the encoder rejects outright, distinct
+        // from the string-building checked by `builds_a_pairing_uri`.
+        let uri = pairing_uri(
+            "tower.example.ts.net",
+            9417,
+            "000G40R40M30E209185GR38E-ABCD",
+        );
+        assert!(qrcode::QrCode::new(uri.as_bytes()).is_ok());
     }
 }

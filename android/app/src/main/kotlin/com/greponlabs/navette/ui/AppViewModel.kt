@@ -1,11 +1,18 @@
 package com.greponlabs.navette.ui
 
+import android.content.Context
 import android.util.Log
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import com.greponlabs.navette.net.ConnectionState
+import com.greponlabs.navette.net.EncryptedPairingStore
 import com.greponlabs.navette.net.NavetteApi
 import com.greponlabs.navette.net.NavetteClient
+import com.greponlabs.navette.net.Pairing
+import com.greponlabs.navette.net.PairingStore
 import com.greponlabs.navette.net.controlWebSocketUrl
 import com.greponlabs.navette.protocol.App
 import com.greponlabs.navette.protocol.RequestCommand
@@ -24,7 +31,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 data class AppUiState(
-    val host: String = "",
+    val pairing: Pairing? = null,
     val connection: ConnectionState = ConnectionState.Disconnected,
     val apps: List<App> = emptyList(),
     val sessions: List<Session> = emptyList(),
@@ -35,9 +42,16 @@ data class AppUiState(
 )
 
 sealed interface AppEvent {
-    data class HostChanged(val host: String) : AppEvent
+    /** A pairing was just obtained -- by scanning a QR code or by manual entry. Saves and connects. */
+    data class Paired(val pairing: Pairing) : AppEvent
 
-    data object Connect : AppEvent
+    /**
+     * Retries the current pairing without asking the user to scan or type it
+     * again. Only meaningful after a transient [ConnectionState.Failed] --
+     * [ConnectionState.Unauthorized] means the stored token was rejected, and
+     * resending it would just fail the same way.
+     */
+    data object Reconnect : AppEvent
 
     data object Refresh : AppEvent
 
@@ -61,18 +75,23 @@ sealed interface AppEvent {
 /**
  * Owns the one [NavetteApi] control connection this app uses, and which
  * session (if any) is currently attached. Single-host only, no
- * reconnect/backoff.
+ * reconnect/backoff beyond [AppEvent.Reconnect].
  *
  * Media state is deliberately not here: `SessionScreen` owns its own
  * `MediaClient` and decoder, and this ViewModel stays the control-channel
  * owner it has always been.
  *
- * [clientFactory] defaults to a real [NavetteClient] but is overridable so
- * tests can inject a fake instead of standing up real networking -- see
- * `AppViewModelTest`.
+ * [pairingStore] is the single source of truth for host, port and token --
+ * see [AppEvent.Paired] and the `init` block below, which resumes the last
+ * pairing on every fresh launch of this ViewModel. [clientFactory] defaults
+ * to a real [NavetteClient] but is overridable so tests can inject a fake
+ * instead of standing up real networking -- see `AppViewModelTest`.
  */
 class AppViewModel(
-    private val clientFactory: (host: String) -> NavetteApi = { host -> NavetteClient(controlWebSocketUrl(host)) },
+    private val pairingStore: PairingStore,
+    private val clientFactory: (pairing: Pairing) -> NavetteApi = { pairing ->
+        NavetteClient(controlWebSocketUrl(pairing.host, pairing.port), token = pairing.token)
+    },
 ) : ViewModel() {
     private val _state = MutableStateFlow(AppUiState())
     val state: StateFlow<AppUiState> = _state.asStateFlow()
@@ -92,10 +111,24 @@ class AppViewModel(
     // which request was actually newer.
     private var refreshJob: Job? = null
 
+    init {
+        // Resumes the last pairing on every fresh launch -- this is what
+        // makes "kill the app, reopen it" retry the stored token rather than
+        // sitting on an empty ConnectScreen until the user re-scans. Guarded:
+        // EncryptedPairingStore's prefs are built lazily on first touch, and
+        // this is the first call to reach it in the app's lifetime, so a
+        // keystore failure here must yield "no pairing, show ConnectScreen"
+        // rather than crashing startup.
+        runCatching { pairingStore.load() }
+            .onFailure { Log.w(TAG, "failed to load a stored pairing: ${it.message}") }
+            .getOrNull()
+            ?.let { connectWithPairing(it) }
+    }
+
     fun onEvent(event: AppEvent) {
         when (event) {
-            is AppEvent.HostChanged -> _state.update { it.copy(host = event.host) }
-            AppEvent.Connect -> connect()
+            is AppEvent.Paired -> pair(event.pairing)
+            AppEvent.Reconnect -> reconnect()
             AppEvent.Refresh -> refresh()
             is AppEvent.RunApp -> runApp(event.appId)
             is AppEvent.AttachSession -> attachSession(event.session)
@@ -107,17 +140,89 @@ class AppViewModel(
         }
     }
 
-    private fun connect() {
-        val host = _state.value.host.trim()
-        if (host.isEmpty()) return
+    /**
+     * Guarded for the same reason `init`'s [PairingStore.load] is, and it is
+     * the more dangerous of the two: `by lazy` does not memoize a thrown
+     * initializer, so [EncryptedPairingStore]'s prefs re-throw on every touch
+     * once the keystore has failed. This call runs on the main thread inside
+     * the QR scanner's success callback, where an escaping exception is a
+     * crash immediately after a successful scan.
+     *
+     * A pairing that could not be stored must not read as one that succeeded,
+     * so the failure is surfaced rather than logged and swallowed. The
+     * connection still goes ahead: the scanned pairing is good for this
+     * session, and refusing to use it would make a device with a broken
+     * keystore unusable rather than merely forgetful.
+     *
+     * The message is about the *next launch* and nothing else, which is now the
+     * whole of what goes wrong: [reconnect] prefers the active pairing, so
+     * Retry within this session reaches the host the user just paired with
+     * rather than the stale stored one. What a failed `save` still costs is
+     * persistence — a failed save leaves whatever was stored before intact, so
+     * the next launch resumes that (or shows ConnectScreen if there was
+     * nothing). Either way this pairing is not remembered, which is what the
+     * message says and all it says.
+     */
+    private fun pair(pairing: Pairing) {
+        val stored =
+            runCatching { pairingStore.save(pairing) }
+                .onFailure { Log.w(TAG, "failed to save the pairing: ${it.message}") }
+                .isSuccess
+        connectWithPairing(pairing)
+        if (!stored) {
+            _state.update {
+                it.copy(
+                    snackbarMessage = "Pairing not saved — this device won't remember it next launch.",
+                )
+            }
+        }
+    }
 
+    /**
+     * Retries the pairing currently in use, falling back to storage only when
+     * there is none.
+     *
+     * The order matters. The active pairing and the stored one diverge exactly
+     * when a `save` failed — [pair] deliberately carries on with the new
+     * pairing — so reloading from storage first would silently reconnect to the
+     * *old* host, or, with an empty store, do nothing at all and leave Retry
+     * looking broken. Retrying what the user is actually connected with is both
+     * the obvious reading of the button and the only one that is right in that
+     * case.
+     *
+     * The storage path stays for the launch where `init`'s load failed or found
+     * nothing: a keystore that recovers between then and the button press is
+     * worth a second attempt. It is guarded like [pair] — a user-initiated
+     * retry must not crash on a button press — and a failure there is surfaced,
+     * since a Retry that silently does nothing is indistinguishable from a
+     * broken button.
+     */
+    private fun reconnect() {
+        _state.value.pairing?.let {
+            connectWithPairing(it)
+            return
+        }
+        runCatching { pairingStore.load() }
+            .onFailure { error ->
+                Log.w(TAG, "failed to load a stored pairing: ${error.message}")
+                _state.update {
+                    it.copy(
+                        snackbarMessage = "Could not read the saved pairing. Scan the pairing code again.",
+                    )
+                }
+            }
+            .getOrNull()
+            ?.let { connectWithPairing(it) }
+    }
+
+    private fun connectWithPairing(pairing: Pairing) {
         connectionJob?.cancel()
         refreshJob?.cancel()
         client?.close()
         // A reconnect must not leave the user on a session screen belonging to
         // the connection being replaced.
-        _state.update { it.copy(activeSession = null) }
-        val newClient = clientFactory(host)
+        _state.update { it.copy(pairing = pairing, activeSession = null) }
+        val newClient = clientFactory(pairing)
         client = newClient
 
         connectionJob =
@@ -240,7 +345,13 @@ class AppViewModel(
         client?.close()
     }
 
-    private companion object {
-        const val TAG = "AppViewModel"
+    companion object {
+        private const val TAG = "AppViewModel"
+
+        /** Builds this ViewModel with a real [EncryptedPairingStore] backed by [context]. */
+        fun factory(context: Context): ViewModelProvider.Factory =
+            viewModelFactory {
+                initializer { AppViewModel(pairingStore = EncryptedPairingStore(context.applicationContext)) }
+            }
     }
 }

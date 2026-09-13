@@ -17,13 +17,19 @@ struct Arguments {
     #[arg(long, default_value = "127.0.0.1:9417")]
     bind: SocketAddr,
 
-    /// Acknowledge that binding the unauthenticated M1 API beyond loopback is unsafe.
+    /// Acknowledge that binding the API beyond loopback exposes it to the whole
+    /// network, not only the tailnet. The API requires a token, but the transport
+    /// is plaintext.
     #[arg(long)]
     allow_remote: bool,
 
     /// Override the persistent session registry path.
     #[arg(long)]
     state_file: Option<PathBuf>,
+
+    /// Override the API token file path.
+    #[arg(long)]
+    token_file: Option<PathBuf>,
 
     /// Override XDG_RUNTIME_DIR for session sockets.
     #[arg(long)]
@@ -54,10 +60,22 @@ fn init_tracing() {
 async fn main() -> Result<()> {
     init_tracing();
     let arguments = Arguments::parse();
-    if !arguments.bind.ip().is_loopback() && !arguments.allow_remote {
-        bail!(
-            "refusing non-loopback bind {}; pass --allow-remote to acknowledge M1 has no authentication",
-            arguments.bind
+    if !arguments.bind.ip().is_loopback() {
+        if !arguments.allow_remote {
+            bail!(
+                "refusing non-loopback bind {}; pass --allow-remote to acknowledge the transport is plaintext",
+                arguments.bind
+            );
+        }
+        // Design §9: the acknowledgement earns a loud startup warning rather
+        // than silent exposure. The flag is passed once and then lives in a
+        // unit file nobody rereads, so the log line is the only thing that
+        // keeps the exposure visible on every subsequent start.
+        tracing::warn!(
+            address = %arguments.bind,
+            "--allow-remote: the API is reachable beyond loopback and the transport is plaintext — \
+             the bearer token and every session's traffic cross the network unencrypted. \
+             Bind loopback and tunnel over SSH or a tailnet unless this is deliberate."
         );
     }
 
@@ -87,7 +105,17 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("failed to bind {}", arguments.bind))?;
     tracing::info!(address = %arguments.bind, apps = app_count, "navetted listening");
-    let state = ApiState::new(apps, supervisor);
+    let token_path = match arguments.token_file {
+        Some(path) => path,
+        None => navette_auth::default_token_path().context("cannot determine a token path")?,
+    };
+    let auth = Arc::new(
+        navette_auth::AuthToken::load_or_create(&token_path)
+            .context("failed to load the API token")?,
+    );
+    // Never log the value itself.
+    tracing::info!(path = %token_path.display(), "API token loaded");
+    let state = ApiState::new(apps, supervisor, auth);
     state.start_existing_bridges();
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())

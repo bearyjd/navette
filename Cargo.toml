@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/navette-protocol",
     "crates/navette-bridge",
+    "crates/navette-auth",
     "crates/navetted",
     "crates/navette-cli",
     "crates/navette-viewer",

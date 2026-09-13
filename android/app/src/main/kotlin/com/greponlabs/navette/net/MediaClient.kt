@@ -67,7 +67,7 @@ internal fun packetBudgetKib(packet: MediaPacket, budgetKib: Int): Int {
  * before [connect] but invoked on OkHttp's reader thread, so whatever it does
  * must itself be safe to run there.
  */
-class MediaClient(private val webSocketUrl: String) {
+class MediaClient(private val webSocketUrl: String, private val token: String) {
     private val httpClient =
         OkHttpClient.Builder()
             // OkHttp fails the socket if a ping goes unanswered for a whole
@@ -135,6 +135,7 @@ class MediaClient(private val webSocketUrl: String) {
                 Request.Builder()
                     .url(webSocketUrl)
                     .addHeader("Sec-WebSocket-Protocol", MEDIA_WEBSOCKET_SUBPROTOCOL)
+                    .addHeader("Authorization", "Bearer $token")
                     .build()
             } catch (error: IllegalArgumentException) {
                 _connectionState.value = ConnectionState.Failed(error.message ?: "invalid host")
@@ -401,7 +402,17 @@ class MediaClient(private val webSocketUrl: String) {
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: OkHttpResponse?) {
-                _connectionState.value = ConnectionState.Failed(t.message ?: "connection failed")
+                // A rotated token otherwise produces an invisible infinite
+                // reconnect loop: the phone spins forever while the daemon
+                // refuses every attempt, read by the user as a network
+                // problem. Distinguishing Unauthorized here is what lets
+                // ReconnectPolicy.shouldRetry make that terminal.
+                _connectionState.value =
+                    if (response?.code == 401) {
+                        ConnectionState.Unauthorized
+                    } else {
+                        ConnectionState.Failed(t.message ?: "connection failed")
+                    }
                 endStream()
             }
 

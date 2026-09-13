@@ -74,7 +74,16 @@ pub struct MediaClient {
 impl MediaClient {
     /// Connects to `url` (`ws://host/v1/sessions/{session}/media`), negotiates
     /// the media subprotocol and asks the bridge for an immediate keyframe.
-    pub async fn connect(url: &str, factory: DecoderFactory) -> Result<Self, ClientError> {
+    ///
+    /// `token` is required, not optional: navetted now authenticates every
+    /// route, and a caller that could silently connect without a credential
+    /// would be the client-side counterpart of the loopback exemption the
+    /// server explicitly refuses to grant.
+    pub async fn connect(
+        url: &str,
+        token: &str,
+        factory: DecoderFactory,
+    ) -> Result<Self, ClientError> {
         let mut request = url
             .into_client_request()
             .map_err(|error| ClientError::Connect(Box::new(error)))?;
@@ -82,6 +91,17 @@ impl MediaClient {
             .parse()
             .map_err(|_| ClientError::Subprotocol)?;
         request.headers_mut().insert(SUBPROTOCOL_HEADER, protocol);
+        // Not an `expect`: that claim holds for `AuthToken::render`'s output but
+        // not for what reaches here, which may have come straight from `--token`
+        // or `NAVETTE_TOKEN`. `NAVETTE_TOKEN=$'ABC\n'` is enough to make the
+        // header value invalid, and panicking on user input is a crash where the
+        // CLI reports an error.
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {token}")
+                .parse()
+                .map_err(|_| ClientError::InvalidToken)?,
+        );
         let (socket, response) = connect_async(request)
             .await
             .map_err(|error| ClientError::Connect(Box::new(error)))?;
@@ -507,6 +527,10 @@ pub enum ClientError {
     Connect(Box<tokio_tungstenite::tungstenite::Error>),
     #[error("server did not negotiate the {MEDIA_WEBSOCKET_SUBPROTOCOL} subprotocol")]
     Subprotocol,
+    #[error(
+        "the token is not a valid HTTP header value; check --token / NAVETTE_TOKEN for stray whitespace or newlines"
+    )]
+    InvalidToken,
     #[error("failed to encode input: {0}")]
     Encode(serde_json::Error),
     #[error("failed to send input: {0}")]

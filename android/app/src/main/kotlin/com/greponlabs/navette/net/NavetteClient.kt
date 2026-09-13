@@ -29,6 +29,13 @@ sealed interface ConnectionState {
     data object Connected : ConnectionState
 
     data class Failed(val reason: String) : ConnectionState
+
+    /**
+     * The daemon refused our token. Terminal: retrying cannot succeed until the
+     * user pairs again, and retrying anyway produces a silent infinite loop
+     * that looks to the user like a network problem.
+     */
+    data object Unauthorized : ConnectionState
 }
 
 /**
@@ -63,7 +70,7 @@ interface NavetteApi {
  * multi-host management are explicitly out of scope here (see
  * android/README.md and this session's PR description).
  */
-class NavetteClient(private val webSocketUrl: String) : NavetteApi {
+class NavetteClient(private val webSocketUrl: String, private val token: String) : NavetteApi {
     private val httpClient =
         OkHttpClient.Builder()
             .pingInterval(20, TimeUnit.SECONDS)
@@ -83,6 +90,7 @@ class NavetteClient(private val webSocketUrl: String) : NavetteApi {
                 Request.Builder()
                     .url(webSocketUrl)
                     .addHeader("Sec-WebSocket-Protocol", CONTROL_WEBSOCKET_SUBPROTOCOL)
+                    .addHeader("Authorization", "Bearer $token")
                     .build()
             } catch (error: IllegalArgumentException) {
                 // A malformed webSocketUrl (okhttp throws IllegalArgumentException
@@ -159,7 +167,19 @@ class NavetteClient(private val webSocketUrl: String) : NavetteApi {
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: OkHttpResponse?) {
-                _connectionState.value = ConnectionState.Failed(t.message ?: "connection failed")
+                // NavetteClient has no reconnect loop of its own to stop
+                // (see this class's doc comment), so distinguishing
+                // Unauthorized here is purely about surfacing: the user must
+                // see "pairing rejected", not a generic connection failure
+                // they would otherwise blame on the network. When
+                // reconnection is added here, it inherits the terminal rule
+                // ReconnectPolicy already enforces for the media path.
+                _connectionState.value =
+                    if (response?.code == 401) {
+                        ConnectionState.Unauthorized
+                    } else {
+                        ConnectionState.Failed(t.message ?: "connection failed")
+                    }
                 failAllPending(t)
             }
 
@@ -187,8 +207,17 @@ class NavetteClient(private val webSocketUrl: String) : NavetteApi {
 internal fun formatAuthorityHost(host: String): String =
     if (host.count { it == ':' } >= 2 && !host.startsWith("[")) "[$host]" else host
 
+/**
+ * The port `navetted` listens on by default. Shared by [controlWebSocketUrl]
+ * and [mediaWebSocketUrl] as their default, and by manual pairing entry
+ * (`ConnectScreen`) when the user has no reason to type anything but the
+ * host -- there is one definition of "default" rather than two literals that
+ * can drift apart.
+ */
+const val DEFAULT_NAVETTE_PORT = 9417
+
 /** Builds the control-channel WebSocket URL for [host]:[port]. */
-fun controlWebSocketUrl(host: String, port: Int = 9417): String =
+fun controlWebSocketUrl(host: String, port: Int = DEFAULT_NAVETTE_PORT): String =
     "ws://${formatAuthorityHost(host)}:$port$CONTROL_WEBSOCKET_PATH"
 
 /**
@@ -199,5 +228,5 @@ fun controlWebSocketUrl(host: String, port: Int = 9417): String =
  * (`validate_session_name`, `crates/navetted/src/registry.rs:267-281`), so
  * the only names that can reach here are already URL-path-safe.
  */
-fun mediaWebSocketUrl(host: String, session: String, port: Int = 9417): String =
+fun mediaWebSocketUrl(host: String, session: String, port: Int = DEFAULT_NAVETTE_PORT): String =
     "ws://${formatAuthorityHost(host)}:$port/v1/sessions/$session/media"

@@ -13,6 +13,7 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
+navette-auth = { path = "../navette-auth" }
 # Upstream, not a fork: emoon/rust_minifb#429 merged on 2026-08-29 and carries
 # all three Wayland keyboard fixes found during navette's live testing --
 # shifted-level keysyms being dropped, a failed present skipping the key-repeat
@@ -42,6 +43,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 axum = { version = "0.8", features = ["ws"] }
 # The end-to-end test drives a real navetted media endpoint and a real encoder
 # rather than a hand-rolled stand-in; both are test-only collaborators.
+# navette-auth is now a real [dependencies] entry (the viewer binary resolves
+# a token to authenticate), so it is not repeated here.
 navette-bridge = { path = "../navette-bridge" }
 navetted = { path = "../navetted" }
 tempfile = "3"

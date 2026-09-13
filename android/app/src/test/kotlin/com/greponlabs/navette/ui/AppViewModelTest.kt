@@ -2,6 +2,8 @@ package com.greponlabs.navette.ui
 
 import com.greponlabs.navette.net.ConnectionState
 import com.greponlabs.navette.net.NavetteApi
+import com.greponlabs.navette.net.Pairing
+import com.greponlabs.navette.net.PairingStore
 import com.greponlabs.navette.protocol.ApiError
 import com.greponlabs.navette.protocol.App
 import com.greponlabs.navette.protocol.AttachInfo
@@ -63,6 +65,33 @@ private class FakeNavetteApi : NavetteApi {
     }
 }
 
+/** Hand-written fake, per this project's testing convention -- no mocking framework. */
+private class FakePairingStore(initial: Pairing? = null) : PairingStore {
+    private var stored: Pairing? = initial
+
+    // Models EncryptedPairingStore under a failed keystore. `by lazy` does not
+    // memoize a thrown initializer, so the real store re-throws on every
+    // touch rather than failing once -- hence a sticky flag, not a one-shot.
+    var failOnSave = false
+    var failOnLoad = false
+
+    override fun load(): Pairing? {
+        if (failOnLoad) throw IllegalStateException("keystore unavailable")
+        return stored
+    }
+
+    override fun save(pairing: Pairing) {
+        if (failOnSave) throw IllegalStateException("keystore unavailable")
+        stored = pairing
+    }
+
+    override fun clear() {
+        stored = null
+    }
+}
+
+private val testPairing = Pairing(host = "tower", port = 9417, token = "test-token")
+
 private val testSession =
     Session(
         name = "work",
@@ -86,7 +115,7 @@ class AppViewModelTest {
     fun setUp() {
         Dispatchers.setMain(StandardTestDispatcher())
         fake = FakeNavetteApi()
-        viewModel = AppViewModel(clientFactory = { fake })
+        viewModel = AppViewModel(pairingStore = FakePairingStore(), clientFactory = { fake })
     }
 
     @After
@@ -106,8 +135,7 @@ class AppViewModelTest {
                 }
             }
 
-            viewModel.onEvent(AppEvent.HostChanged("tower"))
-            viewModel.onEvent(AppEvent.Connect)
+            viewModel.onEvent(AppEvent.Paired(testPairing))
             fake.emit(ConnectionState.Connected)
             testScheduler.advanceUntilIdle()
 
@@ -122,21 +150,20 @@ class AppViewModelTest {
     @Test
     fun `reconnecting closes the previous client and stops listening to its state`() =
         runTest {
-            // clientFactory is invoked once per connect() call, on the SAME
+            // clientFactory is invoked once per pairing, on the SAME
             // ViewModel instance -- this is the actual regression shape
-            // (a user retrying Connect), not two independent ViewModels.
+            // (a user re-pairing), not two independent ViewModels.
             val firstClient = FakeNavetteApi()
             val secondClient = FakeNavetteApi()
             val clients = ArrayDeque(listOf(firstClient, secondClient))
-            val vm = AppViewModel(clientFactory = { clients.removeFirst() })
+            val vm = AppViewModel(pairingStore = FakePairingStore(), clientFactory = { clients.removeFirst() })
 
-            vm.onEvent(AppEvent.HostChanged("tower"))
-            vm.onEvent(AppEvent.Connect)
+            vm.onEvent(AppEvent.Paired(testPairing))
             firstClient.emit(ConnectionState.Connected)
             testScheduler.advanceUntilIdle()
             assertEquals(ConnectionState.Connected, vm.state.value.connection)
 
-            vm.onEvent(AppEvent.Connect)
+            vm.onEvent(AppEvent.Paired(testPairing))
             testScheduler.advanceUntilIdle()
             assertTrue("connect() must close the client it is replacing", firstClient.closed)
 
@@ -150,10 +177,188 @@ class AppViewModelTest {
         }
 
     @Test
+    fun `a pairing that cannot be saved still connects, and says so`() =
+        runTest {
+            // The crash path this guards: keystore fails, init catches it and
+            // shows ConnectScreen, the user scans a QR, and save() throws out
+            // of the scanner's main-thread success callback. `by lazy` does not
+            // memoize a thrown initializer, so the real store throws here even
+            // though init already absorbed one failure.
+            val store = FakePairingStore().apply { failOnSave = true }
+            val vm = AppViewModel(pairingStore = store, clientFactory = { fake })
+
+            vm.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.advanceUntilIdle()
+
+            assertEquals(testPairing, vm.state.value.pairing)
+            val message = vm.state.value.snackbarMessage
+            assertTrue("a pairing that was not saved must say so, got: $message", message != null)
+            assertTrue("the message must be about saving, got: $message", message!!.contains("not saved"))
+            // The message is about the next launch and nothing else. It must
+            // not claim the user has to pair again (a prior pairing survives a
+            // failed save, so the next launch resumes that), nor say anything
+            // about this session -- Retry now prefers the active pairing, so
+            // reconnecting here reaches the right host.
+            assertTrue("must not promise re-pairing is required, got: $message", !message.contains("will have to"))
+            assertTrue("must scope the warning to the next launch, got: $message", message.contains("next launch"))
+        }
+
+    @Test
+    fun `a failed save leaves a prior pairing intact, so the next launch resumes the old host`() =
+        runTest {
+            // This is the fact the notice's wording rests on. A failed save is
+            // not a cleared store: the previous pairing survives, and a fresh
+            // ViewModel (the next launch) auto-resumes it -- to the OLD host.
+            // So "you will have to pair again" would be false, and the honest
+            // warning is that the device may not come back to THIS host.
+            val previous = Pairing(host = "old-tower", port = 9417, token = "old-token")
+            val store = FakePairingStore(previous).apply { failOnSave = true }
+            val vm = AppViewModel(pairingStore = store, clientFactory = { fake })
+
+            vm.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.advanceUntilIdle()
+            assertEquals(testPairing, vm.state.value.pairing)
+
+            // The next launch, same store.
+            store.failOnSave = false
+            val relaunched = AppViewModel(pairingStore = store, clientFactory = { FakeNavetteApi() })
+            testScheduler.advanceUntilIdle()
+            assertEquals(
+                "the store must still hold the pairing the failed save did not replace",
+                previous,
+                relaunched.state.value.pairing,
+            )
+        }
+
+    @Test
+    fun `the unsaved-pairing notice survives the connection succeeding`() =
+        runTest {
+            // Whether the notice can actually be READ depends on what happens
+            // to snackbarMessage next. Connected does not touch it, so on the
+            // ordinary path the user sees it.
+            val store = FakePairingStore().apply { failOnSave = true }
+            val vm = AppViewModel(pairingStore = store, clientFactory = { fake })
+
+            vm.onEvent(AppEvent.Paired(testPairing))
+            fake.emit(ConnectionState.Connected)
+            testScheduler.advanceUntilIdle()
+
+            val message = vm.state.value.snackbarMessage
+            assertTrue("connecting must not clear the notice, got: $message", message != null)
+            assertTrue(message!!.contains("not saved"))
+        }
+
+    @Test
+    fun `a connection failure replaces the unsaved-pairing notice`() =
+        runTest {
+            // Documents the one case where the notice is lost: connectWithPairing's
+            // collector overwrites snackbarMessage with the failure reason. Not
+            // treated as a defect -- a connection that failed outright is the more
+            // urgent thing to show, and the pairing was not saved either way. Pinned
+            // so that a future change to snackbar handling has to decide about it
+            // deliberately rather than by accident.
+            val store = FakePairingStore().apply { failOnSave = true }
+            val vm = AppViewModel(pairingStore = store, clientFactory = { fake })
+
+            vm.onEvent(AppEvent.Paired(testPairing))
+            fake.emit(ConnectionState.Failed("connection refused"))
+            testScheduler.advanceUntilIdle()
+
+            assertEquals("connection refused", vm.state.value.snackbarMessage)
+        }
+
+    @Test
+    fun `a reconnect whose stored pairing cannot be read reports it instead of throwing`() =
+        runTest {
+            // Reaches the storage path only because there is no active pairing:
+            // an empty store means init connected to nothing, so Retry has
+            // nothing in state to prefer. init's load() is already guarded;
+            // this is the second touch, on a user-initiated Retry, which was not.
+            val store = FakePairingStore()
+            val vm = AppViewModel(pairingStore = store, clientFactory = { fake })
+            store.failOnLoad = true
+
+            vm.onEvent(AppEvent.Reconnect)
+            testScheduler.advanceUntilIdle()
+
+            val message = vm.state.value.snackbarMessage
+            assertTrue("a failed read must be surfaced, got: $message", message != null)
+            assertTrue("the message must point at re-pairing, got: $message", message!!.contains("pairing code"))
+        }
+
+    @Test
+    fun `retry after a failed save reconnects to the new host, not the stored one`() =
+        runTest {
+            // The trap this closes: pair() deliberately carries on with the new
+            // pairing when save fails, but Retry used to reload from storage --
+            // so it silently reconnected to the OLD host, with no indication
+            // that it had gone somewhere other than where the user just paired.
+            val previous = Pairing(host = "old-tower", port = 9417, token = "old-token")
+            val store = FakePairingStore(previous)
+            val clients = mutableListOf<Pairing>()
+            val vm =
+                AppViewModel(
+                    pairingStore = store,
+                    clientFactory = { pairing ->
+                        clients.add(pairing)
+                        FakeNavetteApi()
+                    },
+                )
+            store.failOnSave = true
+
+            vm.onEvent(AppEvent.Paired(testPairing))
+            vm.onEvent(AppEvent.Reconnect)
+            testScheduler.advanceUntilIdle()
+
+            assertEquals(testPairing, vm.state.value.pairing)
+            assertEquals(
+                "Retry must redial the pairing in use, not the stale stored one",
+                testPairing,
+                clients.last(),
+            )
+            assertTrue(
+                "the stale pairing must never be dialled after the new one",
+                clients.indexOf(previous) < clients.indexOf(testPairing),
+            )
+        }
+
+    @Test
+    fun `retry with an empty store and no active pairing does nothing but say so`() =
+        runTest {
+            // The other half of the old trap: with nothing on disk, Retry was
+            // a no-op button. It still cannot connect -- there is genuinely
+            // nothing to connect to -- but it must not look broken.
+            val store = FakePairingStore()
+            val vm = AppViewModel(pairingStore = store, clientFactory = { fake })
+
+            vm.onEvent(AppEvent.Reconnect)
+            testScheduler.advanceUntilIdle()
+
+            assertEquals(null, vm.state.value.pairing)
+        }
+
+    @Test
+    fun `a store that fails on every touch does not crash construction or pairing`() =
+        runTest {
+            // Both guards together, in the order the broken-keystore device
+            // actually hits them: construction, then a scan.
+            val store = FakePairingStore().apply {
+                failOnLoad = true
+                failOnSave = true
+            }
+            val vm = AppViewModel(pairingStore = store, clientFactory = { fake })
+
+            vm.onEvent(AppEvent.Paired(testPairing))
+            vm.onEvent(AppEvent.Reconnect)
+            testScheduler.advanceUntilIdle()
+
+            assertEquals(testPairing, vm.state.value.pairing)
+        }
+
+    @Test
     fun `dismissing an older snackbar message does not clear a newer one`() =
         runTest {
-            viewModel.onEvent(AppEvent.HostChanged("tower"))
-            viewModel.onEvent(AppEvent.Connect)
+            viewModel.onEvent(AppEvent.Paired(testPairing))
             fake.emit(ConnectionState.Failed("first error"))
             testScheduler.advanceUntilIdle()
             assertEquals("first error", viewModel.state.value.snackbarMessage)
@@ -173,8 +378,7 @@ class AppViewModelTest {
     @Test
     fun `running an app that the server rejects surfaces the server's error message`() =
         runTest {
-            viewModel.onEvent(AppEvent.HostChanged("tower"))
-            viewModel.onEvent(AppEvent.Connect)
+            viewModel.onEvent(AppEvent.Paired(testPairing))
             fake.responseFor = { Response(1, ResponseOutcome.Ok(ResponseResult.Apps(emptyList()))) }
             fake.emit(ConnectionState.Connected)
             testScheduler.advanceUntilIdle()
@@ -197,8 +401,7 @@ class AppViewModelTest {
 
     /** Connects and drains the post-Connect refresh, leaving the drawer showing. */
     private fun TestScope.connectAndSettle() {
-        viewModel.onEvent(AppEvent.HostChanged("tower"))
-        viewModel.onEvent(AppEvent.Connect)
+        viewModel.onEvent(AppEvent.Paired(testPairing))
         fake.responseFor = { Response(1, ResponseOutcome.Ok(ResponseResult.Sessions(emptyList()))) }
         fake.emit(ConnectionState.Connected)
         testScheduler.advanceUntilIdle()
@@ -317,7 +520,7 @@ class AppViewModelTest {
             testScheduler.advanceUntilIdle()
             assertEquals("work", viewModel.state.value.activeSession)
 
-            viewModel.onEvent(AppEvent.Connect)
+            viewModel.onEvent(AppEvent.Paired(testPairing))
             testScheduler.advanceUntilIdle()
 
             assertEquals(

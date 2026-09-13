@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Legacy backup rules, used on API 23-30 (`android:fullBackupContent`).
+    The API 31+ equivalent is data_extraction_rules.xml, and BOTH are needed:
+    minSdk is 26 and targetSdk is 36, so each path is live on some device.
+
+    navette_pairing.xml is EncryptedSharedPreferences. Its ciphertext backs up
+    happily; its Android Keystore master key does not, because keystore keys
+    are non-exportable by design. So a restore or device transfer produces a
+    file that can never be decrypted, and every load() and save() throws from
+    then on — permanently, since `by lazy` does not memoize a thrown
+    initializer. The app degrades to "pairing never works on this device again"
+    with no in-app way out.
+
+    Excluding it means a restored device starts with no pairing and shows
+    ConnectScreen, which is correct: re-scanning the QR takes seconds, and the
+    token is a credential that arguably should not ride a cloud backup anyway.
+-->
+<full-backup-content>
+    <exclude
+        domain="sharedpref"
+        path="navette_pairing.xml" />
+</full-backup-content>

@@ -20,10 +20,12 @@ To reach it from a phone or another machine, bind a **tailnet** address:
 ./target/release/navetted --bind <tailnet-ip>:9417 --allow-remote
 ```
 
-> `--allow-remote` exists because the M1 control API is **unauthenticated**.
-> Binding beyond loopback exposes session control — list, run, kill — to
-> anything that can reach the address. A tailnet is the intended boundary;
-> there is no TLS termination, gateway, or auth in the path.
+> `--allow-remote` acknowledges that binding beyond loopback exposes the API
+> to the whole network the address is reachable on, not only the tailnet.
+> Every route now requires the bearer token described in Pairing below — there
+> is no unauthenticated control surface any more — but the transport itself is
+> still plaintext: there is no TLS termination or gateway in the path, so a
+> tailnet (WireGuard-encrypted) remains the intended boundary.
 
 ### Client connection
 
@@ -33,7 +35,149 @@ navette run <app-id>
 navette-viewer --url ws://<host>:9417
 ```
 
-Android: enter the host in the connect screen, pick an app from the drawer.
+Android: scan the daemon's pairing QR (or enter host/token manually), pick an
+app from the drawer. See Pairing below.
+
+## Pairing
+
+Every route requires a bearer token — `/healthz` included, no loopback
+exemption. This is what an operator needs to generate, present, and rotate
+one.
+
+### Where the token lives
+
+`$XDG_STATE_HOME/navette/token` (falls back to `~/.local/state/navette/token`
+when `XDG_STATE_HOME` is unset), created mode `0600` the first time
+`navetted` starts and finds none there. It is deliberately its own file, not
+folded into `registry.json` — that file sets no explicit mode and so lands at
+the umask default (typically `0644`), which is not a place to keep a secret.
+
+A token file that exists but cannot be read or parsed is a **fatal startup
+error**, not a trigger to mint a fresh one: silently regenerating on a
+corrupt read would invalidate every paired client the moment a disk hiccup or
+a truncated write touched the file, and the only symptom would be every
+device failing at once. Fail loudly, name the path, and let a human decide to
+rotate.
+
+A token file that is **group- or other-readable is refused**, by the daemon and
+by the clients alike, naming the path and the mode. It is created `0600`; a
+later `chmod` or a restore from a backup that flattened modes is the way it
+stops being one, and a secret every local account can read is not a credential.
+Fix with `chmod 600` on the path the error names.
+
+**Only `navetted` and `navette token` ever create the file.** `navette` and
+`navette-viewer` read it and error if it is absent, naming `navette token`.
+This asymmetry is deliberate. If a client minted one, then deleting the token
+file under a running daemon would play out like this: the daemon still holds
+the old value in memory, `navette ls` writes a brand-new one and gets a 401,
+and restarting the daemon to "fix" that makes it adopt the new value —
+invalidating every paired phone, with nothing in the logs explaining why.
+
+### `navette token`
+
+Local admin command: it reads the daemon's token file directly rather than
+dialling the daemon over the API, so it works whether or not `navetted` is
+currently running, and it only ever operates on **this machine's** token file.
+Add `--token-file <path>` if `navetted` was started with one.
+
+`--url` is a global flag and so applies here too — but it means something
+different for this command than for `navette ls`. Nothing is dialled; `--url`
+is read purely as *a description of the endpoint the phone should dial*, and
+**both** the host and the port in the QR come from it. It defaults to
+`ws://127.0.0.1:9417/v1/ws`.
+
+```bash
+navette token                                       # print it
+navette token --qr                                  # print it, then render a QR
+navette token --qr --advertise-host tower.ts.net    # QR says tower.ts.net:9417
+navette token --qr --url ws://tower.ts.net:19417/v1/ws  # QR says tower.ts.net:19417
+navette token --rotate                              # generate a new one
+navette token --rotate --qr --advertise-host <host> # rotate and re-pair in one step
+```
+
+- **`--qr`** renders a `navette://pair?host=…&port=…&token=…` URI as a
+  terminal QR code, so one scan on the phone delivers the whole connection,
+  not just the secret. The token always prints first, above the QR — if
+  rendering the QR fails, that degrades to a warning rather than losing the
+  token, so a QR failure never means the operator doesn't get the token at
+  all.
+- **`--advertise-host`** overrides the **host** the phone should dial. The
+  command cannot work this out on its own: the phone reaches the daemon over
+  the tailnet, at a MagicDNS name or tailnet IP that has nothing to do with the
+  machine's own hostname — and this command never talks to `navetted`, so it
+  cannot see what address it bound either. What it has is `--url`, and the
+  rule is:
+
+  | `--url` host | `--advertise-host` | QR host |
+  |---|---|---|
+  | loopback (the default), or `localhost` | absent | **error**, naming the flag |
+  | unspecified — `0.0.0.0`, `::` | absent | **error**, naming the flag |
+  | loopback or unspecified | given | the flag's value |
+  | a specific routable address | absent | the `--url` host |
+  | a specific routable address | given | the flag's value |
+
+  The errors are deliberate: a QR saying `127.0.0.1` scans cleanly and then
+  fails to connect, which presents as an auth bug. `0.0.0.0` and `::` are the
+  likelier mistake — they are what you put in `--bind` to expose the daemon —
+  and they name what the daemon *binds*, not anywhere a phone can dial.
+
+  **`--advertise-host` does not carry a port.** The port in the QR always comes
+  from `--url`, so a daemon on a non-default port needs `--url` set, with or
+  without the flag. `--url` at its default gives 9417; a `--url` with **no**
+  port gives the scheme's default (`ws://` → 80, `wss://` → 443), not 9417,
+  because that is the endpoint such a URL actually names:
+
+  ```bash
+  # navetted --bind 0.0.0.0:19417 --allow-remote, phone dials tower.ts.net
+  navette token --qr --url ws://tower.ts.net:19417/v1/ws
+  # equivalently, keeping --url loopback and naming the host explicitly:
+  navette token --qr --url ws://127.0.0.1:19417/v1/ws --advertise-host tower.ts.net
+  ```
+- **`--rotate`** generates a fresh token and invalidates every paired
+  client — Android, `navette`, `navette-viewer`, all of them, immediately on
+  disk.
+
+### Rotation takes effect on daemon restart
+
+The running `navetted` holds the token in memory and does not watch the
+token file, so `--rotate` changes what's on disk immediately but the running
+daemon keeps accepting the *old* token until it's restarted. **After
+rotating, both steps are required:**
+
+1. Restart `navetted`.
+2. Re-pair every client that isn't reading the fresh file itself — the
+   Android app, and any `navette`/`navette-viewer` invocation using
+   `--token`/`NAVETTE_TOKEN` rather than the local file.
+
+There is no partial or soft rotation. Any device not re-paired after the
+restart gets a 401 on its next request.
+
+### Remote clients need an explicit token
+
+`navette` and `navette-viewer` read the local token file by default, but
+only when `--url` points at loopback. The moment `--url` points somewhere
+else, an explicit `--token` (or `NAVETTE_TOKEN`) is **required** — there is
+no silent fallback to the local file on a remote URL, because sending this
+host's token to a remote daemon would hand the credential to whatever is
+actually listening there.
+
+```bash
+navette --url ws://100.x.x.x:9417/v1/ws --token <token> ls
+NAVETTE_TOKEN=<token> navette-viewer --url ws://100.x.x.x:9417
+```
+
+A rejected token reports itself as such and names `navette token`; it is not a
+bare `HTTP error: 401`, which used to read like the daemon was down.
+
+Both clients also take `--token-file <path>`, matching `navetted`'s. Use it
+whenever the daemon was started with one — otherwise the clients read the
+default path and present a token the daemon will reject.
+
+Android pairs by scanning the QR from `navette token --qr`, or by manual
+host/token entry as a fallback for devices without Google Play Services.
+Either path produces the same stored pairing; scanning a new QR (or entering
+one manually) replaces whatever was paired before, since the app holds one
+host at a time.
 
 ## Health checks
 
@@ -47,9 +191,44 @@ Android: enter the host in the connect screen, pick an app from the drawer.
 
 <!-- END AUTO-GENERATED -->
 
+`/healthz` requires the bearer token like every other route, so a bare `curl`
+gets a 401 and `-f` exits non-zero — reporting a perfectly healthy daemon as
+dead. Send the header:
+
 ```bash
-curl -fsS http://127.0.0.1:9417/healthz
+curl -fsS -H "Authorization: Bearer $(navette token)" http://127.0.0.1:9417/healthz
 ```
+
+`navette token` prints the grouped form (`ABCD-1234-…`); the daemon strips the
+dashes before comparing, so it can be passed through as-is.
+
+**Run this as the user `navetted` runs as.** `navette token` resolves the token
+from `$XDG_STATE_HOME`/`$HOME`, and — unlike `navette ls` — it *creates* the
+file when it finds none, because it is the local admin command that legitimately
+mints one. So a liveness check running under a monitoring service account reads
+*that* account's state directory, mints a stray token there, prints it, and
+401s: a healthy daemon reported as dead, which is the whole failure this check
+exists to avoid.
+
+The token file is `0600` and owned by the daemon user, so there is no form of
+this check that an unprivileged monitoring account can run on its own. It needs
+root or the daemon user either way:
+
+```bash
+# -i, not -u: a login shell resets HOME. With plain `sudo -u`, HOME survives
+# whenever sudoers sets always_set_home off or env_keep includes HOME, and
+# `navette token` then mints a stray token under the *invoking* user.
+curl -fsS -H "Authorization: Bearer $(sudo -iu navette navette token)" \
+  http://127.0.0.1:9417/healthz
+
+# Or read the file directly, which mints nothing at all — the safer option for
+# a monitoring hook, and the one to prefer if the check runs unattended.
+curl -fsS -H "Authorization: Bearer $(sudo cat ~navette/.local/state/navette/token)" \
+  http://127.0.0.1:9417/healthz
+```
+
+If `navetted` was started with `--token-file`, pass the same path to the
+client: `navette token --token-file <path>`, or read that path directly.
 
 There is no metrics endpoint, no Prometheus scrape, and no alerting
 integration. Observability is `RUST_LOG` output plus the client-side HUD.

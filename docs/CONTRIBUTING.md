@@ -21,6 +21,18 @@ Android work additionally needs JDK 17 (temurin) and Android SDK
 Rust edition is **2024** with workspace resolver **3**, so a recent toolchain
 is required.
 
+`navetted` requires a bearer token on every request, including `/healthz` —
+anything you run against it locally (`curl`, a manual client, an ad hoc
+script) needs one too. Get one from a `navetted` you've started:
+
+```bash
+navette token
+```
+
+That prints (and, on first run, creates) this machine's token; pass it as
+`--token` or `NAVETTE_TOKEN` to whatever you're dialling the daemon with. See
+`docs/RUNBOOK.md`'s Pairing section for the full picture, including rotation.
+
 ## Commands
 
 <!-- AUTO-GENERATED: from Cargo.toml, android/gradlew, .github/workflows/ci.yml -->

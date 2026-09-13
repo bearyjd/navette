@@ -4,6 +4,7 @@ pub mod api;
 pub mod app_index;
 pub mod bridge;
 pub mod clipboard;
+pub mod guard;
 pub mod media;
 pub mod registry;
 pub mod supervisor;

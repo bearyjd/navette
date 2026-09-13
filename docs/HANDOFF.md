@@ -2592,3 +2592,326 @@ verified as pre-existing or by-design, and none was introduced by the fix wave.
   governs is documented under check 5 above — refusal between 16 and 32 KiB,
   teardown above 32 KiB, and a client-side guard that now keeps sends at or
   under 16 KiB so neither is reached.
+
+## CRITICAL — any web page can drive the daemon, in the default configuration (2026-09-12)
+
+**FIXED (commit `f82c7e9`, `feat/hardening`).** `navetted` now refuses any request
+carrying an `Origin` header with 403, on every route including `/healthz`, closing
+the hole described below. Independently E2E-verified against a live debug daemon:
+`/healthz` and `/v1/sessions/{s}/media` both return 403 with an `Origin` header
+present (empty `Origin` also 403) and behave normally without one. The reasoning
+below is left in place — it's still why the fix takes the shape it does, and it's
+the source of the "no loopback exemption" rule the token in the entries below
+inherits.
+
+Found while designing API-wide auth. **This is live in shipped code on master and
+needs no flags to reach** — it is the documented default, not a misconfiguration.
+
+`grep -rn "origin\|Origin\|cors\|Host"` across `crates/navetted/src/` returns
+nothing. The router (`api.rs:77-80`) carries no middleware of any kind.
+`media_websocket` (`api.rs:84`) validates a session name and nothing else;
+`websocket` (`api.rs:252`) requires a WebSocket subprotocol, which is **not** a
+defense because a browser sets one with `new WebSocket(url, [...])`.
+
+Browsers do not apply CORS preflight to WebSocket handshakes — they open the
+connection and leave rejection to the server. So while `navetted` runs on loopback,
+any page the user visits can attach to `/v1/sessions/{s}/media`, receive the screen,
+and inject input. Session names are user-chosen and guessable, and the control
+socket enumerates sessions anyway. The blob routes in
+`specs/2026-09-11-bulk-transport-design.md` would inherit this: a cross-origin POST
+with a simple content type fires without preflight.
+
+**Fix (item 0 of the hardening branch):** reject any request carrying an `Origin`
+header outright — navette has no browser client, so a blanket rejection is correct
+rather than a policy to tune — plus `Host` validation against the expected authority
+to blunt DNS rebinding. Router-wide middleware, small, and independent of every auth
+decision.
+
+**Design consequence, recorded because it nearly shipped:** an "unauthenticated
+loopback, token for remote" split was about to be proposed on the reasoning that a
+loopback TCP port is equivalent to a 0700 Unix socket. It is not. A 0700 socket is
+unreachable from a web page; a loopback port is not. **The token applies to every
+route with no loopback exemption.**
+
+## Hardening branch — shape agreed 2026-09-12
+
+Decided to fold all three items into one reviewed branch rather than hotfix item 0
+separately: one coherent security story, one review pass.
+
+0. `Origin` rejection + `Host` validation (above).
+1. API-wide bearer token, no loopback exemption. Its own 0600 file — **not**
+   `registry.json`, which sets no explicit mode and so lands at umask default
+   (typically 0644).
+2. `uncompressed_size` ceilings, below — two call sites, two values.
+
+**Update (2026-09-12): all three items are designed, implemented, and reviewed.**
+Items 0 and 1 are landed on `feat/hardening`; item 2 is implemented and reviewed but
+not yet buildable here — see "wprs allocation ceilings are implemented but
+unpushed" further down for why. One deviation from this plan worth flagging: item 0
+as actually built does **not** include `Host` validation. That was reversed during
+design, not dropped by accident —
+`docs/superpowers/specs/2026-09-12-hardening-design.md` §2 records why: a browser
+always sends `Origin` on a WebSocket handshake, so the `Origin` rule alone already
+closes DNS rebinding, and a `Host` allowlist would additionally break the ordinary
+case of a client dialling a tailnet name the daemon has no way to recognise.
+
+Scope note found during orientation and accepted: the Android app persists
+**nothing** (no DataStore, no SharedPreferences anywhere under
+`android/app/src/main/kotlin/`), and `ConnectScreen.kt:24` explicitly defers a
+saved-host registry to M4. A token therefore means retyping it every launch unless
+this branch adds a minimal single-host credential store. Agreed approach: add the
+minimal store here, let M4 generalize it.
+
+When auth lands, `specs/2026-09-11-bulk-transport-design.md` §7 goes stale — it
+says API-wide auth is "tracked separately in docs/HANDOFF.md". Update it then.
+
+## Two items surfaced while designing bulk transport (2026-09-11)
+
+Both were found designing `docs/superpowers/specs/2026-09-11-bulk-transport-design.md`.
+Neither is caused by that design, and neither is fixed by it — recorded here so the
+spec does not have to pretend otherwise.
+
+- **HIGH — a wire-declared size drives an unbounded allocation on every object
+  message.** **RESOLVED IN THE WPRS FORK, NOT YET LANDED HERE (2026-09-12)** — the
+  fix is implemented, tested, and reviewed, but exists only as unpushed local
+  commits; this workspace still builds against the un-ceilinged pin today. See
+  "wprs allocation ceilings are implemented but unpushed" further down for the full
+  status. The finding below is unchanged and still the reason the fix takes the
+  shape it does.
+
+  `streaming_framed_decompress_with` reads `uncompressed_size` with
+  `usize::framed_read` (`wprs/src/serialization/framing.rs:67-75`, which is a
+  **u32** on the wire), and passes it to `decompress_impl`, which resizes its
+  buffer to that value (`wprs/src/sharding_compression.rs:434-439`). Ceiling is
+  4 GB, allocated before any content is validated. This governs **every**
+  `MessageType::Object` navetted reads today — surface commits, input, all of it —
+  not just clipboard data, and it predates all clipboard work. navetted links the
+  bridge in-process, so an OOM here takes down every session, not one.
+
+  Fix is surgical and upstreamable: bound `uncompressed_size` against a ceiling in
+  our wprs pin. 256 MB leaves roughly 8x headroom over a 4K framebuffer (~33 MB
+  uncompressed). It touches every message path, so it wants its own change and its
+  own test, not a line item inside a feature spec.
+
+  **Correction to an earlier claim:** commit `0a49236` and the first draft of the
+  bulk-transport spec cited `Vec<u8>::framed_read`
+  (`wprs/src/serialization/framing.rs:101-106`) as the unbounded path and scoped it
+  to clipboard data transfers. Both were wrong — wrong function, and far too narrow
+  a scope. The citation above is the verified one. Anyone chasing the old reference
+  should stop and read this entry instead.
+
+- **HIGH — the daemon API has no authentication at all, and blob endpoints do not
+  change that either way.** **RESOLVED (2026-09-12, commit `f716def` and the
+  clients that followed it — see "Hardening branch" entries above).** Every route
+  now requires `Authorization: Bearer <token>`, no loopback exemption. The finding
+  below is unchanged and is still the reasoning behind that shape; the remedy it
+  calls for below is what landed.
+
+  Any peer that can reach the API can attach to
+  `/v1/sessions/{s}/media`, read the whole screen, and inject input. The tailnet is
+  the only boundary; `main.rs:57-62` refuses a non-loopback bind without
+  `--allow-remote`, and that is the entire defense.
+
+  Consequence for design work: adding a token to any single route is theater while
+  the media socket stays open. API-wide session authentication is the real remedy
+  and needs its own spec. Until it exists, every new route should be justified by
+  showing it does not widen the boundary, which is what the bulk-transport spec's
+  §7 does, rather than by listing per-route mitigations.
+
+## wprs allocation ceilings are implemented but unpushed — needs the user (2026-09-12)
+
+The fix for the "wire-declared size drives an unbounded allocation" HIGH item above
+is real, tested, and reviewed, but it exists only in a **local, unpushed** clone —
+navette's own `Cargo.toml` pins have not been bumped, and this branch does not yet
+build against the ceilinged wprs.
+
+- Local commits `e5958ed` then `38c61fe`, on top of the pinned rev `5763d74`, in the
+  clone at `/var/home/user/Documents/vibe-code/wprs`. Neither commit is on any
+  remote branch; `git log` there shows them ahead of `origin`.
+- `e5958ed` adds the ceilings the item above called for: **80 MB** for
+  `MessageType::Object` (`streaming_framed_decompress_with`), **128 MB** for
+  `MessageType::RawBuffer` (`streaming_framed_decompress_to_owned`) — 4 tests
+  covering reject-over-ceiling and accept-at-exactly-ceiling at both call sites, the
+  accept tests asserting full payload length rather than mere absence of error.
+- Review (`review10-wprs`) found that patch closed only one of three doors on the
+  same wire path: `AlignedVec::framed_read` (the indices blob,
+  `framing.rs:116-122`) and `Vec<u8>::framed_read` (per shard, `framing.rs:101-106`)
+  are both *also* wire-length-driven allocations, one read before the new check and
+  one read after it and independent of `uncompressed_size` — a peer could declare
+  `uncompressed_size=1` to clear the message-level check, then send a shard claiming
+  4 GB. `38c61fe` closes both: a 1 MB indices bound (`MAX_INDICES_BLOB`,
+  ~131K entries against a fixed small shard count) and a per-shard bound tied to the
+  same message-kind ceiling, both placed at the `sharding_compression.rs` call
+  sites rather than in generic `framing.rs`. The fix round's own test drives the
+  exact attack — `uncompressed_size=1` plus an oversized shard — through the public
+  `streaming_framed_decompress_to_owned` API and confirms it's now refused.
+  Re-review confirmed both new bounds precede their allocations, both call sites are
+  patched, `read_bounded_shard` mirrors `CompressedShard::framed_read`'s field order
+  exactly (no wire desync), and the accept side is exercised at the boundary by the
+  existing encode-path tests.
+- A live loopback E2E (real `navetted`, `foot` as a session, `navette-viewer`
+  attached over the real media WS, VAAPI encoder + viewer decoder matching at
+  696×496) confirmed the `RawBuffer`/`Object` decompress path still works end to end
+  under the new ceilings, run once against the first patch.
+- Why it's not pushed: a `cargo` git dependency can only name a rev that exists on a
+  remote, and pushing to a remote is outside standing agent authorization. What's
+  left is mechanical: push `wprs`'s local tip, then bump the rev pin in
+  `crates/navette-bridge/Cargo.toml:15` and `crates/navetted/Cargo.toml:26` to the
+  pushed SHA.
+- Until then, this branch's own workspace still builds and tests against the
+  **un-ceilinged** pinned rev `5763d74` — the 4 GB-per-message allocation this fix
+  closes is still live in what `master` would inherit if this branch merged today.
+- Also recorded here since it belongs beside this entry, not buried in a spec: the
+  design's original retention estimate for the `RawBuffer` ceiling was wrong. See
+  "Known limitation: retained decompression buffer is ~256 MB, not 128 MB" below.
+
+## On-device pairing verification: not done (2026-09-12)
+
+Everything up through Android unit tests, `assembleDebug`, and `adb install` on the
+Pixel 10 Pro Fold (`57211FDCG0023C`) is done and reviewed (Task 9, commits
+`7de3234`..`30bf424`). The actual scan-a-QR-and-connect, rotate-and-get-rejected,
+re-pair, and media-reconnect checks were **not run** — they need a human driving the
+phone and a decision to expose `navetted` on the tailnet (`--allow-remote`), both
+outside agent authorization. Copied here verbatim from
+`.superpowers/sdd/2026-09-12-hardening/task-9-report.md` before that scratch
+directory is deleted, since this is the branch's single most important behavioural
+property (no invisible reconnect loop on a rotated token) and it is currently
+verified by unit tests and code review only, not on hardware.
+
+**Before anything else: restart `navetted` from current HEAD.** A daemon built
+before this branch's fixes has no bearer-token auth at all, so scenario 1 would
+"work" for a reason that says nothing about this change, and scenario 2's
+rotation/rejection check needs the Task 2/3 guard code live.
+
+**Exposing that daemon so the phone can reach it over the tailnet is the user's
+decision** (no `--allow-remote`, nothing bound to a non-loopback address, was done
+by the implementer) — the whole checklist is blocked on that first.
+
+Once a fresh `navetted` is reachable from the phone's tailnet:
+
+1. **Fresh pairing via QR.** On the daemon host, run
+   `navette token --qr --advertise-host <host>` (the host the phone can reach it
+   at). On the phone, open Navette (fresh install or after clearing app data so no
+   pairing is stored), tap "Scan pairing code", point the camera at the terminal's
+   QR code. Expect: the scan UI closes on its own, a brief "Connecting..." spinner,
+   then the drawer (app/session list). If Play Services is unavailable, fall back to
+   "Enter manually": type the host and the token printed alongside the QR, tap
+   "Pair" — same expected result.
+2. **Rotated token is rejected, no spinner loop.** With the app still connected from
+   step 1, on the daemon host run `navette token --rotate`, then restart
+   `navetted`. On the phone, force-close and reopen the app (this exercises the
+   init-block auto-reconnect using the *old* stored pairing). Expect: a brief
+   "Connecting...", then "Pairing rejected. Scan a new code or enter one manually."
+   — and it stays there. Watch 15-20 seconds: no repeating spinner, no
+   Connecting/Failed flicker, no crash.
+3. **Re-pairing after rejection.** From "Pairing rejected", run
+   `navette token --qr --advertise-host <host>` again (prints the new, post-rotation
+   token) and scan, or use "Enter manually" with the new token. Expect: normal
+   connection, landing on the drawer, same as step 1.
+4. **Media-channel reconnect during an active session is not a pairing failure.**
+   From the drawer, attach to (or run) a session so the session screen is live.
+   Disable Wi-Fi on the phone for a few seconds, then re-enable it. Expect: the
+   ordinary "Reconnecting..." UI and a resumed picture — it must **not** show
+   "pairing rejected" or drop back to the ConnectScreen. This exercises
+   `MediaClient`/`ReconnectPolicy`, unchanged by this task, but is the regression
+   this task must not introduce now that `SessionController` carries a real token
+   instead of a placeholder that always 401'd.
+
+Report back which of the four passed, and for any that didn't, what was on screen —
+a screenshot is the fastest way to communicate that.
+
+## Project hazard: `ConnectionState` has no compiler-enforced exhaustiveness (2026-09-12)
+
+Found during Task 7 (Android 401 handling), and the plan's own prediction about it
+was wrong, in the dangerous direction — worth recording as a standing hazard rather
+than only a footnote on a fixed bug.
+
+`ConnectionState` is a sealed interface, which normally means the Kotlin compiler
+forces every `when` over it to handle every variant or fail to compile. It doesn't
+here: every consumer (`NavetteApp.kt`, `SessionOverlay.kt`) uses a **subject-less**
+`when { }` with an existing `else` branch, not `when (state) { }`. A subject-less
+`when` is just a chain of boolean conditions to the compiler — sealed-class
+exhaustiveness checking never applies to it. Adding `ConnectionState.Unauthorized` in
+Task 7 produced **zero compile errors** at either site; had the implementer trusted
+"the compiler will catch any place this needs handling" and skipped adding explicit
+arms, `Unauthorized` would have silently fallen into the generic "connection lost"
+branch, and the terminal-401 behaviour the hardening design's §7 calls for would not
+exist anywhere a user could see it.
+
+This is a standing hazard, not specific to `Unauthorized` or to this branch: **any**
+future `ConnectionState` variant is silently unhandled at both sites unless someone
+remembers to update the `else` chains by hand. Nothing enforces that they will.
+
+Not fixed here — fixing it means switching both sites to `when (state) { }`, a real
+(if small) behavior-preserving refactor outside this branch's scope. Worth doing
+before the next `ConnectionState` variant is added, precisely because the compiler
+will not remind anyone to do it then either.
+
+## Known limitation: retained decompression buffer is ~256 MB, not 128 MB (2026-09-12)
+
+`docs/superpowers/specs/2026-09-12-hardening-design.md` §6 originally claimed
+worst-case per-connection retention after the wprs ceilings was "the larger
+ceiling, 128 MB" — wrong, in the optimistic direction, and corrected at source
+during Task 10's review.
+
+`ShardingDecompressor` holds one buffer for the connection's whole lifetime and only
+ever grows it. `decompress_to_owned` (the `RawBuffer`/framebuffer path, 128 MB
+ceiling) uses `mem::replace`, which briefly holds **both** the new buffer and the
+old one, and returns a `Vec` that is `truncate`d rather than shrunk — so the
+returned `Vec`'s *capacity* stays at the declared length even though its *length*
+drops. Worst case after one maximum-size `RawBuffer` message, retention is closer to
+**256 MB per connection**, not 128 MB.
+
+Still bounded, still four orders of magnitude better than the pre-fix 4 GB ceiling,
+and the spec has been corrected to say so. **Not fixed** — reducing it would mean
+changing the allocation strategy (an actual shrink path, or a fresh allocation
+instead of `mem::replace` truncation), a larger change than this branch's scope.
+Recorded here as the number to plan memory budgets against, not 128 MB.
+
+## Deferred minor: `Bearer` prefix match is case-sensitive (2026-09-12)
+
+`crates/navetted`'s auth middleware checks the `Authorization` header with
+`strip_prefix("Bearer ")`, which is case-sensitive. RFC 7235 treats the
+auth-scheme token as case-insensitive, so a client sending `bearer <token>` is
+refused (401) rather than accepted. Found and deferred during Task 3's review.
+
+Fails closed, and every client this project controls (CLI, viewer, Android) sends
+`Bearer` with the RFC-conventional capitalization, so this has no live impact today.
+Worth a one-line case-insensitive match if a third-party client is ever added.
+
+## Deferred minor: no end-to-end test of the Android reconnect wiring (2026-09-12)
+
+`SessionScreen.kt`'s composed retry effect — `isDropped` feeding `first{}` feeding
+`shouldRetry` — has each link unit-tested in isolation, but nothing exercises the
+composition end to end. Reverting how those three are wired together (not their
+individual logic) would go uncaught by the existing suite. Found during Task 7's
+review; matches this codebase's existing style (no Compose/instrumented tests
+anywhere), and the on-device checklist above (scenario 2) covers it behaviourally
+once someone runs it — but that's a manual check, not a suite that fails a future
+regression automatically.
+
+## Pattern worth naming: a guarded secret with an unguarded copy elsewhere (2026-09-12)
+
+Recurred three times on this branch, and once on the branch before it — enough to
+be a pattern rather than a coincidence, and worth a standing check rather than an
+anecdote.
+
+1. **`AuthToken` vs raw `String` copies (Task 6).** `AuthToken` got a hand-written
+   `Debug` that redacts the value specifically so it can't reach a log by accident —
+   but the CLI's own argument structs held the same secret as a raw `String`, which
+   `Debug`-derives normally, undoing the guard the moment anyone added a debug
+   trace. Fixed with a `SecretString` newtype that carries the same redacting
+   `Debug`.
+2. **Encrypted store vs `rememberSaveable` instance state (Task 9).** The Android
+   pairing token has an `EncryptedSharedPreferences`-backed store built specifically
+   to hold it — but the manual-entry screen's typed token used `rememberSaveable`,
+   which is an OS-held `Bundle` outside that store, survives process death, and can
+   reach disk. Fixed by dropping it to plain `remember`.
+3. **`lastSent` cleared, `lastRemote` not (the clipboard branch, prior to this
+   one).** Same shape: a guard applied to one of a pair and not its sibling.
+
+**The check to run, not just the anecdote to remember:** when you add a guard around
+a secret (a redacting `Debug`, an encrypted store, a clearing-on-use rule), grep for
+every *other* place the same value is held or constructed, and confirm each one is
+covered too. The bug is never in the guarded copy — it's the copy nobody thought to
+check.
