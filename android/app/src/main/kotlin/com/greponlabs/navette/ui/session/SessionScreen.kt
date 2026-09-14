@@ -67,6 +67,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -82,6 +83,26 @@ private const val RESIZE_DEBOUNCE_MS = 150L
 
 /** How often the HUD pings and republishes. One second, matching [HUD_WINDOW_MS]. */
 private const val HUD_SAMPLE_INTERVAL_MS: Long = 1000L
+
+/**
+ * Runs [work] only while the media socket is live.
+ *
+ * A controller survives its final failed reconnect so the screen can offer a
+ * manual retry. Its HUD worker must not survive that socket: it would keep
+ * waking once per second to ping a dead WebSocket and republish a changing
+ * frame-age sample beneath the terminal overlay. `collectLatest` is
+ * essential: [work] is an intentionally long-running loop, so an ordinary
+ * `collect` would never observe the later failed/disconnected state.
+ */
+internal fun CoroutineScope.launchHudWhileConnected(
+    connection: StateFlow<ConnectionState>,
+    work: suspend () -> Unit,
+): Job =
+    launch {
+        connection.collectLatest { state ->
+            if (state is ConnectionState.Connected) work()
+        }
+    }
 
 /** What the screen renders. */
 internal data class SessionUiState(
@@ -610,7 +631,7 @@ private class SessionController(
             }
         hudJob?.cancel()
         hudJob =
-            scope.launch {
+            scope.launchHudWhileConnected(client.connectionState) {
                 while (true) {
                     val nonce = ++pingNonce
                     synchronized(lock) { hud.recordPing(nonce, System.currentTimeMillis()) }
@@ -1115,4 +1136,3 @@ private class SessionController(
         )
     }
 }
-
