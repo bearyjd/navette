@@ -713,10 +713,11 @@ internal class SessionController(
      * correct regardless of where in that async sequence the first attempt
      * landed.
      *
-     * At most one retry is ever pending: a second call here (a genuine new
-     * copy arriving while the first retry is still waiting) cancels the
-     * older one, so only the latest text is the one that eventually goes
-     * out. `pendingClipboardResend` is a child of `scope`, so `close()`'s
+     * At most one retry is ever pending: every new decision cancels the old
+     * retry *before* it attempts its own send. This ordering matters even
+     * when the new send succeeds immediately: otherwise an older parked
+     * retry can wake on the next connection and overwrite the newer text.
+     * `pendingClipboardResend` is a child of `scope`, so `close()`'s
      * `scope.cancel()` already tears it down; no explicit cancel is needed
      * there.
      *
@@ -731,11 +732,12 @@ internal class SessionController(
      * of the session.
      */
     private fun sendClipboardOrRetryOnConnect(text: String) {
+        pendingClipboardResend?.cancel()
+        pendingClipboardResend = null
         if (client.sendInput(MediaInput.SetClipboard(text))) {
             synchronized(lock) { bridge.markSent(text) }
             return
         }
-        pendingClipboardResend?.cancel()
         pendingClipboardResend =
             scope.launch {
                 client.connectionState.first { it is ConnectionState.Connected }

@@ -23,10 +23,13 @@ private class FakeMediaSessionClient : MediaSessionClient {
     override var onClipboard: ((String) -> Unit)? = null
     var connectCalls = 0
     var closeCalls = 0
+    var stateAfterConnect: ConnectionState = ConnectionState.Connected
+    var acceptClipboard = true
+    val sentClipboard = mutableListOf<String>()
 
     override fun connect() {
         connectCalls += 1
-        mutableConnection.value = ConnectionState.Connected
+        mutableConnection.value = stateAfterConnect
     }
 
     override fun close() {
@@ -35,9 +38,19 @@ private class FakeMediaSessionClient : MediaSessionClient {
     }
 
     override suspend fun nextPacket(): MediaPacket? = null
-    override fun sendInput(input: MediaInput): Boolean = true
+    override fun sendInput(input: MediaInput): Boolean {
+        if (input is MediaInput.SetClipboard) {
+            if (!acceptClipboard) return false
+            sentClipboard += input.text
+        }
+        return true
+    }
     override fun requestKeyframe() = Unit
     override fun sendPing(nonce: ULong): Boolean = true
+
+    fun transitionTo(connection: ConnectionState) {
+        mutableConnection.value = connection
+    }
 }
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -64,6 +77,43 @@ class SessionControllerTest {
 
             controller.close()
             assertEquals(1, client.closeCalls)
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
+    fun `a newer immediate clipboard send cancels an older parked retry`() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        try {
+            val client =
+                FakeMediaSessionClient().apply {
+                    stateAfterConnect = ConnectionState.Connecting
+                    acceptClipboard = false
+                }
+            val controller =
+                SessionController(
+                    mediaUrl = "ws://unused/v1/sessions/demo/media",
+                    token = "unused",
+                    transformHolder = ViewTransformHolder(),
+                    bridge = ClipboardBridge(),
+                    client = client,
+                )
+
+            controller.open()
+            runCurrent()
+            controller.onLocalClipboard("A")
+            runCurrent()
+
+            client.acceptClipboard = true
+            controller.onLocalClipboard("B")
+            assertEquals(listOf("B"), client.sentClipboard)
+
+            client.transitionTo(ConnectionState.Connected)
+            runCurrent()
+            assertEquals("the parked A retry must not overwrite B", listOf("B"), client.sentClipboard)
+
+            controller.close()
         } finally {
             Dispatchers.resetMain()
         }
