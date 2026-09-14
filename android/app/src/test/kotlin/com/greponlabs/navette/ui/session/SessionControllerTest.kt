@@ -1,6 +1,7 @@
 package com.greponlabs.navette.ui.session
 
 import com.greponlabs.navette.net.ConnectionState
+import com.greponlabs.navette.net.BlobDescriptor
 import com.greponlabs.navette.net.MediaInput
 import com.greponlabs.navette.net.MediaPacket
 import kotlinx.coroutines.Dispatchers
@@ -21,6 +22,7 @@ private class FakeMediaSessionClient : MediaSessionClient {
     override val connectionState: StateFlow<ConnectionState> = mutableConnection
     override var onPong: ((ULong) -> Unit)? = null
     override var onClipboard: ((String) -> Unit)? = null
+    override var onClipboardBlob: ((BlobDescriptor) -> Unit)? = null
     var connectCalls = 0
     var closeCalls = 0
     var stateAfterConnect: ConnectionState = ConnectionState.Connected
