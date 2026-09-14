@@ -44,7 +44,6 @@ import androidx.lifecycle.repeatOnLifecycle
 import com.greponlabs.navette.net.ConnectionState
 import com.greponlabs.navette.net.Pairing
 import com.greponlabs.navette.net.mediaWebSocketUrl
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 
 
@@ -217,20 +216,11 @@ fun SessionScreen(
     // its own drop.
     LaunchedEffect(controller, lifecycleOwner) {
         lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            val dropped =
-                controller.state.first {
-                    ReconnectPolicy.isDropped(it.connection) || it.streamEnded || it.decodeError != null
-                }
             if (
-                ReconnectPolicy.shouldRetry(
-                    reconnectAttempt,
-                    dropped.streamEnded,
-                    dropped.decodeError,
-                    dropped.connection is ConnectionState.Unauthorized,
-                )
+                awaitReconnectRebuild(controller.state, reconnectAttempt) { nextAttempt ->
+                    reconnectAttempt = nextAttempt
+                }
             ) {
-                reconnectAttempt += 1
-                delay(ReconnectPolicy.delayMs(reconnectAttempt))
                 reconnectNonce += 1
             }
         }
