@@ -10,6 +10,17 @@ const val MIN_ZOOM: Double = 1.0
 const val MAX_ZOOM: Double = 4.0
 
 /**
+ * The result of a pan after its local movement has been clamped to the
+ * zoomed content. A residual is the part of a screen-space request that the
+ * view could not consume at an edge, preserving the request's sign.
+ */
+data class PanResult(
+    val transform: ViewTransform,
+    val residualX: Double,
+    val residualY: Double,
+)
+
+/**
  * How the video is placed on the surface: `screen = local * zoom + offset`,
  * with the zoom pivoted at the top-left corner.
  *
@@ -73,7 +84,30 @@ data class ViewTransform(
         ).clampedTo(surfaceWidth, surfaceHeight)
     }
 
-    /** Translates by a screen-space delta, then clamps. Unchanged for a non-finite delta. */
+    /**
+     * Translates by a screen-space delta, then clamps, returning any portion
+     * rejected by each edge as a same-sign residual. A non-finite delta or a
+     * degenerate surface is a no-op with no residual: neither is meaningful
+     * to hand to the guest.
+     */
+    fun panned(dx: Double, dy: Double, surfaceWidth: Int, surfaceHeight: Int): PanResult {
+        if (!dx.isFinite() || !dy.isFinite() || surfaceWidth <= 0 || surfaceHeight <= 0) {
+            return PanResult(this, 0.0, 0.0)
+        }
+        val panned = copy(offsetX = offsetX + dx, offsetY = offsetY + dy).clampedTo(surfaceWidth, surfaceHeight)
+        return PanResult(
+            transform = panned,
+            residualX = dx - (panned.offsetX - offsetX),
+            residualY = dy - (panned.offsetY - offsetY),
+        )
+    }
+
+    /**
+     * Translates by a screen-space delta, then clamps. Kept for call-site
+     * compatibility, including the legacy behavior for a transient
+     * degenerate surface: the translated copy is retained because
+     * [clampedTo] cannot determine bounds yet.
+     */
     fun pannedBy(dx: Double, dy: Double, surfaceWidth: Int, surfaceHeight: Int): ViewTransform {
         if (!dx.isFinite() || !dy.isFinite()) return this
         return copy(offsetX = offsetX + dx, offsetY = offsetY + dy).clampedTo(surfaceWidth, surfaceHeight)

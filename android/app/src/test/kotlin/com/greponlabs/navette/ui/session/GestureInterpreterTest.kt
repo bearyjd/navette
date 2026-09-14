@@ -253,7 +253,19 @@ class GestureInterpreterTest {
 
         val effects = fingers.drain()
         assertEquals(1, effects.filterIsInstance<GestureEffect.Zoom>().size)
-        assertEquals(listOf(GestureEffect.Pan(50f, 30f)), effects.filterIsInstance<GestureEffect.Pan>())
+        assertEquals(
+            listOf(GestureEffect.Pan(50f, 30f, handoffAtEdge = false)),
+            effects.filterIsInstance<GestureEffect.Pan>(),
+        )
+    }
+
+    @Test
+    fun `a normal zoomed pan allows an edge handoff`() {
+        val fingers = twoFingersDown(zoomed = true)
+
+        fingers.move(p(FINGER_A, 150f, 130f), p(FINGER_B, 350f, 130f))
+
+        assertEquals(listOf(GestureEffect.Pan(50f, 30f, handoffAtEdge = true)), fingers.drain())
     }
 
     // -- two-finger tap ------------------------------------------------------

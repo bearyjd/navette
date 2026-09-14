@@ -83,8 +83,12 @@ sealed interface GestureEffect {
     /** Multiply the zoom by [scaleFactor] about a screen-space focal point. */
     data class Zoom(val scaleFactor: Double, val focalX: Float, val focalY: Float) : GestureEffect
 
-    /** Translate the zoomed view by a screen-space delta. */
-    data class Pan(val dx: Float, val dy: Float) : GestureEffect
+    /**
+     * Translate the zoomed view by a screen-space delta. A regular two-finger
+     * pan may hand an edge residual to the guest; focal drift while pinching
+     * is always local so a pinch never scrolls the guest.
+     */
+    data class Pan(val dx: Float, val dy: Float, val handoffAtEdge: Boolean = true) : GestureEffect
 
     /** Scroll the guest by a screen-space finger delta. */
     data class Scroll(val dx: Float, val dy: Float) : GestureEffect
@@ -148,9 +152,9 @@ data class GestureStep(val state: GestureState, val effects: List<GestureEffect>
  *
  * [DragMode] is decided once, from [TouchEvent.zoomed] at the
  * [TouchAction.PointerDown] that starts the two-finger gesture, and never
- * re-read: zoomed in, a drag pans; at 1:1, it scrolls the guest. While zoomed
- * in the guest therefore cannot be scrolled -- pinch back to 1:1 first. That
- * is a chosen limitation, recorded in `android/README.md`.
+ * re-read: zoomed in, a drag pans; at 1:1, it scrolls the guest. At a zoomed
+ * content edge, the controller hands only the unconsumed pan delta to the
+ * guest. Pinch focal drift remains local even when it reaches an edge.
  */
 object GestureInterpreter {
     fun step(state: GestureState, event: TouchEvent): GestureStep =
@@ -286,7 +290,7 @@ object GestureInterpreter {
             val dy = focalY - fromY
             if (dx != 0f || dy != 0f) {
                 when (state.mode) {
-                    DragMode.Pan -> effects += GestureEffect.Pan(dx, dy)
+                    DragMode.Pan -> effects += GestureEffect.Pan(dx, dy, handoffAtEdge = !pinching)
                     DragMode.Scroll -> if (!pinching) effects += GestureEffect.Scroll(dx, dy)
                 }
             }

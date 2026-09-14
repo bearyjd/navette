@@ -628,8 +628,12 @@ internal class SessionController(
             }
             is GestureEffect.Pan -> {
                 val (width, height) = synchronized(lock) { surfaceSize } ?: return
-                transform = transform.pannedBy(effect.dx.toDouble(), effect.dy.toDouble(), width, height)
+                val panned = transform.panned(effect.dx.toDouble(), effect.dy.toDouble(), width, height)
+                transform = panned.transform
                 applyTransform()
+                if (effect.handoffAtEdge && (panned.residualX != 0.0 || panned.residualY != 0.0)) {
+                    sendScroll(panned.residualX.toFloat(), panned.residualY.toFloat())
+                }
             }
             is GestureEffect.Scroll -> sendScroll(effect.dx, effect.dy)
             GestureEffect.ToggleHud -> onToggleHud?.invoke()
@@ -773,10 +777,11 @@ internal class SessionController(
     }
 
     /**
-     * Only ever reached at 1:1 (a two-finger drag while zoomed pans instead),
-     * where screen and content pixels coincide, so the finger delta needs no
-     * rescaling before it becomes a guest scroll delta. Gated like
-     * [sendButton]: an axis is delivered at the pointer's position too.
+     * Reached for a two-finger drag at 1:1, or for the unconsumed part of a
+     * zoomed pan at a content edge. Both are already screen-space pixel
+     * deltas, so they need no rescaling before they become guest scroll
+     * deltas. Gated like [sendButton]: an axis is delivered at the pointer's
+     * position too.
      */
     private fun sendScroll(dx: Float, dy: Float) {
         val stream = gate.primary ?: return
