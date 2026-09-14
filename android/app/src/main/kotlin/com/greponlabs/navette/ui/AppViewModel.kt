@@ -12,6 +12,7 @@ import com.greponlabs.navette.net.EncryptedPairingStore
 import com.greponlabs.navette.net.NavetteApi
 import com.greponlabs.navette.net.NavetteClient
 import com.greponlabs.navette.net.Pairing
+import com.greponlabs.navette.net.PairingRegistry
 import com.greponlabs.navette.net.PairingStore
 import com.greponlabs.navette.net.controlWebSocketUrl
 import com.greponlabs.navette.protocol.App
@@ -32,6 +33,7 @@ import kotlinx.coroutines.launch
 
 data class AppUiState(
     val pairing: Pairing? = null,
+    val registry: PairingRegistry = PairingRegistry(),
     val connection: ConnectionState = ConnectionState.Disconnected,
     val apps: List<App> = emptyList(),
     val sessions: List<Session> = emptyList(),
@@ -39,11 +41,21 @@ data class AppUiState(
     val snackbarMessage: String? = null,
     /** The session the user is attached to, or `null` when the drawer is showing. */
     val activeSession: String? = null,
+    /** Host management is explicit, so deleting an active host never auto-selects another. */
+    val showingHosts: Boolean = false,
+    val addingHost: Boolean = false,
 )
 
 sealed interface AppEvent {
     /** A pairing was just obtained -- by scanning a QR code or by manual entry. Saves and connects. */
     data class Paired(val pairing: Pairing) : AppEvent
+
+    data object ShowHosts : AppEvent
+    data object HideHosts : AppEvent
+    data object AddHost : AppEvent
+    data object CancelAddHost : AppEvent
+    data class SelectHost(val id: String) : AppEvent
+    data class DeleteHost(val id: String) : AppEvent
 
     /**
      * Retries the current pairing without asking the user to scan or type it
@@ -73,17 +85,19 @@ sealed interface AppEvent {
 }
 
 /**
- * Owns the one [NavetteApi] control connection this app uses, and which
- * session (if any) is currently attached. Single-host only, no
+ * Owns the active [NavetteApi] control connection, the encrypted host
+ * registry, and which session (if any) is currently attached. Selecting a
+ * host persists that active choice, cancels collectors for the old client,
+ * closes it, and clears the old session before the replacement connects. No
  * reconnect/backoff beyond [AppEvent.Reconnect].
  *
  * Media state is deliberately not here: `SessionScreen` owns its own
  * `MediaClient` and decoder, and this ViewModel stays the control-channel
  * owner it has always been.
  *
- * [pairingStore] is the single source of truth for host, port and token --
- * see [AppEvent.Paired] and the `init` block below, which resumes the last
- * pairing on every fresh launch of this ViewModel. [clientFactory] defaults
+ * [pairingStore] is the single source of truth for the encrypted host
+ * registry and active host -- see [AppEvent.Paired] and the `init` block
+ * below, which resumes that active host on every fresh launch. [clientFactory] defaults
  * to a real [NavetteClient] but is overridable so tests can inject a fake
  * instead of standing up real networking -- see `AppViewModelTest`.
  */
@@ -119,15 +133,24 @@ class AppViewModel(
         // this is the first call to reach it in the app's lifetime, so a
         // keystore failure here must yield "no pairing, show ConnectScreen"
         // rather than crashing startup.
-        runCatching { pairingStore.load() }
+        runCatching { pairingStore.loadRegistry() }
             .onFailure { Log.w(TAG, "failed to load a stored pairing: ${it.message}") }
             .getOrNull()
-            ?.let { connectWithPairing(it) }
+            ?.also { registry -> _state.update { it.copy(registry = registry) } }
+            ?.active
+            ?.pairing
+            ?.let(::connectWithPairing)
     }
 
     fun onEvent(event: AppEvent) {
         when (event) {
             is AppEvent.Paired -> pair(event.pairing)
+            AppEvent.ShowHosts -> _state.update { it.copy(showingHosts = true, addingHost = false) }
+            AppEvent.HideHosts -> _state.update { it.copy(showingHosts = false, addingHost = false) }
+            AppEvent.AddHost -> _state.update { it.copy(showingHosts = false, addingHost = true) }
+            AppEvent.CancelAddHost -> _state.update { it.copy(showingHosts = it.registry.hosts.isNotEmpty(), addingHost = false) }
+            is AppEvent.SelectHost -> selectHost(event.id)
+            is AppEvent.DeleteHost -> deleteHost(event.id)
             AppEvent.Reconnect -> reconnect()
             AppEvent.Refresh -> refresh()
             is AppEvent.RunApp -> runApp(event.appId)
@@ -164,12 +187,13 @@ class AppViewModel(
      * message says and all it says.
      */
     private fun pair(pairing: Pairing) {
-        val stored =
-            runCatching { pairingStore.save(pairing) }
+        val registry =
+            runCatching { pairingStore.upsert(pairing) }
                 .onFailure { Log.w(TAG, "failed to save the pairing: ${it.message}") }
-                .isSuccess
+                .getOrNull()
         connectWithPairing(pairing)
-        if (!stored) {
+        _state.update { it.copy(registry = registry ?: it.registry, showingHosts = false, addingHost = false) }
+        if (registry == null) {
             _state.update {
                 it.copy(
                     snackbarMessage = "Pairing not saved — this device won't remember it next launch.",
@@ -202,7 +226,7 @@ class AppViewModel(
             connectWithPairing(it)
             return
         }
-        runCatching { pairingStore.load() }
+        runCatching { pairingStore.loadRegistry() }
             .onFailure { error ->
                 Log.w(TAG, "failed to load a stored pairing: ${error.message}")
                 _state.update {
@@ -212,7 +236,42 @@ class AppViewModel(
                 }
             }
             .getOrNull()
-            ?.let { connectWithPairing(it) }
+            ?.also { registry -> _state.update { it.copy(registry = registry) } }
+            ?.active
+            ?.pairing
+            ?.let(::connectWithPairing)
+    }
+
+    private fun selectHost(id: String) {
+        val selected = _state.value.registry.hosts.firstOrNull { it.id == id } ?: return
+        val persisted = runCatching { pairingStore.select(id) }
+            .onFailure { Log.w(TAG, "failed to select a saved host: ${it.message}") }
+            .getOrNull() ?: return
+        _state.update { it.copy(registry = persisted, showingHosts = false, addingHost = false) }
+        connectWithPairing(selected.pairing)
+    }
+
+    private fun deleteHost(id: String) {
+        val prior = _state.value.registry
+        val deleted = prior.hosts.firstOrNull { it.id == id } ?: return
+        val updated = runCatching { pairingStore.delete(id) }
+            .onFailure { Log.w(TAG, "failed to delete a saved host: ${it.message}") }
+            .getOrNull() ?: return
+        if (prior.activeId != deleted.id) {
+            _state.update { it.copy(registry = updated) }
+            return
+        }
+        connectionJob?.cancel()
+        refreshJob?.cancel()
+        client?.close()
+        client = null
+        _state.update {
+            it.copy(
+                pairing = null, registry = updated, connection = ConnectionState.Disconnected,
+                apps = emptyList(), sessions = emptyList(), isLoading = false, activeSession = null,
+                showingHosts = true, addingHost = false,
+            )
+        }
     }
 
     private fun connectWithPairing(pairing: Pairing) {
@@ -221,7 +280,7 @@ class AppViewModel(
         client?.close()
         // A reconnect must not leave the user on a session screen belonging to
         // the connection being replaced.
-        _state.update { it.copy(pairing = pairing, activeSession = null) }
+        _state.update { it.copy(pairing = pairing, activeSession = null, showingHosts = false, addingHost = false) }
         val newClient = clientFactory(pairing)
         client = newClient
 

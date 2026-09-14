@@ -9,10 +9,11 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.greponlabs.navette.net.ConnectionState
 import com.greponlabs.navette.ui.connect.ConnectScreen
 import com.greponlabs.navette.ui.drawer.DrawerScreen
+import com.greponlabs.navette.ui.hosts.HostListScreen
 import com.greponlabs.navette.ui.session.SessionScreen
 
 /**
- * Three states, not a navigation graph: Connect (no pairing yet), Drawer
+ * Four states, not a navigation graph: Connect/add host, host list, Drawer
  * (connected, choosing), and Session (attached).
  *
  * Navigation Compose was considered and left out: with three screens and a
@@ -44,7 +45,15 @@ fun NavetteApp(
                 onLeave = { viewModel.onEvent(AppEvent.LeaveSession) },
             )
         }
-        state.connection is ConnectionState.Connected ->
+        state.showingHosts ->
+            HostListScreen(
+                registry = state.registry,
+                onSelect = { viewModel.onEvent(AppEvent.SelectHost(it)) },
+                onDelete = { viewModel.onEvent(AppEvent.DeleteHost(it)) },
+                onAdd = { viewModel.onEvent(AppEvent.AddHost) },
+                onBack = { viewModel.onEvent(AppEvent.HideHosts) },
+            )
+        state.connection is ConnectionState.Connected && !state.addingHost ->
             DrawerScreen(
                 sessions = state.sessions,
                 apps = state.apps,
@@ -53,6 +62,7 @@ fun NavetteApp(
                 onRefresh = { viewModel.onEvent(AppEvent.Refresh) },
                 onRunApp = { appId -> viewModel.onEvent(AppEvent.RunApp(appId)) },
                 onAttachSession = { session -> viewModel.onEvent(AppEvent.AttachSession(session)) },
+                onManageHosts = { viewModel.onEvent(AppEvent.ShowHosts) },
                 onSnackbarDismissed = { shown -> viewModel.onEvent(AppEvent.DismissSnackbar(shown)) },
             )
         // Unauthorized is not broken out here: ConnectScreen already handles it
@@ -65,6 +75,8 @@ fun NavetteApp(
                 connection = state.connection,
                 onPaired = { pairing -> viewModel.onEvent(AppEvent.Paired(pairing)) },
                 onRetry = { viewModel.onEvent(AppEvent.Reconnect) },
+                onBack = if (state.addingHost) ({ viewModel.onEvent(AppEvent.CancelAddHost) }) else null,
+                onManageHosts = if (state.registry.hosts.isNotEmpty()) ({ viewModel.onEvent(AppEvent.ShowHosts) }) else null,
             )
     }
 }

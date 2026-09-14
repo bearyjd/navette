@@ -70,7 +70,20 @@ class PairingUriTest {
         // producing side (crates/navette-cli/src/main.rs `resolve_advertise_host`).
         val pairing =
             parsePairingUri("navette://pair?host=[fd7a:115c:a1e0::1]&port=9417&token=ABCD1234ABCD1234ABCD1234")
-        assertEquals(Pairing("[fd7a:115c:a1e0::1]", 9417, "ABCD1234ABCD1234ABCD1234"), pairing)
+        assertEquals(Pairing("fd7a:115c:a1e0:0:0:0:0:1", 9417, "ABCD1234ABCD1234ABCD1234"), pairing)
+    }
+
+    @Test
+    fun `QR parser shares strict endpoint and token normalization`() {
+        assertEquals(
+            Pairing("tower.ts.net", 9417, "ABCD1234ABCD1234ABCD1234"),
+            parsePairingUri("navette://pair?host=Tower.TS.Net&port=9417&token=abcd-1234-abcd-1234-abcd-1234"),
+        )
+        listOf("127.0.0.1", "tower:9417", "tower/path", "tower%25evil", "[fd7a::1]:9417").forEach { host ->
+            assertNull(parsePairingUri("navette://pair?host=$host&port=9417&token=ABCD1234ABCD1234ABCD1234"))
+        }
+        assertNull(parsePairingUri("navette://pair?host=tower&port=9417&token=IIIIIIIIIIIIIIIIIIIIIIII"))
+        assertNull(parsePairingUri("navette://pair?host=tower&port=9417&token=ABCD1234ABCD1234ABCD1234#fragment"))
     }
 }
 
