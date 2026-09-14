@@ -334,4 +334,28 @@ class MediaProtocolTest {
     fun setClipboardPassesValidation() {
         assertNull(MediaInput.SetClipboard("hello").validate())
     }
+
+    @Test
+    fun imageBlobDescriptorsMatchRustWireValidation() {
+        val blob = BlobDescriptor(
+            id = "0123456789abcdef0123456789abcdef",
+            mime = "image/png",
+            size = 42,
+        )
+        assertNull(blob.validate())
+        assertEquals(
+            """{"type":"set_clipboard_blob","blob":{"id":"0123456789abcdef0123456789abcdef","mime":"image/png","size":42}}""",
+            mediaJson.encodeToString(MediaInput.serializer(), MediaInput.SetClipboardBlob(blob)),
+        )
+        assertEquals(
+            MediaServerMessage.ClipboardBlob(blob),
+            mediaJson.decodeFromString(
+                MediaServerMessage.serializer(),
+                """{"type":"clipboard_blob","blob":{"id":"0123456789abcdef0123456789abcdef","mime":"image/png","size":42}}""",
+            ),
+        )
+        assertTrue(BlobDescriptor("../path", "image/png", 1).validate() != null)
+        assertTrue(BlobDescriptor(blob.id, "image/svg+xml", 1).validate() != null)
+        assertTrue(BlobDescriptor(blob.id, "image/jpeg", 0).validate() != null)
+    }
 }

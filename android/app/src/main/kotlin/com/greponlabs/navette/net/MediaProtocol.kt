@@ -50,6 +50,8 @@ val MEDIA_MAGIC: ByteArray = byteArrayOf('N'.code.toByte(), 'V'.code.toByte(), '
 const val MEDIA_VERSION: Int = 1
 const val MEDIA_HEADER_LEN: Int = 44
 const val MAX_MEDIA_PAYLOAD: Long = 16L * 1024 * 1024
+const val MAX_BLOB_BYTES: Long = 64L * 1024 * 1024
+const val BLOB_ID_LEN: Int = 32
 const val STREAM_CONFIG_VERSION: Int = 1
 const val STREAM_CONFIG_PREFIX_LEN: Int = 21
 
@@ -377,7 +379,29 @@ sealed interface MediaInput {
     @Serializable
     @SerialName("set_clipboard")
     data class SetClipboard(val text: String) : MediaInput
+
+    @Serializable
+    @SerialName("set_clipboard_blob")
+    data class SetClipboardBlob(val blob: BlobDescriptor) : MediaInput
 }
+
+/** Socket metadata for bytes held only on the authenticated HTTP blob route. */
+@Serializable
+data class BlobDescriptor(
+    val id: String,
+    val mime: String,
+    val size: Long,
+)
+
+fun BlobDescriptor.validate(): InputValidationError? =
+    when {
+        id.length != BLOB_ID_LEN || id.any { !it.isDigit() && it !in 'a'..'f' } ->
+            InputValidationError.InvalidBlobDescriptor
+        mime !in setOf("image/png", "image/jpeg", "image/webp") ->
+            InputValidationError.InvalidBlobDescriptor
+        size !in 1..MAX_BLOB_BYTES -> InputValidationError.InvalidBlobDescriptor
+        else -> null
+    }
 
 sealed interface InputValidationError {
     data object NonFiniteCoordinate : InputValidationError
@@ -389,6 +413,8 @@ sealed interface InputValidationError {
     data class LayoutOutOfRange(val layoutIndex: Int) : InputValidationError
 
     data object ViewportOutOfRange : InputValidationError
+
+    data object InvalidBlobDescriptor : InputValidationError
 }
 
 /**
@@ -423,6 +449,7 @@ fun MediaInput.validate(): InputValidationError? =
         MediaInput.RequestKeyframe -> null
         is MediaInput.Ping -> null
         is MediaInput.SetClipboard -> null
+        is MediaInput.SetClipboardBlob -> blob.validate()
     }
 
 /** The bridge reports protocol problems as JSON text frames; they are informational. */
@@ -439,6 +466,10 @@ sealed interface MediaServerMessage {
     @Serializable
     @SerialName("clipboard")
     data class Clipboard(val text: String) : MediaServerMessage
+
+    @Serializable
+    @SerialName("clipboard_blob")
+    data class ClipboardBlob(val blob: BlobDescriptor) : MediaServerMessage
 }
 
 /**

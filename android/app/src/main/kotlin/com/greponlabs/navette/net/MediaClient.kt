@@ -347,6 +347,10 @@ class MediaClient(private val webSocketUrl: String, private val token: String) {
     @Volatile
     var onClipboard: ((String) -> Unit)? = null
 
+    /** Descriptor for a guest image whose bytes must be fetched separately. */
+    @Volatile
+    var onClipboardBlob: ((BlobDescriptor) -> Unit)? = null
+
     private val listener =
         object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: OkHttpResponse) {
@@ -393,6 +397,7 @@ class MediaClient(private val webSocketUrl: String, private val token: String) {
                 when (reported) {
                     is MediaServerMessage.Pong -> onPong?.invoke(reported.nonce)
                     is MediaServerMessage.Clipboard -> onClipboard?.invoke(reported.text)
+                    is MediaServerMessage.ClipboardBlob -> onClipboardBlob?.invoke(reported.blob)
                     is MediaServerMessage.Error -> Log.w(TAG, "media server reported: $reported")
                     // Never `text` itself: an unparseable frame that was meant
                     // to be a Clipboard message has clipboard content

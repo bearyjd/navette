@@ -3,6 +3,7 @@ package com.greponlabs.navette.ui.session
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.net.Uri
 import android.view.SurfaceView
 import android.view.View
 import androidx.compose.foundation.background
@@ -41,10 +42,18 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
+import androidx.core.content.FileProvider
 import com.greponlabs.navette.net.ConnectionState
+import com.greponlabs.navette.net.MAX_BLOB_BYTES
 import com.greponlabs.navette.net.Pairing
 import com.greponlabs.navette.net.mediaWebSocketUrl
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import androidx.compose.runtime.rememberCoroutineScope
+import java.io.ByteArrayOutputStream
+import java.io.File
 
 
 /**
@@ -92,6 +101,7 @@ fun SessionScreen(
     // push as if the phone had copied it new, clobbering whatever the guest
     // copied while the socket was down.
     val clipboardBridge = remember(pairing.host, sessionName) { ClipboardBridge() }
+    val clipboardScope = rememberCoroutineScope()
     val controller =
         remember(pairing.host, pairing.port, sessionName, reconnectNonce) {
             SessionController(
@@ -131,9 +141,26 @@ fun SessionScreen(
     // would miss the case this feature exists for.
     DisposableEffect(controller) {
         fun readLocalClipboard(): String? = clipboard.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()
+        fun readLocalImage(): Pair<String, Uri>? {
+            val item = clipboard.primaryClip?.getItemAt(0) ?: return null
+            val uri = item.uri ?: return null
+            val mime = context.contentResolver.getType(uri) ?: return null
+            return mime.takeIf { it in setOf("image/png", "image/jpeg", "image/webp") }?.let { it to uri }
+        }
+        fun offerLocalClipboard() {
+            val text = readLocalClipboard()
+            if (!text.isNullOrEmpty() && clipboard.primaryClip?.getItemAt(0)?.text != null) {
+                controller.onLocalClipboard(text)
+                return
+            }
+            val (mime, uri) = readLocalImage() ?: return
+            clipboardScope.launch(Dispatchers.IO) {
+                readBoundedClipboardImage(context, uri)?.let { controller.onLocalClipboardBlob(mime, it) }
+            }
+        }
         val clipboardListener =
             ClipboardManager.OnPrimaryClipChangedListener {
-                readLocalClipboard()?.let { controller.onLocalClipboard(it) }
+                offerLocalClipboard()
             }
         clipboard.addPrimaryClipChangedListener(clipboardListener)
         // Goes through onLocalClipboardResume, not onLocalClipboard: this
@@ -160,6 +187,14 @@ fun SessionScreen(
     LaunchedEffect(controller) {
         controller.onToggleHud = { hudVisible = !hudVisible }
         controller.onClipboardPush = { text -> clipboard.setPrimaryClip(ClipData.newPlainText("navette", text)) }
+        controller.onClipboardBlobPush = { blob, bytes ->
+            clipboardScope.launch(Dispatchers.IO) {
+                val uri = writeClipboardImage(context, blob.mime, bytes) ?: return@launch
+                withContext(Dispatchers.Main) {
+                    clipboard.setPrimaryClip(ClipData.newUri(context.contentResolver, "navette", uri))
+                }
+            }
+        }
     }
 
     // Re-asserts whichever focus target is correct, every time this effect
@@ -386,3 +421,39 @@ private fun BoxScope.ImeLayer(
         Text(text = if (imeRaised) "Hide keyboard" else "Keyboard", color = Color.White)
     }
 }
+
+private fun readBoundedClipboardImage(context: Context, uri: Uri): ByteArray? =
+    runCatching {
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            val output = ByteArrayOutputStream()
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                if (output.size().toLong() + count > MAX_BLOB_BYTES) return@use null
+                output.write(buffer, 0, count)
+            }
+            output.toByteArray().takeIf { it.isNotEmpty() }
+        }
+    }.getOrNull()
+
+private fun writeClipboardImage(context: Context, mime: String, bytes: ByteArray): Uri? =
+    runCatching {
+        if (bytes.isEmpty() || bytes.size.toLong() > MAX_BLOB_BYTES) return@runCatching null
+        val suffix =
+            when (mime) {
+                "image/png" -> ".png"
+                "image/jpeg" -> ".jpg"
+                "image/webp" -> ".webp"
+                else -> return@runCatching null
+            }
+        val directory = File(context.cacheDir, "clipboard").apply { mkdirs() }
+        val partial = File.createTempFile("navette-", ".part", directory)
+        partial.outputStream().use { it.write(bytes) }
+        val final = File(directory, partial.name.removeSuffix(".part") + suffix)
+        if (!partial.renameTo(final)) {
+            partial.delete()
+            return@runCatching null
+        }
+        FileProvider.getUriForFile(context, context.packageName + ".clipboard", final)
+    }.getOrNull()

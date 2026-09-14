@@ -13,6 +13,7 @@ import com.greponlabs.navette.media.StreamGateEvent
 import com.greponlabs.navette.net.BTN_LEFT
 import com.greponlabs.navette.net.BTN_RIGHT
 import com.greponlabs.navette.net.ConnectionState
+import com.greponlabs.navette.net.BlobDescriptor
 import com.greponlabs.navette.net.MediaClient
 import com.greponlabs.navette.net.MediaInput
 import com.greponlabs.navette.net.MediaPacket
@@ -50,6 +51,7 @@ internal interface MediaSessionClient {
     val connectionState: StateFlow<ConnectionState>
     var onPong: ((ULong) -> Unit)?
     var onClipboard: ((String) -> Unit)?
+    var onClipboardBlob: ((BlobDescriptor) -> Unit)?
 
     fun connect()
     fun close()
@@ -76,6 +78,11 @@ private class OkHttpMediaSessionClient(
         get() = delegate.onClipboard
         set(value) {
             delegate.onClipboard = value
+        }
+    override var onClipboardBlob: ((BlobDescriptor) -> Unit)?
+        get() = delegate.onClipboardBlob
+        set(value) {
+            delegate.onClipboardBlob = value
         }
 
     override fun connect() = delegate.connect()
@@ -145,6 +152,12 @@ internal class SessionController(
 ) {
     private val gate = StreamGate()
     private val scope = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
+    private val blobCoordinator =
+        ClipboardBlobCoordinator(
+            scope = scope,
+            transport = HttpBlobTransport(mediaUrl, token),
+            announce = { blob -> client.sendInput(MediaInput.SetClipboardBlob(blob)) },
+        )
 
     /**
      * Guards [decoder], [surface] and [surfaceSize], which two threads reach:
@@ -206,6 +219,9 @@ internal class SessionController(
      * must not be called from there.
      */
     var onClipboardPush: ((String) -> Unit)? = null
+
+    /** Called with an image downloaded from the authenticated blob route. */
+    var onClipboardBlobPush: ((BlobDescriptor, ByteArray) -> Unit)? = null
 
     /**
      * The surface the most recent successfully-sent motion was addressed to.
@@ -270,6 +286,9 @@ internal class SessionController(
             val toWrite = synchronized(lock) { bridge.onRemoteClipboard(text) }
             if (toWrite != null) scope.launch { onClipboardPush?.invoke(toWrite) }
         }
+        client.onClipboardBlob = { blob ->
+            blobCoordinator.download(blob) { bytes -> onClipboardBlobPush?.invoke(blob, bytes) }
+        }
         // connect() before the state collector, not after. The client's flow
         // starts at Disconnected; connect() moves it to Connecting
         // synchronously. Collecting first, on Main.immediate, would publish
@@ -316,6 +335,8 @@ internal class SessionController(
         hudJob?.cancel()
         client.onPong = null
         client.onClipboard = null
+        client.onClipboardBlob = null
+        blobCoordinator.invalidate()
         // Clear the surface BEFORE stopping the decoder. Cancelling
         // packetsJob above does not preempt a route() already inside
         // startDecoder, and with the old order that call could publish a
@@ -679,6 +700,11 @@ internal class SessionController(
     fun onLocalClipboard(text: String) {
         val forward = synchronized(lock) { bridge.onLocalClipboard(text) } ?: return
         sendClipboardOrRetryOnConnect(forward)
+    }
+
+    /** Starts an HTTP upload; only its completed descriptor reaches the socket. */
+    fun onLocalClipboardBlob(mime: String, bytes: ByteArray) {
+        blobCoordinator.upload(mime, bytes)
     }
 
     /**

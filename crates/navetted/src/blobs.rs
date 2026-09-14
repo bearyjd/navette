@@ -191,8 +191,10 @@ impl BlobWriter {
         if self.reserved == 0 {
             return Err(BlobStoreError::InvalidDescriptor);
         }
-        let file = self.file.take().expect("writer not already finished");
-        file.sync_all()?;
+        self.file
+            .as_mut()
+            .expect("writer not already finished")
+            .sync_all()?;
         let final_path = self.part_path.with_extension("");
         let descriptor = BlobDescriptor {
             id: self.id.clone(),
@@ -208,9 +210,15 @@ impl BlobWriter {
             &metadata_part,
             serde_json::to_vec(&descriptor).expect("BlobDescriptor serializes"),
         )?;
-        fs::rename(&metadata_part, &metadata_path)?;
         fs::rename(&self.part_path, &final_path)?;
+        if let Err(error) = fs::rename(&metadata_part, &metadata_path) {
+            let _ = fs::remove_file(&final_path);
+            let _ = fs::remove_file(&metadata_part);
+            return Err(BlobStoreError::Io(error));
+        }
+        self.file.take();
         self.store.release(&self.session, self.reserved);
+        self.reserved = 0;
         Ok(descriptor)
     }
 }
