@@ -88,8 +88,7 @@ internal class HttpBlobTransport(
                     (URL(collectionUrl + "/" + blob.id).openConnection() as HttpURLConnection)
                 connection.setRequestProperty("Authorization", "Bearer $token")
                 if (connection.responseCode != HttpURLConnection.HTTP_OK ||
-                    connection.contentType != blob.mime ||
-                    connection.contentLengthLong != blob.size
+                    connection.contentType != blob.mime
                 ) {
                     return@runCatching null
                 }

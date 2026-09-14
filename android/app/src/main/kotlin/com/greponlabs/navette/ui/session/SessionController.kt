@@ -158,6 +158,7 @@ internal class SessionController(
             transport = HttpBlobTransport(mediaUrl, token),
             announce = { blob -> client.sendInput(MediaInput.SetClipboardBlob(blob)) },
         )
+    private var suppressNextLocalBlob = false
 
     /**
      * Guards [decoder], [surface] and [surfaceSize], which two threads reach:
@@ -287,7 +288,10 @@ internal class SessionController(
             if (toWrite != null) scope.launch { onClipboardPush?.invoke(toWrite) }
         }
         client.onClipboardBlob = { blob ->
-            blobCoordinator.download(blob) { bytes -> onClipboardBlobPush?.invoke(blob, bytes) }
+            blobCoordinator.download(blob) { bytes ->
+                suppressNextLocalBlob = true
+                onClipboardBlobPush?.invoke(blob, bytes)
+            }
         }
         // connect() before the state collector, not after. The client's flow
         // starts at Disconnected; connect() moves it to Connecting
@@ -337,6 +341,7 @@ internal class SessionController(
         client.onClipboard = null
         client.onClipboardBlob = null
         blobCoordinator.invalidate()
+        suppressNextLocalBlob = false
         // Clear the surface BEFORE stopping the decoder. Cancelling
         // packetsJob above does not preempt a route() already inside
         // startDecoder, and with the old order that call could publish a
@@ -704,6 +709,10 @@ internal class SessionController(
 
     /** Starts an HTTP upload; only its completed descriptor reaches the socket. */
     fun onLocalClipboardBlob(mime: String, bytes: ByteArray) {
+        if (suppressNextLocalBlob) {
+            suppressNextLocalBlob = false
+            return
+        }
         blobCoordinator.upload(mime, bytes)
     }
 
