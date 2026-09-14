@@ -23,9 +23,10 @@ phone's portrait size fails outright.
   `src/test/kotlin` use the exact fixtures `navette-protocol`'s own Rust
   tests assert against -- if the wire shape ever changes there, these are
   meant to drift out of sync loudly, not silently.
-- `net/NavetteClient.kt` -- one WebSocket connection to a `navetted` host,
-  request/response correlated by `request_id`. No reconnect/backoff, no
-  multi-host registry -- out of scope for this slice.
+- `net/NavetteClient.kt` -- one active WebSocket connection to a `navetted`
+  host, request/response correlated by `request_id`. `PairingStore` keeps an
+  encrypted, versioned multi-host registry; selecting a host replaces the
+  active client safely. No reconnect/backoff is implied by the registry.
 - `net/MediaProtocol.kt` -- Kotlin mirror of
   `crates/navette-protocol/src/media.rs`: the 44-byte big-endian frame
   header, `StreamConfig`, and the `MediaInput` JSON types, with every
@@ -36,10 +37,9 @@ phone's portrait size fails outright.
 - `media/` -- `StreamGate` (picks one stream per session and ignores the
   rest), `AnnexB` (pulls SPS/PPS out of `codec_config` for `csd-0`/`csd-1`),
   and `H264Decoder` (`MediaCodec` in async mode, decoding to a `Surface`).
-- `ui/` -- three screens switched on state, not a navigation graph (Connect,
-  Drawer, Session). Navigation Compose was considered and left out: with a
-  back-stack no deeper than session-to-drawer, a third branch is simpler than
-  a nav graph plus a dependency. Revisit at a fourth screen.
+- `ui/` -- four state-switched screens, not a navigation graph (Connect/add,
+  host list, Drawer, Session). Navigation Compose remains unnecessary while
+  history is only host-list/drawer/session back navigation.
 - `ui/session/` -- `SessionScreen` plus the pure logic it uses:
   `InputMapper` (touch/keys/IME text to `MediaInput`, viewport clamping,
   touch rescaling, scroll units), `KeycodeMap` (Android keycodes and

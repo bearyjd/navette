@@ -174,10 +174,14 @@ whenever the daemon was started with one — otherwise the clients read the
 default path and present a token the daemon will reject.
 
 Android pairs by scanning the QR from `navette token --qr`, or by manual
-host/token entry as a fallback for devices without Google Play Services.
-Either path produces the same stored pairing; scanning a new QR (or entering
-one manually) replaces whatever was paired before, since the app holds one
-host at a time.
+host/token entry as a fallback for devices without Google Play Services. The
+app stores an encrypted host registry and resumes its active host at launch.
+Use **Computers** from the workbench (or **Saved computers** from a failed or
+unauthorized connection screen) to add, select, or delete hosts. Re-pairing
+the same normalized host and port replaces that host's rotated token; another
+port is a distinct host entry. Selecting a host closes the prior control
+connection and leaves its session before connecting to the new one. Deleting
+the active host returns to the host list without silently choosing another.
 
 ## Health checks
 

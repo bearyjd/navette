@@ -69,6 +69,7 @@ fun DrawerScreen(
     onRefresh: () -> Unit,
     onRunApp: (String) -> Unit,
     onAttachSession: (String) -> Unit,
+    onManageHosts: () -> Unit,
     onSnackbarDismissed: (shown: String) -> Unit,
 ) {
     val snackbarHostState = remember { SnackbarHostState() }
@@ -94,6 +95,7 @@ fun DrawerScreen(
                     }
                 },
                 actions = {
+                    TextButton(onClick = onManageHosts) { Text("Computers") }
                     if (isLoading) {
                         CircularProgressIndicator(
                             modifier = Modifier.padding(horizontal = 20.dp).size(22.dp),

@@ -32,7 +32,11 @@ import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import com.greponlabs.navette.net.ConnectionState
 import com.greponlabs.navette.net.DEFAULT_NAVETTE_PORT
 import com.greponlabs.navette.net.Pairing
+import com.greponlabs.navette.net.canonicalHost
+import com.greponlabs.navette.net.canonicalPort
+import com.greponlabs.navette.net.normalizePairingToken
 import com.greponlabs.navette.net.parsePairingUri
+import com.greponlabs.navette.net.validatedPairing
 
 /**
  * Pairs with a `navetted` host by scanning the QR code it renders
@@ -45,8 +49,8 @@ import com.greponlabs.navette.net.parsePairingUri
  * Services is not guaranteed to be present, and because it is the only way
  * to test pairing without a physical camera.
  *
- * Not a saved multi-host registry -- that's M4 (docs/ROADMAP.md, "Cloud +
- * polish"). One pairing, one slot in [com.greponlabs.navette.net.PairingStore].
+ * A successful pairing upserts the encrypted host registry; re-pairing the
+ * same endpoint replaces only that endpoint's rotated token.
  */
 /**
  * Builds a [Pairing] from the manual-entry fields, or null when they are not
@@ -61,9 +65,8 @@ import com.greponlabs.navette.net.parsePairingUri
  * scanned one accept exactly the same values.
  */
 internal fun manualPairing(host: String, port: String, token: String): Pairing? {
-    val trimmedHost = host.trim().takeIf { it.isNotBlank() } ?: return null
-    val trimmedToken = token.trim().takeIf { it.isNotBlank() } ?: return null
-    return Pairing(trimmedHost, parsePort(port) ?: return null, trimmedToken)
+    val parsedPort = parsePort(port) ?: return null
+    return validatedPairing(host.trim(), parsedPort, token.trim())
 }
 
 /**
@@ -72,13 +75,15 @@ internal fun manualPairing(host: String, port: String, token: String): Pairing? 
  * duplicate the token's shape for the same reason: a second definition is a
  * second thing to drift.
  */
-internal fun parsePort(raw: String): Int? = raw.trim().toIntOrNull()?.takeIf { it in 1..65535 }
+internal fun parsePort(raw: String): Int? = canonicalPort(raw.trim())
 
 @Composable
 fun ConnectScreen(
     connection: ConnectionState,
     onPaired: (Pairing) -> Unit,
     onRetry: () -> Unit,
+    onBack: (() -> Unit)? = null,
+    onManageHosts: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -113,6 +118,8 @@ fun ConnectScreen(
         verticalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterVertically),
     ) {
         Text(text = "Navette", style = MaterialTheme.typography.headlineMedium)
+        if (onBack != null) TextButton(onClick = onBack) { Text("Back to computers") }
+        if (onManageHosts != null) TextButton(onClick = onManageHosts) { Text("Saved computers") }
         Text(text = "Scan the pairing QR code shown by \"navette token --qr\".")
 
         Button(

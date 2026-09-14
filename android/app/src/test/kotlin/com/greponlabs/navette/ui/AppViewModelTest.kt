@@ -3,6 +3,8 @@ package com.greponlabs.navette.ui
 import com.greponlabs.navette.net.ConnectionState
 import com.greponlabs.navette.net.NavetteApi
 import com.greponlabs.navette.net.Pairing
+import com.greponlabs.navette.net.PairingRegistry
+import com.greponlabs.navette.net.SavedPairing
 import com.greponlabs.navette.net.PairingStore
 import com.greponlabs.navette.protocol.ApiError
 import com.greponlabs.navette.protocol.App
@@ -68,6 +70,7 @@ private class FakeNavetteApi : NavetteApi {
 /** Hand-written fake, per this project's testing convention -- no mocking framework. */
 private class FakePairingStore(initial: Pairing? = null) : PairingStore {
     private var stored: Pairing? = initial
+    private var registry = initial?.let { PairingRegistry(listOf(SavedPairing("initial", it)), "initial") } ?: PairingRegistry()
 
     // Models EncryptedPairingStore under a failed keystore. `by lazy` does not
     // memoize a thrown initializer, so the real store re-throws on every
@@ -85,8 +88,35 @@ private class FakePairingStore(initial: Pairing? = null) : PairingStore {
         stored = pairing
     }
 
+    override fun loadRegistry(): PairingRegistry {
+        if (failOnLoad) throw IllegalStateException("keystore unavailable")
+        return registry
+    }
+
+    override fun upsert(pairing: Pairing): PairingRegistry {
+        if (failOnSave) throw IllegalStateException("keystore unavailable")
+        val existing = registry.hosts.firstOrNull { it.pairing.host == pairing.host && it.pairing.port == pairing.port }
+        val saved = SavedPairing(existing?.id ?: "host-${registry.hosts.size + 1}", pairing)
+        registry = PairingRegistry(registry.hosts.filterNot { it.id == saved.id } + saved, saved.id)
+        stored = pairing
+        return registry
+    }
+
+    override fun select(id: String): PairingRegistry {
+        registry = PairingRegistry(registry.hosts, id)
+        stored = registry.active?.pairing
+        return registry
+    }
+
+    override fun delete(id: String): PairingRegistry {
+        registry = PairingRegistry(registry.hosts.filterNot { it.id == id }, registry.activeId?.takeIf { it != id })
+        stored = registry.active?.pairing
+        return registry
+    }
+
     override fun clear() {
         stored = null
+        registry = PairingRegistry()
     }
 }
 
@@ -528,5 +558,67 @@ class AppViewModelTest {
                 null,
                 viewModel.state.value.activeSession,
             )
+        }
+
+    @Test
+    fun `switching hosts closes the old client and clears the active session`() =
+        runTest {
+            val first = FakeNavetteApi()
+            val second = FakeNavetteApi()
+            val store = FakePairingStore()
+            val vm = AppViewModel(pairingStore = store, clientFactory = { if (it.host == "one") first else second })
+            val one = Pairing("one", 9417, "one-token")
+            val two = Pairing("two", 9417, "two-token")
+            vm.onEvent(AppEvent.Paired(one))
+            vm.onEvent(AppEvent.Paired(two))
+            val firstId = vm.state.value.registry.hosts.first { it.pairing == one }.id
+            vm.onEvent(AppEvent.SelectHost(firstId))
+            testScheduler.advanceUntilIdle()
+            assertTrue(second.closed)
+            assertEquals(one, vm.state.value.pairing)
+            assertEquals(null, vm.state.value.activeSession)
+        }
+
+    @Test
+    fun `deleting inactive host preserves active connection`() =
+        runTest {
+            val store = FakePairingStore()
+            val vm = AppViewModel(pairingStore = store, clientFactory = { fake })
+            val one = Pairing("one", 9417, "one-token")
+            val two = Pairing("two", 9417, "two-token")
+            vm.onEvent(AppEvent.Paired(one))
+            vm.onEvent(AppEvent.Paired(two))
+            val inactiveId = vm.state.value.registry.hosts.first { it.pairing == one }.id
+            vm.onEvent(AppEvent.DeleteHost(inactiveId))
+            assertEquals(two, vm.state.value.pairing)
+            assertEquals(1, vm.state.value.registry.hosts.size)
+            assertTrue(!vm.state.value.showingHosts)
+        }
+
+    @Test
+    fun `deleting active host disconnects and returns to host list without fallback`() =
+        runTest {
+            val store = FakePairingStore()
+            val vm = AppViewModel(pairingStore = store, clientFactory = { fake })
+            vm.onEvent(AppEvent.Paired(Pairing("one", 9417, "one-token")))
+            val id = vm.state.value.registry.activeId!!
+            vm.onEvent(AppEvent.DeleteHost(id))
+            assertEquals(null, vm.state.value.pairing)
+            assertEquals(ConnectionState.Disconnected, vm.state.value.connection)
+            assertTrue(vm.state.value.showingHosts)
+            assertTrue(fake.closed)
+        }
+
+    @Test
+    fun `saved hosts remain reachable after the active host fails`() =
+        runTest {
+            val store = FakePairingStore()
+            val vm = AppViewModel(pairingStore = store, clientFactory = { fake })
+            vm.onEvent(AppEvent.Paired(Pairing("offline", 9417, "offline-token")))
+            fake.emit(ConnectionState.Failed("offline"))
+            testScheduler.advanceUntilIdle()
+            vm.onEvent(AppEvent.ShowHosts)
+            assertTrue(vm.state.value.showingHosts)
+            assertEquals(1, vm.state.value.registry.hosts.size)
         }
 }
