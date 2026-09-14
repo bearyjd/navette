@@ -22,6 +22,7 @@ use wprs::serialization::wayland::{
 };
 use wprs::serialization::{Event, RecvType, Request};
 
+use crate::blobs::BlobStore;
 use crate::clipboard::{ClipboardSync, GuestEvent, SyncAction};
 use crate::media::{MediaCommand, MediaHub};
 
@@ -36,6 +37,7 @@ static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone)]
 pub struct BridgeManager {
     media: MediaHub,
+    blobs: BlobStore,
     workers: Arc<Mutex<HashMap<String, BridgeHandle>>>,
 }
 
@@ -53,9 +55,10 @@ impl BridgeHandle {
 }
 
 impl BridgeManager {
-    pub fn new(media: MediaHub) -> Self {
+    pub fn new(media: MediaHub, blobs: BlobStore) -> Self {
         Self {
             media,
+            blobs,
             workers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -76,15 +79,21 @@ impl BridgeManager {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let media = self.media.clone();
+        let blobs = self.blobs.clone();
         let name = session.name.clone();
         let worker_name = name.clone();
         let socket = PathBuf::from(&session.socket_path);
         let thread = thread::Builder::new()
             .name(format!("navette-bridge-{name}"))
             .spawn(move || {
-                if let Err(error) =
-                    run_bridge(&worker_name, socket, media.clone(), input, worker_stop)
-                {
+                if let Err(error) = run_bridge(
+                    &worker_name,
+                    socket,
+                    media.clone(),
+                    blobs,
+                    input,
+                    worker_stop,
+                ) {
                     tracing::error!(session = %worker_name, %error, "session bridge stopped");
                 }
                 media.unregister_session(&worker_name);
@@ -185,6 +194,7 @@ struct WorkerState {
 struct SessionIo<'a> {
     transport: &'a WprsTransport,
     media: &'a MediaHub,
+    blobs: &'a BlobStore,
     encode: &'a EncodeQueue,
     session: &'a str,
 }
@@ -193,6 +203,7 @@ fn run_bridge(
     session: &str,
     socket: PathBuf,
     media: MediaHub,
+    blobs: BlobStore,
     mut commands: tokio::sync::mpsc::Receiver<MediaCommand>,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -228,6 +239,7 @@ fn run_bridge(
     let io = SessionIo {
         transport: &transport,
         media: &media,
+        blobs: &blobs,
         encode: &encode,
         session,
     };
@@ -475,12 +487,27 @@ fn handle_guest_data(clipboard: &mut ClipboardSync, request: DataRequest, io: &S
             mime_types: metadata.mime_types,
         },
         DataRequest::TransferData(DataSource::Selection, data) => {
-            GuestEvent::TransferFromGuest { bytes: data.0 }
+            match clipboard.pending_guest_blob_mime() {
+                Some(mime) => {
+                    let stored = io
+                        .blobs
+                        .begin_write(io.session, &mime)
+                        .and_then(|mut writer| {
+                            writer.write_chunk(&data.0)?;
+                            writer.finish()
+                        });
+                    match stored {
+                        Ok(blob) => GuestEvent::TransferBlobFromGuest { blob },
+                        Err(_) => GuestEvent::TransferBlobFailed,
+                    }
+                }
+                None => GuestEvent::TransferFromGuest { bytes: data.0 },
+            }
         }
         DataRequest::DestinationRequest(DataDestinationRequest::RequestDataTransfer(
             DataSource::Selection,
-            _mime,
-        )) => GuestEvent::PasteRequested,
+            mime,
+        )) => GuestEvent::PasteRequested { mime },
         // Primary selection and drag-and-drop ride these same enums and are
         // out of scope: they fall through without touching clipboard state.
         _ => return,
@@ -529,6 +556,14 @@ fn apply_sync_action(clipboard: &mut ClipboardSync, action: SyncAction, io: &Ses
                 clipboard.forget_phone_echo();
             }
         }
+        SyncAction::PushBlobToPhone { blob } => {
+            let reached = io
+                .media
+                .publish_message(io.session, MediaServerMessage::ClipboardBlob { blob });
+            if reached == 0 {
+                clipboard.forget_phone_echo();
+            }
+        }
         SyncAction::OfferToGuest { mime_types } => {
             io.transport.send(Event::Data(DataEvent::DestinationEvent(
                 DataDestinationEvent::SelectionSet(
@@ -538,6 +573,13 @@ fn apply_sync_action(clipboard: &mut ClipboardSync, action: SyncAction, io: &Ses
             )));
         }
         SyncAction::AnswerGuest { bytes } => {
+            io.transport.send(Event::Data(DataEvent::TransferData(
+                DataSource::Selection,
+                DataToTransfer(bytes),
+            )));
+        }
+        SyncAction::AnswerGuestBlob { blob } => {
+            let bytes = io.blobs.read(io.session, &blob).unwrap_or_default();
             io.transport.send(Event::Data(DataEvent::TransferData(
                 DataSource::Selection,
                 DataToTransfer(bytes),
@@ -642,6 +684,13 @@ fn pump_input(
                 ..
             } => {
                 let action = clipboard.on_phone_clipboard(text);
+                apply_sync_action(clipboard, action, io);
+            }
+            MediaCommand::Input {
+                input: MediaInput::SetClipboardBlob { blob },
+                ..
+            } => {
+                let action = clipboard.on_phone_blob(blob);
                 apply_sync_action(clipboard, action, io);
             }
             MediaCommand::Input {
@@ -1216,8 +1265,8 @@ mod tests {
     #[test]
     fn start_reaps_a_dead_worker_and_restarts_the_session() {
         let media = MediaHub::default();
-        let manager = BridgeManager::new(media.clone());
         let dir = tempfile::tempdir().unwrap();
+        let manager = BridgeManager::new(media.clone(), BlobStore::new(dir.path().join("blobs")));
 
         let dead_socket = dir.path().join("no-such-socket");
         let dead_session = session_fixture("dead", dead_socket.to_string_lossy().into_owned());
@@ -1951,6 +2000,8 @@ mod tests {
         transport: WprsTransport,
         wprsd: FakeWprsd,
         media: MediaHub,
+        _blob_dir: tempfile::TempDir,
+        blobs: BlobStore,
         // `Option` so a test can simulate nobody being attached (`self.client
         // = None`) without the partial-move `ClipboardFixture` would suffer
         // as a plain `MediaAttachment` field -- every other method here
@@ -1962,6 +2013,8 @@ mod tests {
     impl ClipboardFixture {
         fn new() -> Self {
             let media = MediaHub::default();
+            let blob_dir = tempfile::tempdir().unwrap();
+            let blobs = BlobStore::new(blob_dir.path().join("blobs"));
             let commands = media.register_session("s1");
             let client = media.attach("s1").expect("attach to the fixture session");
             let (transport, wprsd) = FakeWprsd::connect();
@@ -1970,6 +2023,8 @@ mod tests {
                 transport,
                 wprsd,
                 media,
+                _blob_dir: blob_dir,
+                blobs,
                 client: Some(client),
                 commands,
             }
@@ -1981,6 +2036,7 @@ mod tests {
             let io = SessionIo {
                 transport: &self.transport,
                 media: &self.media,
+                blobs: &self.blobs,
                 encode: &self.worker.encode,
                 session: "s1",
             };
@@ -1993,6 +2049,7 @@ mod tests {
             let io = SessionIo {
                 transport: &self.transport,
                 media: &self.media,
+                blobs: &self.blobs,
                 encode: &self.worker.encode,
                 session: "s1",
             };
@@ -2048,6 +2105,96 @@ mod tests {
             },
             "the guest's clipboard text must reach the media hub"
         );
+    }
+
+    #[tokio::test]
+    async fn a_guest_image_copy_is_stored_then_published_as_a_descriptor() {
+        let mut fixture = ClipboardFixture::new();
+        fixture.send_requests(vec![data_request(DataRequest::SourceRequest(
+            DataSourceRequest::SetSelection(
+                DataSource::Selection,
+                SourceMetadata::from_mime_types(vec!["image/png".to_string()]),
+            ),
+        ))]);
+        assert!(matches!(
+            fixture.wprsd.recv(),
+            Event::Data(DataEvent::SourceEvent(
+                DataSourceEvent::MimeTypeSendRequestedByDestination(DataSource::Selection, mime)
+            )) if mime == "image/png"
+        ));
+
+        fixture.send_requests(vec![data_request(DataRequest::TransferData(
+            DataSource::Selection,
+            DataToTransfer(b"png".to_vec()),
+        ))]);
+        let MediaServerMessage::ClipboardBlob { blob } =
+            recv_message(fixture.client.as_ref().expect("fixture client attached")).await
+        else {
+            panic!("guest image must publish a descriptor, not bytes");
+        };
+        assert_eq!(blob.mime, "image/png");
+        assert_eq!(fixture.blobs.read("s1", &blob).unwrap(), b"png");
+    }
+
+    #[test]
+    fn a_phone_image_descriptor_offers_image_mimes_and_missing_data_answers_empty() {
+        let mut fixture = ClipboardFixture::new();
+        let mut writer = fixture.blobs.begin_write("s1", "image/png").unwrap();
+        writer.write_chunk(b"png").unwrap();
+        let blob = writer.finish().unwrap();
+        fixture
+            .client
+            .as_ref()
+            .expect("fixture client attached")
+            .submit_input(MediaInput::SetClipboardBlob { blob: blob.clone() })
+            .unwrap();
+        fixture.pump();
+        assert!(matches!(
+            fixture.wprsd.recv(),
+            Event::Data(DataEvent::DestinationEvent(
+                DataDestinationEvent::SelectionSet(DataSource::Selection, metadata)
+            )) if metadata.mime_types == vec!["image/png", "image/jpeg", "image/webp"]
+        ));
+        fixture.send_requests(vec![data_request(DataRequest::DestinationRequest(
+            DataDestinationRequest::RequestDataTransfer(
+                DataSource::Selection,
+                "image/png".to_string(),
+            ),
+        ))]);
+        assert!(matches!(
+            fixture.wprsd.recv(),
+            Event::Data(DataEvent::TransferData(
+                DataSource::Selection,
+                DataToTransfer(bytes)
+            )) if bytes == b"png"
+        ));
+
+        let missing = navette_protocol::media::BlobDescriptor {
+            id: "11111111111111111111111111111111".into(),
+            mime: "image/png".into(),
+            size: 3,
+        };
+        fixture
+            .client
+            .as_ref()
+            .expect("fixture client attached")
+            .submit_input(MediaInput::SetClipboardBlob { blob: missing })
+            .unwrap();
+        fixture.pump();
+        let _offered = fixture.wprsd.recv();
+        fixture.send_requests(vec![data_request(DataRequest::DestinationRequest(
+            DataDestinationRequest::RequestDataTransfer(
+                DataSource::Selection,
+                "image/png".to_string(),
+            ),
+        ))]);
+        assert!(matches!(
+            fixture.wprsd.recv(),
+            Event::Data(DataEvent::TransferData(
+                DataSource::Selection,
+                DataToTransfer(bytes)
+            )) if bytes.is_empty()
+        ));
     }
 
     /// The `bridge.rs` wiring for `ClipboardSync::forget_phone_echo`:

@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod app_index;
+pub mod blobs;
 pub mod bridge;
 pub mod clipboard;
 pub mod guard;

@@ -3,11 +3,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Json;
 use axum::Router;
+use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response as HttpResponse};
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use futures_util::{SinkExt, StreamExt};
 use navette_protocol::media::{
     MAX_INPUT_MESSAGE, MEDIA_WEBSOCKET_SUBPROTOCOL, MediaInput, MediaServerMessage,
@@ -19,6 +20,7 @@ use navette_protocol::{
 use serde_json::{Value, json};
 
 use crate::app_index::AppIndex;
+use crate::blobs::{BlobStore, BlobStoreError};
 use crate::bridge::BridgeManager;
 use crate::media::{MediaHub, MediaHubError};
 use crate::registry::{RegistryError, validate_session_name};
@@ -31,6 +33,7 @@ pub struct ApiState<R: ProcessRunner> {
     pub apps: Arc<AppIndex>,
     pub supervisor: Arc<Supervisor<R>>,
     pub media: MediaHub,
+    pub blobs: BlobStore,
     pub bridges: BridgeManager,
     pub auth: Arc<navette_auth::AuthToken>,
 }
@@ -41,6 +44,7 @@ impl<R: ProcessRunner> Clone for ApiState<R> {
             apps: Arc::clone(&self.apps),
             supervisor: Arc::clone(&self.supervisor),
             media: self.media.clone(),
+            blobs: self.blobs.clone(),
             bridges: self.bridges.clone(),
             auth: Arc::clone(&self.auth),
         }
@@ -54,11 +58,13 @@ impl<R: ProcessRunner> ApiState<R> {
         auth: Arc<navette_auth::AuthToken>,
     ) -> Self {
         let media = MediaHub::default();
+        let blobs = BlobStore::new(supervisor.blob_root());
         Self {
             apps,
             supervisor,
-            bridges: BridgeManager::new(media.clone()),
+            bridges: BridgeManager::new(media.clone(), blobs.clone()),
             media,
+            blobs,
             auth,
         }
     }
@@ -86,6 +92,8 @@ pub fn router<R: ProcessRunner>(state: ApiState<R>) -> Router {
         .route("/healthz", get(health))
         .route("/v1/ws", any(websocket::<R>))
         .route("/v1/sessions/{session}/media", any(media_websocket::<R>))
+        .route("/v1/sessions/{session}/blobs", post(upload_blob::<R>))
+        .route("/v1/sessions/{session}/blobs/{id}", get(download_blob::<R>))
         .layer(axum::middleware::from_fn_with_state(
             auth,
             crate::guard::authenticate,
@@ -94,6 +102,82 @@ pub fn router<R: ProcessRunner>(state: ApiState<R>) -> Router {
             crate::guard::reject_browser_origin,
         ))
         .with_state(state)
+}
+
+async fn upload_blob<R: ProcessRunner>(
+    Path(session): Path<String>,
+    State(state): State<ApiState<R>>,
+    headers: HeaderMap,
+    body: Body,
+) -> HttpResponse {
+    let Some(mime) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    };
+    if mime.contains(';') {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
+
+    let mut writer = match state.blobs.begin_write(&session, mime) {
+        Ok(writer) => writer,
+        Err(error) => return blob_error_response(error),
+    };
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        };
+        if let Err(error) = writer.write_chunk(&chunk) {
+            return blob_error_response(error);
+        }
+    }
+    match writer.finish() {
+        Ok(blob) => (StatusCode::CREATED, Json(blob)).into_response(),
+        Err(error) => blob_error_response(error),
+    }
+}
+
+async fn download_blob<R: ProcessRunner>(
+    Path((session, id)): Path<(String, String)>,
+    State(state): State<ApiState<R>>,
+) -> HttpResponse {
+    let placeholder = navette_protocol::media::BlobDescriptor {
+        id,
+        mime: "image/png".into(),
+        size: 1,
+    };
+    if placeholder.validate().is_err() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(blob) = state.blobs.descriptor(&session, &placeholder.id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match state.blobs.read(&session, &blob) {
+        Ok(bytes) => {
+            let mut response = Body::from(bytes).into_response();
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                blob.mime.parse().expect("BlobDescriptor validates MIME"),
+            );
+            response
+        }
+        Err(error) => blob_error_response(error),
+    }
+}
+
+fn blob_error_response(error: BlobStoreError) -> HttpResponse {
+    match error {
+        BlobStoreError::UnsupportedMime => StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response(),
+        BlobStoreError::BlobTooLarge => StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        BlobStoreError::SessionBudgetExceeded => StatusCode::INSUFFICIENT_STORAGE.into_response(),
+        BlobStoreError::InvalidSession
+        | BlobStoreError::InvalidDescriptor
+        | BlobStoreError::NotFound => StatusCode::NOT_FOUND.into_response(),
+        BlobStoreError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 #[cfg(test)]
@@ -507,6 +591,7 @@ mod tests {
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tower::ServiceExt;
 
     use super::*;
     use crate::registry::Registry;
@@ -908,5 +993,119 @@ mod tests {
             42
         );
         assert_eq!(extract_request_id("not json"), 0);
+    }
+
+    #[tokio::test]
+    async fn blob_routes_require_auth_reject_bad_mime_and_round_trip_a_session_blob() {
+        let temp = TempDir::new().unwrap();
+        let state = test_state(&temp);
+        let token = state.auth.render();
+        let app = router(state);
+
+        let unauthenticated = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/sessions/work/blobs")
+            .header("content-type", "image/png")
+            .body(axum::body::Body::from("png"))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(unauthenticated).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let unsupported = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/sessions/work/blobs")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "image/svg+xml")
+            .body(axum::body::Body::from("svg"))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(unsupported).await.unwrap().status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+
+        let upload = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/sessions/work/blobs")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "image/png")
+            .body(axum::body::Body::from("png"))
+            .unwrap();
+        let response = app.clone().oneshot(upload).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let blob: navette_protocol::media::BlobDescriptor = serde_json::from_slice(&body).unwrap();
+
+        let download = axum::http::Request::builder()
+            .uri(format!("/v1/sessions/work/blobs/{}", blob.id))
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(download).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "image/png");
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap(),
+            "png"
+        );
+    }
+
+    #[tokio::test]
+    async fn blob_routes_return_not_found_payload_too_large_and_insufficient_storage() {
+        let temp = TempDir::new().unwrap();
+        let mut state = test_state(&temp);
+        state.blobs = BlobStore::with_limits(temp.path().join("limited-blobs"), 4, 6);
+        let token = state.auth.render();
+        let app = router(state);
+
+        let missing = axum::http::Request::builder()
+            .uri("/v1/sessions/work/blobs/0123456789abcdef0123456789abcdef")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(missing).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let too_large = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/sessions/work/blobs")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "image/png")
+            .body(axum::body::Body::from("12345"))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(too_large).await.unwrap().status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+
+        let first = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/sessions/work/blobs")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "image/png")
+            .body(axum::body::Body::from("1234"))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(first).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+        let exhausted = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/sessions/work/blobs")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "image/png")
+            .body(axum::body::Body::from("123"))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(exhausted).await.unwrap().status(),
+            StatusCode::INSUFFICIENT_STORAGE
+        );
     }
 }

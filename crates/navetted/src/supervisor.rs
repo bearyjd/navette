@@ -135,6 +135,11 @@ impl<R: ProcessRunner> Supervisor<R> {
         }
     }
 
+    /// Runtime-only root for session-scoped bulk clipboard blobs.
+    pub fn blob_root(&self) -> PathBuf {
+        self.xdg_runtime_dir.join("navette-blobs")
+    }
+
     pub fn with_timeouts(
         mut self,
         readiness_timeout: Duration,
