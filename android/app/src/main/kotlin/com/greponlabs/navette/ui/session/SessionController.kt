@@ -149,13 +149,14 @@ internal class SessionController(
     // in open() -- so it is guarded by `lock` rather than getting its own.
     private val bridge: ClipboardBridge,
     private val client: MediaSessionClient = OkHttpMediaSessionClient(mediaUrl, token),
+    private val blobTransport: BlobTransport = HttpBlobTransport(mediaUrl, token),
 ) {
     private val gate = StreamGate()
     private val scope = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
     private val blobCoordinator =
         ClipboardBlobCoordinator(
             scope = scope,
-            transport = HttpBlobTransport(mediaUrl, token),
+            transport = blobTransport,
             announce = { blob -> client.sendInput(MediaInput.SetClipboardBlob(blob)) },
         )
     private var suppressNextLocalBlob = false
@@ -284,6 +285,11 @@ internal class SessionController(
         // runs on OkHttp's reader thread, and onClipboardPush ends in a
         // ClipboardManager call the screen must make from the main thread.
         client.onClipboard = { text ->
+            // A text clipboard value is newer than any in-flight image blob
+            // operation, even if the text bridge later identifies it as an
+            // echo. Invalidate before making that decision so no old fetch
+            // can overwrite the phone after this callback returns.
+            blobCoordinator.invalidate()
             val toWrite = synchronized(lock) { bridge.onRemoteClipboard(text) }
             if (toWrite != null) scope.launch { onClipboardPush?.invoke(toWrite) }
         }
@@ -703,6 +709,7 @@ internal class SessionController(
      * genuinely new value reaches [client].
      */
     fun onLocalClipboard(text: String) {
+        blobCoordinator.invalidate()
         val forward = synchronized(lock) { bridge.onLocalClipboard(text) } ?: return
         sendClipboardOrRetryOnConnect(forward)
     }
@@ -722,6 +729,7 @@ internal class SessionController(
      * why a resume needs a suppression the listener path does not.
      */
     fun onLocalClipboardResume(text: String) {
+        blobCoordinator.invalidate()
         val forward = synchronized(lock) { bridge.onLocalClipboardResume(text) } ?: return
         sendClipboardOrRetryOnConnect(forward)
     }

@@ -7,6 +7,7 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Test
+import kotlin.concurrent.thread
 
 private class FakeBlobTransport : BlobTransport {
     val uploads = mutableListOf<CompletableDeferred<BlobDescriptor?>>()
@@ -56,5 +57,20 @@ class ClipboardBlobCoordinatorTest {
         runCurrent()
 
         assertEquals(emptyList<ByteArray>(), received)
+    }
+
+    @Test
+    fun crossThreadInvalidationMakesAnAlreadyStartedUploadStale() = runTest {
+        val transport = FakeBlobTransport()
+        val announced = mutableListOf<BlobDescriptor>()
+        val coordinator = ClipboardBlobCoordinator(backgroundScope, transport, announced::add)
+
+        coordinator.upload("image/png", byteArrayOf(1))
+        runCurrent()
+        thread { coordinator.invalidate() }.join()
+        transport.uploads.single().complete(first)
+        runCurrent()
+
+        assertEquals(emptyList<BlobDescriptor>(), announced)
     }
 }

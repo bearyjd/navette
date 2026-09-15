@@ -259,6 +259,7 @@ impl<R: ProcessRunner> Supervisor<R> {
             .map_err(|_| SupervisorError::RegistryLock)?
             .remove(name)?;
         let _ = fs::remove_dir_all(self.runtime_root.join(name));
+        let _ = fs::remove_dir_all(self.blob_root().join(name));
         let _ = fs::remove_file(self.xdg_runtime_dir.join(&session.wayland_display));
         Ok(removed)
     }
@@ -572,10 +573,22 @@ mod tests {
         let runner = Arc::new(FakeRunner::new(runtime));
         let supervisor = harness(runner.clone(), &temp);
         supervisor.start(&app(), Some("work")).await.unwrap();
+        let blob_dir = supervisor.blob_root().join("work");
+        fs::create_dir_all(&blob_dir).unwrap();
+        fs::write(blob_dir.join("stale-blob"), b"old").unwrap();
 
         let removed = supervisor.kill("work").await.unwrap();
         assert_eq!(removed.name, "work");
         assert!(supervisor.registry.lock().unwrap().get("work").is_none());
+        assert!(
+            !blob_dir.exists(),
+            "killing a session must discard its blob namespace before the name can be reused"
+        );
+        supervisor.start(&app(), Some("work")).await.unwrap();
+        assert!(
+            !blob_dir.exists(),
+            "recreating the same session name must not resurrect stale blob data"
+        );
         assert_eq!(
             runner.state.lock().unwrap().terminated,
             [(101, false), (100, false)]

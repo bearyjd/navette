@@ -7,6 +7,7 @@ import com.greponlabs.navette.net.validate
 import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -28,27 +29,27 @@ internal class ClipboardBlobCoordinator(
     private val transport: BlobTransport,
     private val announce: (BlobDescriptor) -> Unit,
 ) {
-    private var generation: Long = 0
+    private val generation = AtomicLong(0)
 
     fun upload(mime: String, bytes: ByteArray) {
-        val claim = ++generation
+        val claim = generation.incrementAndGet()
         scope.launch {
             val descriptor = transport.upload(mime, bytes) ?: return@launch
-            if (claim == generation) announce(descriptor)
+            if (claim == generation.get()) announce(descriptor)
         }
     }
 
     fun download(blob: BlobDescriptor, accept: (ByteArray) -> Unit) {
-        val claim = ++generation
+        val claim = generation.incrementAndGet()
         scope.launch {
             val bytes = transport.download(blob) ?: return@launch
-            if (claim == generation) accept(bytes)
+            if (claim == generation.get()) accept(bytes)
         }
     }
 
     /** Call whenever a media connection is rebuilt; clipboard blobs do not replay. */
     fun invalidate() {
-        generation++
+        generation.incrementAndGet()
     }
 }
 

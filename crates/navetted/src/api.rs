@@ -110,6 +110,9 @@ async fn upload_blob<R: ProcessRunner>(
     headers: HeaderMap,
     body: Body,
 ) -> HttpResponse {
+    if !is_live_session(&state, &session) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let Some(mime) = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -144,6 +147,9 @@ async fn download_blob<R: ProcessRunner>(
     Path((session, id)): Path<(String, String)>,
     State(state): State<ApiState<R>>,
 ) -> HttpResponse {
+    if !is_live_session(&state, &session) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let placeholder = navette_protocol::media::BlobDescriptor {
         id,
         mime: "image/png".into(),
@@ -166,6 +172,15 @@ async fn download_blob<R: ProcessRunner>(
         }
         Err(error) => blob_error_response(error),
     }
+}
+
+fn is_live_session<R: ProcessRunner>(state: &ApiState<R>, session: &str) -> bool {
+    validate_session_name(session).is_ok()
+        && state.supervisor.registry().lock().is_ok_and(|registry| {
+            registry
+                .get(session)
+                .is_some_and(|record| record.status == navette_protocol::SessionStatus::Running)
+        })
 }
 
 fn blob_error_response(error: BlobStoreError) -> HttpResponse {
@@ -665,6 +680,27 @@ mod tests {
             .unwrap();
     }
 
+    fn add_stopped_session(state: &ApiState<NoopRunner>, name: &str) {
+        state
+            .supervisor
+            .registry()
+            .lock()
+            .unwrap()
+            .insert(Session {
+                name: name.into(),
+                app_id: "firefox".into(),
+                app_pid: 10,
+                daemon_pid: 11,
+                wayland_display: format!("navette-{name}"),
+                socket_path: format!("/tmp/{name}.sock"),
+                created_at_ms: 1,
+                last_attached_at_ms: None,
+                client_count: 0,
+                status: SessionStatus::Stopped,
+            })
+            .unwrap();
+    }
+
     fn media_packet(kind: MediaKind, sequence: u64, keyframe: bool) -> MediaPacket {
         MediaPacket::new(
             MediaHeader {
@@ -711,6 +747,7 @@ mod tests {
     async fn websocket_lists_apps_and_echoes_request_id() {
         let temp = TempDir::new().unwrap();
         let state = test_state(&temp);
+        add_running_session(&state, "work");
         let token = state.auth.render();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -999,6 +1036,7 @@ mod tests {
     async fn blob_routes_require_auth_reject_bad_mime_and_round_trip_a_session_blob() {
         let temp = TempDir::new().unwrap();
         let state = test_state(&temp);
+        add_running_session(&state, "work");
         let token = state.auth.render();
         let app = router(state);
 
@@ -1060,8 +1098,43 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let mut state = test_state(&temp);
         state.blobs = BlobStore::with_limits(temp.path().join("limited-blobs"), 4, 6);
+        add_running_session(&state, "work");
+        add_stopped_session(&state, "stopped");
         let token = state.auth.render();
         let app = router(state);
+
+        let unknown_upload = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/sessions/unknown/blobs")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "image/png")
+            .body(axum::body::Body::from("png"))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(unknown_upload).await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "untrusted route names must not create blob directories"
+        );
+        assert!(
+            !temp.path().join("limited-blobs/unknown").exists(),
+            "an unknown session must not gain a blob namespace"
+        );
+        let stopped_upload = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/sessions/stopped/blobs")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "image/png")
+            .body(axum::body::Body::from("png"))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(stopped_upload).await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "a stopped registry record is not an active blob namespace"
+        );
+        assert!(
+            !temp.path().join("limited-blobs/stopped").exists(),
+            "a non-live session must not gain a blob namespace"
+        );
 
         let missing = axum::http::Request::builder()
             .uri("/v1/sessions/work/blobs/0123456789abcdef0123456789abcdef")
