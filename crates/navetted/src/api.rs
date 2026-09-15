@@ -1,9 +1,11 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Json;
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -18,16 +20,93 @@ use navette_protocol::{
     WEBSOCKET_SUBPROTOCOL,
 };
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt;
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
+use tokio::time::{Duration, Instant, sleep_until, timeout};
 
 use crate::app_index::AppIndex;
 use crate::blobs::{BlobStore, BlobStoreError};
 use crate::bridge::BridgeManager;
 use crate::media::{MediaHub, MediaHubError};
-use crate::registry::{RegistryError, validate_session_name};
+use crate::registry::{RegistryError, default_session_name, validate_session_name};
 use crate::supervisor::{ProcessRunner, Supervisor, SupervisorError};
 
 const MAX_CONTROL_MESSAGE_SIZE: usize = 1024 * 1024;
 const MAX_INPUT_MESSAGES_PER_SECOND: u32 = 240;
+const MAX_CONCURRENT_BLOB_UPLOADS: usize = 4;
+const MAX_CONCURRENT_BLOB_DOWNLOADS: usize = 4;
+const BLOB_UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+const BLOB_UPLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
+const BLOB_READ_CHUNK_BYTES: usize = 64 * 1024;
+const BLOB_DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+const BLOB_DOWNLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Holds a transfer slot only while a response is making progress. The
+/// watchdog releases a stalled reader's permit even when Hyper stops polling
+/// the body stream because the peer stopped consuming it.
+struct DownloadLease {
+    permit: Mutex<Option<OwnedSemaphorePermit>>,
+    last_progress: Mutex<Instant>,
+    expired: AtomicBool,
+    finished: AtomicBool,
+    wake: Notify,
+}
+
+impl DownloadLease {
+    fn new(permit: OwnedSemaphorePermit) -> Arc<Self> {
+        Arc::new(Self {
+            permit: Mutex::new(Some(permit)),
+            last_progress: Mutex::new(Instant::now()),
+            expired: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            wake: Notify::new(),
+        })
+    }
+
+    fn touch(&self) {
+        if let Ok(mut last_progress) = self.last_progress.lock() {
+            *last_progress = Instant::now();
+        }
+        self.wake.notify_one();
+    }
+
+    fn finish(&self) {
+        self.finished.store(true, Ordering::Release);
+        if let Ok(mut permit) = self.permit.lock() {
+            permit.take();
+        }
+        self.wake.notify_waiters();
+    }
+
+    async fn watch(self: Arc<Self>) {
+        let deadline = Instant::now() + BLOB_DOWNLOAD_TOTAL_TIMEOUT;
+        loop {
+            if self.finished.load(Ordering::Acquire) {
+                return;
+            }
+            let idle_deadline = self
+                .last_progress
+                .lock()
+                .map(|last_progress| *last_progress + BLOB_DOWNLOAD_IDLE_TIMEOUT)
+                .unwrap_or(deadline);
+            let wake_at = idle_deadline.min(deadline);
+            tokio::select! {
+                _ = sleep_until(wake_at) => {
+                    let now = Instant::now();
+                    let idle = self.last_progress.lock().is_ok_and(|last_progress| {
+                        now.saturating_duration_since(*last_progress) >= BLOB_DOWNLOAD_IDLE_TIMEOUT
+                    });
+                    if now >= deadline || idle {
+                        self.expired.store(true, Ordering::Release);
+                        self.finish();
+                        return;
+                    }
+                }
+                _ = self.wake.notified() => {}
+            }
+        }
+    }
+}
 
 pub struct ApiState<R: ProcessRunner> {
     pub apps: Arc<AppIndex>,
@@ -36,6 +115,9 @@ pub struct ApiState<R: ProcessRunner> {
     pub blobs: BlobStore,
     pub bridges: BridgeManager,
     pub auth: Arc<navette_auth::AuthToken>,
+    upload_slots: Arc<Semaphore>,
+    download_slots: Arc<Semaphore>,
+    lifecycle_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
 }
 
 impl<R: ProcessRunner> Clone for ApiState<R> {
@@ -47,6 +129,9 @@ impl<R: ProcessRunner> Clone for ApiState<R> {
             blobs: self.blobs.clone(),
             bridges: self.bridges.clone(),
             auth: Arc::clone(&self.auth),
+            upload_slots: Arc::clone(&self.upload_slots),
+            download_slots: Arc::clone(&self.download_slots),
+            lifecycle_locks: Arc::clone(&self.lifecycle_locks),
         }
     }
 }
@@ -73,7 +158,25 @@ impl<R: ProcessRunner> ApiState<R> {
             media,
             blobs,
             auth,
+            upload_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_BLOB_UPLOADS)),
+            download_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_BLOB_DOWNLOADS)),
+            lifecycle_locks: Arc::new(AsyncMutex::new(HashMap::new())),
         }
+    }
+
+    /// Serializes destructive lifecycle transitions for the same session
+    /// name. In particular, a successful old Kill cannot deactivate blobs or
+    /// stop a bridge after a concurrent Run has recreated that name.
+    async fn lock_session_lifecycle(&self, session: &str) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.lifecycle_locks.lock().await;
+            Arc::clone(
+                locks
+                    .entry(session.to_owned())
+                    .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+            )
+        };
+        lock.lock_owned().await
     }
 
     pub fn start_existing_bridges(&self) {
@@ -129,24 +232,33 @@ async fn upload_blob<R: ProcessRunner>(
     if mime.contains(';') {
         return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
     }
+    let _upload_permit = match Arc::clone(&state.upload_slots).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+    };
 
     let mut writer = match state.blobs.begin_write(&session, mime) {
         Ok(writer) => writer,
         Err(error) => return blob_error_response(error),
     };
     let mut stream = body.into_data_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
-            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-        };
-        if let Err(error) = writer.write_chunk(&chunk) {
-            return blob_error_response(error);
+    let write_body = async {
+        while let Some(chunk) = timeout(BLOB_UPLOAD_IDLE_TIMEOUT, stream.next())
+            .await
+            .map_err(|_| StatusCode::REQUEST_TIMEOUT.into_response())?
+        {
+            let chunk = chunk.map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
+            writer.write_chunk(&chunk).map_err(blob_error_response)?;
         }
-    }
-    match writer.finish() {
-        Ok(blob) => (StatusCode::CREATED, Json(blob)).into_response(),
-        Err(error) => blob_error_response(error),
+        writer
+            .finish()
+            .map(|blob| (StatusCode::CREATED, Json(blob)).into_response())
+            .map_err(blob_error_response)
+    };
+    match timeout(BLOB_UPLOAD_TOTAL_TIMEOUT, write_body).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(response)) => response,
+        Err(_) => StatusCode::REQUEST_TIMEOUT.into_response(),
     }
 }
 
@@ -168,17 +280,57 @@ async fn download_blob<R: ProcessRunner>(
     let Some(blob) = state.blobs.descriptor(&session, &placeholder.id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match state.blobs.read(&session, &blob) {
-        Ok(bytes) => {
-            let mut response = Body::from(bytes).into_response();
-            response.headers_mut().insert(
-                header::CONTENT_TYPE,
-                blob.mime.parse().expect("BlobDescriptor validates MIME"),
-            );
-            response
+    let download_permit = match Arc::clone(&state.download_slots).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+    };
+    let path = match state.blobs.read_path(&session, &blob) {
+        Ok(path) => path,
+        Err(error) => return blob_error_response(error),
+    };
+    let file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(error) => return blob_error_response(BlobStoreError::Io(error)),
+    };
+    let lease = DownloadLease::new(download_permit);
+    tokio::spawn(Arc::clone(&lease).watch());
+    let stream = futures_util::stream::try_unfold((file, lease), |(mut file, lease)| async move {
+        if lease.expired.load(Ordering::Acquire) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "blob download timed out",
+            ));
         }
-        Err(error) => blob_error_response(error),
-    }
+        let mut buffer = vec![0; BLOB_READ_CHUNK_BYTES];
+        let read = match file.read(&mut buffer).await {
+            Ok(read) => read,
+            Err(error) => {
+                lease.finish();
+                return Err(error);
+            }
+        };
+        if read == 0 {
+            lease.finish();
+            Ok::<_, std::io::Error>(None)
+        } else {
+            buffer.truncate(read);
+            lease.touch();
+            Ok(Some((Bytes::from(buffer), (file, lease))))
+        }
+    });
+    let mut response = Body::from_stream(stream).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        blob.mime.parse().expect("BlobDescriptor validates MIME"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        blob.size
+            .to_string()
+            .parse()
+            .expect("u64 content length is always a valid header"),
+    );
+    response
 }
 
 fn is_live_session<R: ProcessRunner>(state: &ApiState<R>, session: &str) -> bool {
@@ -470,7 +622,16 @@ pub async fn dispatch<R: ProcessRunner>(state: &ApiState<R>, request: Request) -
                     format!("application not found: {app_id}"),
                 );
             };
-            let result = state.supervisor.start(app, name.as_deref()).await;
+            let session_name = name.unwrap_or_else(|| default_session_name(&app.id));
+            if let Err(error) = validate_session_name(&session_name) {
+                return Response::error(
+                    request_id,
+                    ApiFailure::from(error).code,
+                    "invalid session name",
+                );
+            }
+            let _lifecycle = state.lock_session_lifecycle(&session_name).await;
+            let result = state.supervisor.start(app, Some(&session_name)).await;
             match result {
                 Ok(session) => match state.blobs.activate(&session.name) {
                     Err(error) => {
@@ -494,14 +655,25 @@ pub async fn dispatch<R: ProcessRunner>(state: &ApiState<R>, request: Request) -
             }
         }
         RequestCommand::Kill { session } => {
-            let _ = state.blobs.deactivate(&session);
-            state.bridges.stop(&session);
-            state
-                .supervisor
-                .kill(&session)
-                .await
-                .map(|_| ResponseResult::Ack)
-                .map_err(ApiFailure::from)
+            if let Err(error) = validate_session_name(&session) {
+                Err(ApiFailure::from(error))
+            } else {
+                let _lifecycle = state.lock_session_lifecycle(&session).await;
+                state
+                    .supervisor
+                    .kill(&session)
+                    .await
+                    .map(|_| {
+                        // Do not revoke a running session's blob writers or
+                        // unregister its bridge until process teardown and
+                        // registry removal succeeded. A failed kill must leave
+                        // the still-running session fully usable.
+                        let _ = state.blobs.deactivate(&session);
+                        state.bridges.stop(&session);
+                        ResponseResult::Ack
+                    })
+                    .map_err(ApiFailure::from)
+            }
         }
         RequestCommand::Attach { session } => {
             if let Err(error) = validate_session_name(&session) {
@@ -633,6 +805,7 @@ mod tests {
     #[derive(Debug, Default)]
     pub(crate) struct NoopRunner {
         alive: Mutex<BTreeSet<u32>>,
+        fail_terminate: bool,
     }
 
     impl ProcessRunner for NoopRunner {
@@ -645,11 +818,19 @@ mod tests {
         }
 
         fn terminate(&self, _pid: u32, _force: bool) -> io::Result<()> {
-            Ok(())
+            if self.fail_terminate {
+                Err(io::Error::other("injected terminate failure"))
+            } else {
+                Ok(())
+            }
         }
     }
 
     pub(crate) fn test_state(temp: &TempDir) -> ApiState<NoopRunner> {
+        test_state_with_runner(temp, Arc::new(NoopRunner::default()))
+    }
+
+    fn test_state_with_runner(temp: &TempDir, runner: Arc<NoopRunner>) -> ApiState<NoopRunner> {
         let apps = AppIndex::from_apps([App {
             id: "firefox".into(),
             name: "Firefox".into(),
@@ -660,7 +841,7 @@ mod tests {
         }]);
         let registry = Registry::open(temp.path().join("registry.json")).unwrap();
         let supervisor = Supervisor::new(
-            Arc::new(NoopRunner::default()),
+            runner,
             Arc::new(Mutex::new(registry)),
             temp.path().join("runtime"),
             "wprsd",
@@ -758,6 +939,84 @@ mod tests {
                     code: ErrorCode::NotFound,
                     ..
                 }
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_kill_keeps_the_running_blob_namespace_live() {
+        let temp = TempDir::new().unwrap();
+        let runner = Arc::new(NoopRunner {
+            alive: Mutex::new(BTreeSet::from([10, 11])),
+            fail_terminate: true,
+        });
+        let state = test_state_with_runner(&temp, runner);
+        add_running_session(&state, "work");
+
+        let response = dispatch(
+            &state,
+            Request {
+                request_id: 1,
+                command: RequestCommand::Kill {
+                    session: "work".into(),
+                },
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            response.outcome,
+            ResponseOutcome::Error {
+                error: navette_protocol::ApiError {
+                    code: ErrorCode::ProcessFailed,
+                    ..
+                }
+            }
+        ));
+        assert!(
+            state.blobs.begin_write("work", "image/png").is_ok(),
+            "a failed kill must not revoke the still-running session's blob writers"
+        );
+        assert!(
+            state
+                .supervisor
+                .registry()
+                .lock()
+                .unwrap()
+                .get("work")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_waits_for_the_sessions_lifecycle_transition_before_teardown() {
+        let temp = TempDir::new().unwrap();
+        let state = test_state(&temp);
+        add_running_session(&state, "work");
+        let transition = state.lock_session_lifecycle("work").await;
+        let kill = dispatch(
+            &state,
+            Request {
+                request_id: 1,
+                command: RequestCommand::Kill {
+                    session: "work".into(),
+                },
+            },
+        );
+        tokio::pin!(kill);
+
+        assert!(
+            timeout(Duration::from_millis(20), &mut kill).await.is_err(),
+            "a Kill must not enter teardown while a same-name Run/rollback transition owns the lifecycle"
+        );
+        assert!(state.blobs.begin_write("work", "image/png").is_ok());
+        drop(transition);
+
+        let response = kill.await;
+        assert!(matches!(
+            response.outcome,
+            ResponseOutcome::Ok {
+                result: ResponseResult::Ack
             }
         ));
     }
@@ -1116,7 +1375,7 @@ mod tests {
     async fn blob_routes_return_not_found_payload_too_large_and_insufficient_storage() {
         let temp = TempDir::new().unwrap();
         let mut state = test_state(&temp);
-        state.blobs = BlobStore::with_limits(temp.path().join("limited-blobs"), 4, 6);
+        state.blobs = BlobStore::with_limits(temp.path().join("limited-blobs"), 4, 6, 16);
         add_running_session(&state, "work");
         add_stopped_session(&state, "stopped");
         let token = state.auth.render();

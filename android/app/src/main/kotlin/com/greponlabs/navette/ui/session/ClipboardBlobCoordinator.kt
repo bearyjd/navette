@@ -23,10 +23,36 @@ internal interface BlobTransport {
     suspend fun download(blob: BlobDescriptor): ByteArray?
 }
 
+/**
+ * A successfully uploaded descriptor that has not reached the media socket.
+ * This is owned by SessionScreen (rather than a reconnect-scoped controller)
+ * so a WebSocket rebuild cannot orphan the HTTP object before it is announced.
+ */
+internal class PendingClipboardBlobAnnouncement {
+    private val lock = Any()
+    private var descriptor: BlobDescriptor? = null
+
+    fun remember(blob: BlobDescriptor) {
+        synchronized(lock) { descriptor = blob }
+    }
+
+    fun retry(announce: (BlobDescriptor) -> Boolean) {
+        synchronized(lock) {
+            val pending = descriptor ?: return
+            if (announce(pending)) descriptor = null
+        }
+    }
+
+    fun clear() {
+        synchronized(lock) { descriptor = null }
+    }
+}
+
 internal class ClipboardBlobCoordinator(
     private val scope: CoroutineScope,
     private val transport: BlobTransport,
-    private val announce: (BlobDescriptor) -> Unit,
+    private val pendingAnnouncement: PendingClipboardBlobAnnouncement = PendingClipboardBlobAnnouncement(),
+    private val announce: (BlobDescriptor) -> Boolean,
 ) {
     private val lock = Any()
     private var generation = 0L
@@ -36,19 +62,27 @@ internal class ClipboardBlobCoordinator(
     }
 
     /** Claims the ordering slot before a caller begins slow local I/O. */
-    fun claim(): Long = synchronized(lock) { ++generation }
+    fun claim(): Long = synchronized(lock) {
+        pendingAnnouncement.clear()
+        ++generation
+    }
 
     /** Starts an upload only when its pre-I/O claim is still the newest value. */
     fun uploadIfCurrent(claim: Long, mime: String, bytes: ByteArray) {
         if (!isCurrent(claim)) return
         scope.launch {
             val descriptor = transport.upload(mime, bytes) ?: return@launch
-            commitIfCurrent(claim) { announce(descriptor) }
+            commitIfCurrent(claim) {
+                if (!announce(descriptor)) pendingAnnouncement.remember(descriptor)
+            }
         }
     }
 
     fun download(blob: BlobDescriptor, accept: (ByteArray, Long) -> Unit) {
-        val claim = synchronized(lock) { ++generation }
+        // A remote image is newer clipboard state than any locally uploaded
+        // descriptor waiting for a reconnect. Claim through the same path as
+        // local work so that stale descriptor cannot be announced later.
+        val claim = claim()
         scope.launch {
             val bytes = transport.download(blob) ?: return@launch
             commitIfCurrent(claim) { accept(bytes, claim) }
@@ -62,11 +96,25 @@ internal class ClipboardBlobCoordinator(
         }
     }
 
+    /**
+     * Re-sends an already-uploaded descriptor after the media socket returns.
+     * The HTTP object remains valid until a newer clipboard claim supersedes
+     * it, so retrying only this lightweight ordered notification is enough.
+     */
+    fun retryPendingAnnouncement() {
+        synchronized(lock) {
+            pendingAnnouncement.retry(announce)
+        }
+    }
+
     private fun isCurrent(claim: Long): Boolean = synchronized(lock) { claim == generation }
 
-    /** Call whenever a media connection is rebuilt; clipboard blobs do not replay. */
-    fun invalidate() {
-        synchronized(lock) { ++generation }
+    /** Call when this controller is discarded; no old clipboard state may cross into its replacement. */
+    fun invalidate(clearPendingAnnouncement: Boolean = true) {
+        synchronized(lock) {
+            ++generation
+            if (clearPendingAnnouncement) pendingAnnouncement.clear()
+        }
     }
 }
 

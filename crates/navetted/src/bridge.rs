@@ -536,6 +536,12 @@ fn handle_guest_data(clipboard: &mut ClipboardSync, request: DataRequest, io: &S
 /// make with the transport knowledge it deliberately does not have. See
 /// `PushToPhone`'s arm and `ClipboardSync::forget_phone_echo`.
 fn apply_sync_action(clipboard: &mut ClipboardSync, action: SyncAction, io: &SessionIo<'_>) {
+    // A descriptor is held only while it is the guest-facing clipboard
+    // value. Once a newer text/blob supersedes it, remove both payload and
+    // metadata through BlobStore's descriptor-checked deletion path.
+    for blob in clipboard.take_retired_blobs() {
+        let _ = io.blobs.remove(io.session, &blob);
+    }
     match action {
         SyncAction::Nothing => {}
         SyncAction::AskGuestFor { mime } => {

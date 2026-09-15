@@ -150,6 +150,7 @@ internal class SessionController(
     private val bridge: ClipboardBridge,
     private val client: MediaSessionClient = OkHttpMediaSessionClient(mediaUrl, token),
     private val blobTransport: BlobTransport = HttpBlobTransport(mediaUrl, token),
+    private val pendingBlobAnnouncement: PendingClipboardBlobAnnouncement = PendingClipboardBlobAnnouncement(),
 ) {
     private val gate = StreamGate()
     private val scope = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
@@ -158,6 +159,7 @@ internal class SessionController(
             scope = scope,
             transport = blobTransport,
             announce = { blob -> client.sendInput(MediaInput.SetClipboardBlob(blob)) },
+            pendingAnnouncement = pendingBlobAnnouncement,
         )
     // The platform listener identifies the URI it observed. Only that exact
     // FileProvider URI may consume this one-shot echo, so an unrelated local
@@ -311,7 +313,10 @@ internal class SessionController(
         client.connect()
         connectionJob =
             scope.launch {
-                client.connectionState.collect { connection -> _state.update { it.copy(connection = connection) } }
+                client.connectionState.collect { connection ->
+                    if (connection is ConnectionState.Connected) blobCoordinator.retryPendingAnnouncement()
+                    _state.update { it.copy(connection = connection) }
+                }
             }
         hudJob?.cancel()
         hudJob =
@@ -348,7 +353,7 @@ internal class SessionController(
         client.onPong = null
         client.onClipboard = null
         client.onClipboardBlob = null
-        blobCoordinator.invalidate()
+        blobCoordinator.invalidate(clearPendingAnnouncement = false)
         synchronized(lock) { localBlobEchoIdentity = null }
         // Clear the surface BEFORE stopping the decoder. Cancelling
         // packetsJob above does not preempt a route() already inside

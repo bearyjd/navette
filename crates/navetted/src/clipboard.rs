@@ -78,6 +78,10 @@ pub struct ClipboardSync {
     echo_from_phone: Option<String>,
     echo_blob_from_guest: Option<String>,
     echo_blob_from_phone: Option<String>,
+    /// Blob objects that stopped being the current clipboard value. The
+    /// bridge drains this after each transition, keeping I/O out of this
+    /// pure decision layer while avoiding an unbounded session blob cache.
+    retired_blobs: Vec<BlobDescriptor>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -158,7 +162,7 @@ impl ClipboardSync {
                 }
 
                 self.echo_from_phone = Some(text.clone());
-                self.phone_clipboard = Some(PhoneClipboard::Text(text.clone()));
+                self.replace_phone_clipboard(PhoneClipboard::Text(text.clone()));
                 SyncAction::PushToPhone { text }
             }
             GuestEvent::TransferBlobFromGuest { blob } => {
@@ -175,7 +179,7 @@ impl ClipboardSync {
                     return SyncAction::Nothing;
                 }
                 self.echo_blob_from_phone = Some(blob.id.clone());
-                self.phone_clipboard = Some(PhoneClipboard::Blob(blob.clone()));
+                self.replace_phone_clipboard(PhoneClipboard::Blob(blob.clone()));
                 SyncAction::PushBlobToPhone { blob }
             }
             GuestEvent::TransferBlobFailed => {
@@ -232,7 +236,7 @@ impl ClipboardSync {
         }
 
         self.echo_from_guest = Some(text.clone());
-        self.phone_clipboard = Some(PhoneClipboard::Text(text));
+        self.replace_phone_clipboard(PhoneClipboard::Text(text));
         SyncAction::OfferToGuest {
             mime_types: OFFERED_MIME_TYPES
                 .iter()
@@ -251,7 +255,7 @@ impl ClipboardSync {
         }
 
         self.echo_blob_from_guest = Some(blob.id.clone());
-        self.phone_clipboard = Some(PhoneClipboard::Blob(blob));
+        self.replace_phone_clipboard(PhoneClipboard::Blob(blob));
         SyncAction::OfferToGuest {
             mime_types: match &self.phone_clipboard {
                 Some(PhoneClipboard::Blob(blob)) => vec![blob.mime.clone()],
@@ -267,6 +271,24 @@ impl ClipboardSync {
         (self.awaiting_guest_transfer == Some(AwaitingGuestTransfer::Blob))
             .then(|| self.pending_guest_mime.clone())
             .flatten()
+    }
+
+    /// Returns blobs displaced by newer clipboard state. The bridge owns the
+    /// storage lifetime and must attempt the safe descriptor-checked delete.
+    pub fn take_retired_blobs(&mut self) -> Vec<BlobDescriptor> {
+        std::mem::take(&mut self.retired_blobs)
+    }
+
+    fn replace_phone_clipboard(&mut self, next: PhoneClipboard) {
+        let next_blob_id = match &next {
+            PhoneClipboard::Blob(blob) => Some(blob.id.clone()),
+            PhoneClipboard::Text(_) => None,
+        };
+        if let Some(PhoneClipboard::Blob(previous)) = self.phone_clipboard.replace(next)
+            && Some(previous.id.as_str()) != next_blob_id.as_deref()
+        {
+            self.retired_blobs.push(previous);
+        }
     }
 }
 
@@ -718,6 +740,22 @@ mod tests {
             SyncAction::OfferToGuest {
                 mime_types: vec!["image/png".into()]
             }
+        );
+    }
+
+    #[test]
+    fn superseding_a_blob_records_it_for_bridge_reclamation() {
+        let mut sync = ClipboardSync::new();
+        assert!(matches!(
+            sync.on_phone_blob(blob()),
+            SyncAction::OfferToGuest { .. }
+        ));
+        sync.on_phone_clipboard("new text".into());
+
+        assert_eq!(sync.take_retired_blobs(), vec![blob()]);
+        assert!(
+            sync.take_retired_blobs().is_empty(),
+            "retired blobs are drained once"
         );
     }
 

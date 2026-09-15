@@ -39,7 +39,7 @@ class ClipboardBlobCoordinatorTest {
     fun newerUploadSupersedesOlderCompletedUpload() = runTest {
         val transport = FakeBlobTransport()
         val announced = mutableListOf<BlobDescriptor>()
-        val coordinator = ClipboardBlobCoordinator(backgroundScope, transport, announced::add)
+        val coordinator = ClipboardBlobCoordinator(backgroundScope, transport, announce = announced::add)
 
         coordinator.upload("image/png", byteArrayOf(1))
         runCurrent()
@@ -56,7 +56,7 @@ class ClipboardBlobCoordinatorTest {
     fun reconnectInvalidationDiscardsInFlightDownloadWithoutReplay() = runTest {
         val transport = FakeBlobTransport()
         val received = mutableListOf<ByteArray>()
-        val coordinator = ClipboardBlobCoordinator(backgroundScope, transport, {})
+        val coordinator = ClipboardBlobCoordinator(backgroundScope, transport) { true }
 
         coordinator.download(first) { bytes, _ -> received += bytes }
         runCurrent()
@@ -71,7 +71,7 @@ class ClipboardBlobCoordinatorTest {
     fun crossThreadInvalidationMakesAnAlreadyStartedUploadStale() = runTest {
         val transport = FakeBlobTransport()
         val announced = mutableListOf<BlobDescriptor>()
-        val coordinator = ClipboardBlobCoordinator(backgroundScope, transport, announced::add)
+        val coordinator = ClipboardBlobCoordinator(backgroundScope, transport, announce = announced::add)
 
         coordinator.upload("image/png", byteArrayOf(1))
         runCurrent()
@@ -80,6 +80,58 @@ class ClipboardBlobCoordinatorTest {
         runCurrent()
 
         assertEquals(emptyList<BlobDescriptor>(), announced)
+    }
+
+    @Test
+    fun retriesUploadedDescriptorWhenItsFirstSocketAnnouncementFails() = runTest {
+        val transport = FakeBlobTransport()
+        val attempts = mutableListOf<BlobDescriptor>()
+        var socketReady = false
+        val coordinator =
+            ClipboardBlobCoordinator(backgroundScope, transport) { descriptor ->
+                attempts += descriptor
+                socketReady
+            }
+
+        coordinator.upload("image/png", byteArrayOf(1))
+        runCurrent()
+        transport.uploads.single().complete(first)
+        runCurrent()
+        socketReady = true
+        coordinator.retryPendingAnnouncement()
+
+        assertEquals(
+            "the successful HTTP upload is announced again after the socket returns",
+            listOf(first, first),
+            attempts,
+        )
+    }
+
+    @Test
+    fun newerRemoteBlobDiscardsAnUnannouncedLocalDescriptor() = runTest {
+        val transport = FakeBlobTransport()
+        val attempts = mutableListOf<BlobDescriptor>()
+        var socketReady = false
+        val coordinator =
+            ClipboardBlobCoordinator(backgroundScope, transport) { descriptor ->
+                attempts += descriptor
+                socketReady
+            }
+
+        coordinator.upload("image/png", byteArrayOf(1))
+        runCurrent()
+        transport.uploads.single().complete(first)
+        runCurrent()
+        coordinator.download(second) { _, _ -> error("the fetch need not finish for ordering to apply") }
+        runCurrent()
+        socketReady = true
+        coordinator.retryPendingAnnouncement()
+
+        assertEquals(
+            "a newer remote blob must prevent an old local descriptor retry",
+            listOf(first),
+            attempts,
+        )
     }
 
     @Test
@@ -100,6 +152,7 @@ class ClipboardBlobCoordinatorTest {
                 ) {
                     effectStarted.countDown()
                     releaseEffect.await()
+                    true
                 }
             coordinator.upload("image/png", byteArrayOf(1))
             assertTrue(effectStarted.await(1, TimeUnit.SECONDS))

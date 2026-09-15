@@ -115,6 +115,8 @@ fun SessionScreen(
     // push as if the phone had copied it new, clobbering whatever the guest
     // copied while the socket was down.
     val clipboardBridge = remember(pairing.host, sessionName) { ClipboardBridge() }
+    val pendingBlobAnnouncement =
+        remember(pairing.host, sessionName) { PendingClipboardBlobAnnouncement() }
     val clipboardScope = rememberCoroutineScope()
     val controller =
         remember(pairing.host, pairing.port, sessionName, reconnectNonce) {
@@ -123,6 +125,7 @@ fun SessionScreen(
                 pairing.token,
                 transformHolder,
                 clipboardBridge,
+                pendingBlobAnnouncement = pendingBlobAnnouncement,
             )
         }
     val state by controller.state.collectAsState()

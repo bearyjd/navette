@@ -29,6 +29,7 @@ private class FakeMediaSessionClient : MediaSessionClient {
     var closeCalls = 0
     var stateAfterConnect: ConnectionState = ConnectionState.Connected
     var acceptClipboard = true
+    var acceptClipboardBlob = true
     val sentClipboard = mutableListOf<String>()
     val sentInputs = mutableListOf<MediaInput>()
 
@@ -49,6 +50,7 @@ private class FakeMediaSessionClient : MediaSessionClient {
             if (!acceptClipboard) return false
             sentClipboard += input.text
         }
+        if (input is MediaInput.SetClipboardBlob && !acceptClipboardBlob) return false
         return true
     }
     override fun requestKeyframe() = Unit
@@ -120,6 +122,66 @@ class SessionControllerTest {
             assertEquals("the parked A retry must not overwrite B", listOf("B"), client.sentClipboard)
 
             controller.close()
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
+    fun replacementControllerRetriesAnUploadedBlobWhoseDescriptorMissedTheSocket() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        try {
+            val descriptor = BlobDescriptor("0123456789abcdef0123456789abcdef", "image/png", 1)
+            var uploads = 0
+            val transport =
+                object : BlobTransport {
+                    override suspend fun upload(mime: String, bytes: ByteArray): BlobDescriptor {
+                        uploads += 1
+                        return descriptor
+                    }
+
+                    override suspend fun download(blob: BlobDescriptor): ByteArray? = null
+                }
+            val pendingAnnouncement = PendingClipboardBlobAnnouncement()
+            val disconnectedClient = FakeMediaSessionClient().apply { acceptClipboardBlob = false }
+            val firstController =
+                SessionController(
+                    mediaUrl = "ws://unused/v1/sessions/demo/media",
+                    token = "unused",
+                    transformHolder = ViewTransformHolder(),
+                    bridge = ClipboardBridge(),
+                    client = disconnectedClient,
+                    blobTransport = transport,
+                    pendingBlobAnnouncement = pendingAnnouncement,
+                )
+            firstController.open()
+            runCurrent()
+            firstController.onLocalClipboardBlob("image/png", byteArrayOf(1))
+            runCurrent()
+            assertEquals(1, disconnectedClient.sentInputs.filterIsInstance<MediaInput.SetClipboardBlob>().size)
+            firstController.close()
+
+            val replacementClient = FakeMediaSessionClient()
+            val replacementController =
+                SessionController(
+                    mediaUrl = "ws://unused/v1/sessions/demo/media",
+                    token = "unused",
+                    transformHolder = ViewTransformHolder(),
+                    bridge = ClipboardBridge(),
+                    client = replacementClient,
+                    blobTransport = transport,
+                    pendingBlobAnnouncement = pendingAnnouncement,
+                )
+            replacementController.open()
+            runCurrent()
+
+            assertEquals(
+                "the replacement controller retries the descriptor without repeating its HTTP upload",
+                1,
+                replacementClient.sentInputs.filterIsInstance<MediaInput.SetClipboardBlob>().size,
+            )
+            assertEquals(1, uploads)
+            replacementController.close()
         } finally {
             Dispatchers.resetMain()
         }
