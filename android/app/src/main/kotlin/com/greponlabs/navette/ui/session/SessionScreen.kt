@@ -77,6 +77,17 @@ import java.io.File
 /** A resume only forwards actual text, never a URI coerced to a string. */
 internal fun resumeClipboardText(itemText: CharSequence?): String? = itemText?.toString()
 
+/** Claims ordering before a provider MIME lookup, which can block on another process. */
+internal fun claimClipboardImageBeforeMime(
+    uriIdentity: String,
+    claim: (String) -> Long?,
+    lookupMime: () -> String?,
+): Pair<Long, String>? {
+    val token = claim(uriIdentity) ?: return null
+    val mime = lookupMime() ?: return null
+    return mime.takeIf { it in setOf("image/png", "image/jpeg", "image/webp") }?.let { token to it }
+}
+
 @Composable
 fun SessionScreen(
     sessionName: String,
@@ -144,11 +155,9 @@ fun SessionScreen(
     DisposableEffect(controller) {
         fun readLocalClipboard(): String? =
             resumeClipboardText(clipboard.primaryClip?.getItemAt(0)?.text)
-        fun readLocalImage(): Pair<String, Uri>? {
+        fun readLocalImageUri(): Uri? {
             val item = clipboard.primaryClip?.getItemAt(0) ?: return null
-            val uri = item.uri ?: return null
-            val mime = context.contentResolver.getType(uri) ?: return null
-            return mime.takeIf { it in setOf("image/png", "image/jpeg", "image/webp") }?.let { it to uri }
+            return item.uri
         }
         fun offerLocalClipboard() {
             val text = readLocalClipboard()
@@ -156,8 +165,12 @@ fun SessionScreen(
                 controller.onLocalClipboard(text)
                 return
             }
-            val (mime, uri) = readLocalImage() ?: return
-            val claim = controller.beginLocalClipboardBlob(uri.toString()) ?: return
+            val uri = readLocalImageUri() ?: return
+            val (claim, mime) =
+                claimClipboardImageBeforeMime(
+                    uri.toString(),
+                    controller::beginLocalClipboardBlob,
+                ) { context.contentResolver.getType(uri) } ?: return
             clipboardScope.launch(Dispatchers.IO) {
                 readBoundedClipboardImage(context, uri)?.let {
                     controller.onLocalClipboardBlob(mime, it, claim)

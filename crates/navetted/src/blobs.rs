@@ -141,6 +141,7 @@ impl BlobStore {
             file: Some(file),
             reserved: 0,
             epoch,
+            revoked: false,
         })
     }
 
@@ -206,6 +207,22 @@ impl BlobStore {
             }
         }
     }
+
+    fn lease(
+        &self,
+        session: &str,
+        epoch: u64,
+    ) -> Result<std::sync::MutexGuard<'_, BlobLifecycle>, BlobStoreError> {
+        let lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| io::Error::other("blob lifecycle lock poisoned"))?;
+        if lifecycle.live.get(session).copied() == Some(epoch) {
+            Ok(lifecycle)
+        } else {
+            Err(BlobStoreError::SessionNotLive)
+        }
+    }
 }
 
 pub struct BlobWriter {
@@ -217,10 +234,22 @@ pub struct BlobWriter {
     file: Option<File>,
     reserved: u64,
     epoch: u64,
+    revoked: bool,
 }
 
 impl BlobWriter {
     pub fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), BlobStoreError> {
+        let store = self.store.clone();
+        let session = self.session.clone();
+        let epoch = self.epoch;
+        let lease = match store.lease(&session, epoch) {
+            Ok(lease) => lease,
+            Err(BlobStoreError::SessionNotLive) => {
+                self.revoke();
+                return Err(BlobStoreError::SessionNotLive);
+            }
+            Err(error) => return Err(error),
+        };
         let additional = u64::try_from(chunk.len()).map_err(|_| BlobStoreError::BlobTooLarge)?;
         if self
             .reserved
@@ -237,10 +266,14 @@ impl BlobWriter {
             return Err(BlobStoreError::Io(error));
         }
         self.reserved += additional;
+        drop(lease);
         Ok(())
     }
 
     pub fn finish(mut self) -> Result<BlobDescriptor, BlobStoreError> {
+        if self.revoked {
+            return Err(BlobStoreError::SessionNotLive);
+        }
         if self.reserved == 0 {
             return Err(BlobStoreError::InvalidDescriptor);
         }
@@ -257,14 +290,7 @@ impl BlobWriter {
         descriptor
             .validate()
             .map_err(|_| BlobStoreError::InvalidDescriptor)?;
-        let lifecycle = self
-            .store
-            .lifecycle
-            .lock()
-            .map_err(|_| io::Error::other("blob lifecycle lock poisoned"))?;
-        if lifecycle.live.get(&self.session).copied() != Some(self.epoch) {
-            return Err(BlobStoreError::SessionNotLive);
-        }
+        let _lifecycle = self.store.lease(&self.session, self.epoch)?;
         let metadata_part = final_path.with_extension("meta.part");
         let metadata_path = final_path.with_extension("meta");
         fs::write(
@@ -281,6 +307,15 @@ impl BlobWriter {
         self.store.release(&self.session, self.epoch, self.reserved);
         self.reserved = 0;
         Ok(descriptor)
+    }
+
+    fn revoke(&mut self) {
+        if self.file.take().is_some() {
+            let _ = fs::remove_file(&self.part_path);
+            self.store.release(&self.session, self.epoch, self.reserved);
+        }
+        self.reserved = 0;
+        self.revoked = true;
     }
 }
 
@@ -500,5 +535,30 @@ mod tests {
         );
         drop(another_current);
         drop(current);
+    }
+
+    #[test]
+    fn revoked_writer_rejects_later_chunks_cleans_its_partial_and_cannot_finish() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let mut writer = store.begin_write("desktop", "image/png").unwrap();
+        writer.write_chunk(b"old").unwrap();
+        let part_path = writer.part_path.clone();
+        assert!(part_path.exists());
+
+        store.deactivate("desktop").unwrap();
+
+        assert!(matches!(
+            writer.write_chunk(b"new"),
+            Err(BlobStoreError::SessionNotLive)
+        ));
+        assert!(
+            !part_path.exists(),
+            "revocation must clean the stale partial immediately"
+        );
+        assert!(matches!(
+            writer.finish(),
+            Err(BlobStoreError::SessionNotLive)
+        ));
     }
 }
