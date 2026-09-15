@@ -17,8 +17,15 @@ pub const MAX_SESSION_BLOB_BYTES: u64 = 256 * 1024 * 1024;
 pub struct BlobStore {
     root: Arc<PathBuf>,
     active: Arc<Mutex<HashMap<String, u64>>>,
+    lifecycle: Arc<Mutex<BlobLifecycle>>,
     max_blob_bytes: u64,
     max_session_bytes: u64,
+}
+
+#[derive(Debug, Default)]
+struct BlobLifecycle {
+    next_epoch: u64,
+    live: HashMap<String, u64>,
 }
 
 #[derive(Debug, Error)]
@@ -35,6 +42,8 @@ pub enum BlobStoreError {
     SessionBudgetExceeded,
     #[error("blob not found")]
     NotFound,
+    #[error("session is not live")]
+    SessionNotLive,
     #[error("blob I/O failed: {0}")]
     Io(#[from] io::Error),
 }
@@ -44,6 +53,7 @@ impl BlobStore {
         Self {
             root: Arc::new(root.into()),
             active: Arc::new(Mutex::new(HashMap::new())),
+            lifecycle: Arc::new(Mutex::new(BlobLifecycle::default())),
             max_blob_bytes: MAX_BLOB_BYTES as u64,
             max_session_bytes: MAX_SESSION_BLOB_BYTES,
         }
@@ -58,9 +68,42 @@ impl BlobStore {
         Self {
             root: Arc::new(root.into()),
             active: Arc::new(Mutex::new(HashMap::new())),
+            lifecycle: Arc::new(Mutex::new(BlobLifecycle::default())),
             max_blob_bytes,
             max_session_bytes,
         }
+    }
+
+    /// Starts a fresh blob namespace for a newly running session. Holding the
+    /// lifecycle lock across cleanup prevents a writer leased to a previous
+    /// incarnation from publishing into a reused name.
+    pub fn activate(&self, session: &str) -> Result<(), BlobStoreError> {
+        if validate_session_name(session).is_err() {
+            return Err(BlobStoreError::InvalidSession);
+        }
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| io::Error::other("blob lifecycle lock poisoned"))?;
+        fs::remove_dir_all(self.root.join(session)).or_else(ignore_not_found)?;
+        lifecycle.next_epoch = lifecycle.next_epoch.wrapping_add(1).max(1);
+        let epoch = lifecycle.next_epoch;
+        lifecycle.live.insert(session.to_owned(), epoch);
+        Ok(())
+    }
+
+    /// Revokes every writer lease before deleting the session namespace.
+    pub fn deactivate(&self, session: &str) -> Result<(), BlobStoreError> {
+        if validate_session_name(session).is_err() {
+            return Err(BlobStoreError::InvalidSession);
+        }
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| io::Error::other("blob lifecycle lock poisoned"))?;
+        lifecycle.live.remove(session);
+        fs::remove_dir_all(self.root.join(session)).or_else(ignore_not_found)?;
+        Ok(())
     }
 
     /// Begins an atomic write. Dropping the writer removes the partial file
@@ -72,6 +115,13 @@ impl BlobStore {
         if !is_supported_mime(mime) {
             return Err(BlobStoreError::UnsupportedMime);
         }
+        let lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| io::Error::other("blob lifecycle lock poisoned"))?;
+        let Some(epoch) = lifecycle.live.get(session).copied() else {
+            return Err(BlobStoreError::SessionNotLive);
+        };
         let directory = self.root.join(session);
         fs::create_dir_all(&directory)?;
         set_private_directory(&directory)?;
@@ -90,6 +140,7 @@ impl BlobStore {
             part_path,
             file: Some(file),
             reserved: 0,
+            epoch,
         })
     }
 
@@ -164,6 +215,7 @@ pub struct BlobWriter {
     part_path: PathBuf,
     file: Option<File>,
     reserved: u64,
+    epoch: u64,
 }
 
 impl BlobWriter {
@@ -204,6 +256,14 @@ impl BlobWriter {
         descriptor
             .validate()
             .map_err(|_| BlobStoreError::InvalidDescriptor)?;
+        let lifecycle = self
+            .store
+            .lifecycle
+            .lock()
+            .map_err(|_| io::Error::other("blob lifecycle lock poisoned"))?;
+        if lifecycle.live.get(&self.session).copied() != Some(self.epoch) {
+            return Err(BlobStoreError::SessionNotLive);
+        }
         let metadata_part = final_path.with_extension("meta.part");
         let metadata_path = final_path.with_extension("meta");
         fs::write(
@@ -273,6 +333,14 @@ fn not_found(error: io::Error) -> BlobStoreError {
     }
 }
 
+fn ignore_not_found(error: io::Error) -> io::Result<()> {
+    if error.kind() == io::ErrorKind::NotFound {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
 #[cfg(unix)]
 fn set_private_directory(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -290,7 +358,9 @@ mod tests {
     use tempfile::TempDir;
 
     fn store(temp: &TempDir) -> BlobStore {
-        BlobStore::new(temp.path().join("blobs"))
+        let store = BlobStore::new(temp.path().join("blobs"));
+        store.activate("desktop").unwrap();
+        store
     }
 
     #[test]
@@ -357,6 +427,7 @@ mod tests {
     fn enforces_per_blob_and_per_session_budgets_without_publishing_partial_data() {
         let temp = TempDir::new().unwrap();
         let store = BlobStore::with_limits(temp.path().join("blobs"), 4, 6);
+        store.activate("desktop").unwrap();
 
         let mut too_big = store.begin_write("desktop", "image/png").unwrap();
         assert!(matches!(
@@ -373,5 +444,34 @@ mod tests {
             over_session.write_chunk(b"123"),
             Err(BlobStoreError::SessionBudgetExceeded)
         ));
+    }
+
+    #[test]
+    fn revoked_writer_cannot_publish_into_a_recreated_session_namespace() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("blobs");
+        let stale = root.join("desktop/stale-blob");
+        fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        fs::write(&stale, b"orphaned").unwrap();
+        let store = BlobStore::new(&root);
+        store.activate("desktop").unwrap();
+        assert!(
+            !stale.exists(),
+            "a session start must clear an orphaned namespace before leasing it"
+        );
+        let mut writer = store.begin_write("desktop", "image/png").unwrap();
+        writer.write_chunk(b"old").unwrap();
+
+        store.deactivate("desktop").unwrap();
+        store.activate("desktop").unwrap();
+
+        assert!(matches!(
+            writer.finish(),
+            Err(BlobStoreError::SessionNotLive)
+        ));
+        assert!(
+            !temp.path().join("blobs/desktop").exists(),
+            "a writer leased before kill must not recreate the replacement namespace"
+        );
     }
 }

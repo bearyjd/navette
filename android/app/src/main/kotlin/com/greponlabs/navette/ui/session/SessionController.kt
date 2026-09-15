@@ -159,7 +159,10 @@ internal class SessionController(
             transport = blobTransport,
             announce = { blob -> client.sendInput(MediaInput.SetClipboardBlob(blob)) },
         )
-    private var suppressNextLocalBlob = false
+    // The platform listener identifies the URI it observed. Only that exact
+    // FileProvider URI may consume this one-shot echo, so an unrelated local
+    // image cannot accidentally suppress the remote write's echo.
+    private var localBlobEchoIdentity: String? = null
 
     /**
      * Guards [decoder], [surface] and [surfaceSize], which two threads reach:
@@ -223,7 +226,7 @@ internal class SessionController(
     var onClipboardPush: ((String) -> Unit)? = null
 
     /** Called with an image downloaded from the authenticated blob route. */
-    var onClipboardBlobPush: ((BlobDescriptor, ByteArray) -> Unit)? = null
+    var onClipboardBlobPush: ((BlobDescriptor, ByteArray, Long) -> Unit)? = null
 
     /**
      * The surface the most recent successfully-sent motion was addressed to.
@@ -294,9 +297,8 @@ internal class SessionController(
             if (toWrite != null) scope.launch { onClipboardPush?.invoke(toWrite) }
         }
         client.onClipboardBlob = { blob ->
-            blobCoordinator.download(blob) { bytes ->
-                suppressNextLocalBlob = true
-                onClipboardBlobPush?.invoke(blob, bytes)
+            blobCoordinator.download(blob) { bytes, claim ->
+                onClipboardBlobPush?.invoke(blob, bytes, claim)
             }
         }
         // connect() before the state collector, not after. The client's flow
@@ -347,7 +349,7 @@ internal class SessionController(
         client.onClipboard = null
         client.onClipboardBlob = null
         blobCoordinator.invalidate()
-        suppressNextLocalBlob = false
+        synchronized(lock) { localBlobEchoIdentity = null }
         // Clear the surface BEFORE stopping the decoder. Cancelling
         // packetsJob above does not preempt a route() already inside
         // startDecoder, and with the old order that call could publish a
@@ -715,12 +717,29 @@ internal class SessionController(
     }
 
     /** Starts an HTTP upload; only its completed descriptor reaches the socket. */
-    fun onLocalClipboardBlob(mime: String, bytes: ByteArray) {
-        if (suppressNextLocalBlob) {
-            suppressNextLocalBlob = false
-            return
-        }
+    fun onLocalClipboardBlob(mime: String, bytes: ByteArray, sourceIdentity: String? = null) {
+        if (sourceIdentity != null && synchronized(lock) {
+                if (localBlobEchoIdentity == sourceIdentity) {
+                    localBlobEchoIdentity = null
+                    true
+                } else {
+                    false
+                }
+            }
+        ) return
         blobCoordinator.upload(mime, bytes)
+    }
+
+    /**
+     * Commits a downloaded image to the Android clipboard only if no newer
+     * clipboard event has invalidated its blob claim. The effect runs while
+     * the coordinator's generation is serialized with invalidation.
+     */
+    fun commitClipboardBlob(claim: Long, identity: String, effect: () -> Unit) {
+        blobCoordinator.commitIfCurrent(claim) {
+            synchronized(lock) { localBlobEchoIdentity = identity }
+            effect()
+        }
     }
 
     /**

@@ -1,11 +1,19 @@
 package com.greponlabs.navette.ui.session
 
 import com.greponlabs.navette.net.BlobDescriptor
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.concurrent.thread
 
@@ -50,7 +58,7 @@ class ClipboardBlobCoordinatorTest {
         val received = mutableListOf<ByteArray>()
         val coordinator = ClipboardBlobCoordinator(backgroundScope, transport, {})
 
-        coordinator.download(first, received::add)
+        coordinator.download(first) { bytes, _ -> received += bytes }
         runCurrent()
         coordinator.invalidate()
         transport.downloads.single().complete(byteArrayOf(1))
@@ -72,5 +80,42 @@ class ClipboardBlobCoordinatorTest {
         runCurrent()
 
         assertEquals(emptyList<BlobDescriptor>(), announced)
+    }
+
+    @Test
+    fun invalidationCannotPassAnAcceptedAnnouncementEffect() {
+        val effectStarted = CountDownLatch(1)
+        val releaseEffect = CountDownLatch(1)
+        val invalidationFinished = CountDownLatch(1)
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val coordinator =
+                ClipboardBlobCoordinator(
+                    scope,
+                    object : BlobTransport {
+                        override suspend fun upload(mime: String, bytes: ByteArray): BlobDescriptor? = first
+
+                        override suspend fun download(blob: BlobDescriptor): ByteArray? = null
+                    },
+                ) {
+                    effectStarted.countDown()
+                    releaseEffect.await()
+                }
+            coordinator.upload("image/png", byteArrayOf(1))
+            assertTrue(effectStarted.await(1, TimeUnit.SECONDS))
+            thread {
+                coordinator.invalidate()
+                invalidationFinished.countDown()
+            }
+
+            assertFalse(
+                "invalidation must serialize behind an accepted announcement effect",
+                invalidationFinished.await(100, TimeUnit.MILLISECONDS),
+            )
+            releaseEffect.countDown()
+            assertTrue(invalidationFinished.await(1, TimeUnit.SECONDS))
+        } finally {
+            scope.cancel()
+        }
     }
 }

@@ -59,6 +59,13 @@ impl<R: ProcessRunner> ApiState<R> {
     ) -> Self {
         let media = MediaHub::default();
         let blobs = BlobStore::new(supervisor.blob_root());
+        if let Ok(registry) = supervisor.registry().lock() {
+            for session in registry.list() {
+                if session.status == navette_protocol::SessionStatus::Running {
+                    let _ = blobs.activate(&session.name);
+                }
+            }
+        }
         Self {
             apps,
             supervisor,
@@ -190,7 +197,8 @@ fn blob_error_response(error: BlobStoreError) -> HttpResponse {
         BlobStoreError::SessionBudgetExceeded => StatusCode::INSUFFICIENT_STORAGE.into_response(),
         BlobStoreError::InvalidSession
         | BlobStoreError::InvalidDescriptor
-        | BlobStoreError::NotFound => StatusCode::NOT_FOUND.into_response(),
+        | BlobStoreError::NotFound
+        | BlobStoreError::SessionNotLive => StatusCode::NOT_FOUND.into_response(),
         BlobStoreError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -464,19 +472,29 @@ pub async fn dispatch<R: ProcessRunner>(state: &ApiState<R>, request: Request) -
             };
             let result = state.supervisor.start(app, name.as_deref()).await;
             match result {
-                Ok(session) => match state.bridges.start(&session) {
-                    Ok(()) => Ok(ResponseResult::Session { session }),
+                Ok(session) => match state.blobs.activate(&session.name) {
                     Err(error) => {
                         let _ = state.supervisor.kill(&session.name).await;
                         Err(ApiFailure::internal(format!(
-                            "failed to start media bridge: {error}"
+                            "failed to initialize clipboard blob namespace: {error}"
                         )))
                     }
+                    Ok(()) => match state.bridges.start(&session) {
+                        Ok(()) => Ok(ResponseResult::Session { session }),
+                        Err(error) => {
+                            let _ = state.blobs.deactivate(&session.name);
+                            let _ = state.supervisor.kill(&session.name).await;
+                            Err(ApiFailure::internal(format!(
+                                "failed to start media bridge: {error}"
+                            )))
+                        }
+                    },
                 },
                 Err(error) => Err(ApiFailure::from(error)),
             }
         }
         RequestCommand::Kill { session } => {
+            let _ = state.blobs.deactivate(&session);
             state.bridges.stop(&session);
             state
                 .supervisor
@@ -678,6 +696,7 @@ mod tests {
                 status: SessionStatus::Running,
             })
             .unwrap();
+        state.blobs.activate(name).unwrap();
     }
 
     fn add_stopped_session(state: &ApiState<NoopRunner>, name: &str) {

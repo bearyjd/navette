@@ -7,7 +7,6 @@ import com.greponlabs.navette.net.validate
 import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
-import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -29,27 +28,35 @@ internal class ClipboardBlobCoordinator(
     private val transport: BlobTransport,
     private val announce: (BlobDescriptor) -> Unit,
 ) {
-    private val generation = AtomicLong(0)
+    private val lock = Any()
+    private var generation = 0L
 
     fun upload(mime: String, bytes: ByteArray) {
-        val claim = generation.incrementAndGet()
+        val claim = synchronized(lock) { ++generation }
         scope.launch {
             val descriptor = transport.upload(mime, bytes) ?: return@launch
-            if (claim == generation.get()) announce(descriptor)
+            commitIfCurrent(claim) { announce(descriptor) }
         }
     }
 
-    fun download(blob: BlobDescriptor, accept: (ByteArray) -> Unit) {
-        val claim = generation.incrementAndGet()
+    fun download(blob: BlobDescriptor, accept: (ByteArray, Long) -> Unit) {
+        val claim = synchronized(lock) { ++generation }
         scope.launch {
             val bytes = transport.download(blob) ?: return@launch
-            if (claim == generation.get()) accept(bytes)
+            commitIfCurrent(claim) { accept(bytes, claim) }
+        }
+    }
+
+    /** Runs the externally visible effect while invalidation is excluded. */
+    fun commitIfCurrent(claim: Long, effect: () -> Unit) {
+        synchronized(lock) {
+            if (claim == generation) effect()
         }
     }
 
     /** Call whenever a media connection is rebuilt; clipboard blobs do not replay. */
     fun invalidate() {
-        generation.incrementAndGet()
+        synchronized(lock) { ++generation }
     }
 }
 

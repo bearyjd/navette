@@ -15,6 +15,7 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -185,7 +186,7 @@ class SessionControllerTest {
                     blobTransport = transport,
                 )
             val received = mutableListOf<ByteArray>()
-            controller.onClipboardBlobPush = { _, bytes -> received += bytes }
+            controller.onClipboardBlobPush = { _, bytes, _ -> received += bytes }
             controller.open()
             client.onClipboardBlob?.invoke(BlobDescriptor("0123456789abcdef0123456789abcdef", "image/png", 1))
             runCurrent()
@@ -194,6 +195,95 @@ class SessionControllerTest {
             runCurrent()
 
             assertTrue("the completed old image must not overwrite newer remote text", received.isEmpty())
+            controller.close()
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
+    fun unrelatedLocalImageCannotConsumeTheRemoteImageEcho() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        try {
+            val downloaded = CompletableDeferred<ByteArray?>()
+            val uploads = mutableListOf<ByteArray>()
+            val transport =
+                object : BlobTransport {
+                    override suspend fun upload(mime: String, bytes: ByteArray): BlobDescriptor? {
+                        uploads += bytes
+                        return BlobDescriptor("11111111111111111111111111111111", "image/png", bytes.size.toLong())
+                    }
+
+                    override suspend fun download(blob: BlobDescriptor): ByteArray? = downloaded.await()
+                }
+            val client = FakeMediaSessionClient()
+            val controller =
+                SessionController(
+                    mediaUrl = "ws://unused/v1/sessions/demo/media",
+                    token = "unused",
+                    transformHolder = ViewTransformHolder(),
+                    bridge = ClipboardBridge(),
+                    client = client,
+                    blobTransport = transport,
+                )
+            val echoedUri = "content://navette/remote-image"
+            controller.onClipboardBlobPush = { _, _, claim ->
+                controller.commitClipboardBlob(claim, echoedUri) {}
+            }
+            controller.open()
+            client.onClipboardBlob?.invoke(BlobDescriptor("0123456789abcdef0123456789abcdef", "image/png", 1))
+            runCurrent()
+            downloaded.complete(byteArrayOf(1))
+            runCurrent()
+
+            controller.onLocalClipboardBlob("image/png", byteArrayOf(7), "content://outside/image")
+            controller.onLocalClipboardBlob("image/png", byteArrayOf(8), echoedUri)
+            runCurrent()
+
+            assertEquals(1, uploads.size)
+            assertTrue("only the unrelated local image uploads", uploads.single().contentEquals(byteArrayOf(7)))
+            controller.close()
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
+    fun newerTextPreventsAnAlreadyCachedImageFromBecomingThePrimaryClip() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        try {
+            val downloaded = CompletableDeferred<ByteArray?>()
+            val transport =
+                object : BlobTransport {
+                    override suspend fun upload(mime: String, bytes: ByteArray): BlobDescriptor? = null
+
+                    override suspend fun download(blob: BlobDescriptor): ByteArray? = downloaded.await()
+                }
+            val client = FakeMediaSessionClient()
+            val controller =
+                SessionController(
+                    mediaUrl = "ws://unused/v1/sessions/demo/media",
+                    token = "unused",
+                    transformHolder = ViewTransformHolder(),
+                    bridge = ClipboardBridge(),
+                    client = client,
+                    blobTransport = transport,
+                )
+            var claim: Long? = null
+            controller.onClipboardBlobPush = { _, _, token -> claim = token }
+            controller.open()
+            client.onClipboardBlob?.invoke(BlobDescriptor("0123456789abcdef0123456789abcdef", "image/png", 1))
+            runCurrent()
+            downloaded.complete(byteArrayOf(1))
+            runCurrent()
+
+            client.onClipboard?.invoke("newer text")
+            var wrotePrimaryClip = false
+            controller.commitClipboardBlob(claim ?: error("download must issue a cache claim"), "content://cached") {
+                wrotePrimaryClip = true
+            }
+
+            assertFalse("a newer text value must win after image cache I/O", wrotePrimaryClip)
             controller.close()
         } finally {
             Dispatchers.resetMain()

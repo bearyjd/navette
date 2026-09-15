@@ -2015,6 +2015,7 @@ mod tests {
             let media = MediaHub::default();
             let blob_dir = tempfile::tempdir().unwrap();
             let blobs = BlobStore::new(blob_dir.path().join("blobs"));
+            blobs.activate("s1").unwrap();
             let commands = media.register_session("s1");
             let client = media.attach("s1").expect("attach to the fixture session");
             let (transport, wprsd) = FakeWprsd::connect();

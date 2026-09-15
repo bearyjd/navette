@@ -155,7 +155,9 @@ fun SessionScreen(
             }
             val (mime, uri) = readLocalImage() ?: return
             clipboardScope.launch(Dispatchers.IO) {
-                readBoundedClipboardImage(context, uri)?.let { controller.onLocalClipboardBlob(mime, it) }
+                readBoundedClipboardImage(context, uri)?.let {
+                    controller.onLocalClipboardBlob(mime, it, uri.toString())
+                }
             }
         }
         val clipboardListener =
@@ -187,11 +189,13 @@ fun SessionScreen(
     LaunchedEffect(controller) {
         controller.onToggleHud = { hudVisible = !hudVisible }
         controller.onClipboardPush = { text -> clipboard.setPrimaryClip(ClipData.newPlainText("navette", text)) }
-        controller.onClipboardBlobPush = { blob, bytes ->
+        controller.onClipboardBlobPush = { blob, bytes, claim ->
             clipboardScope.launch(Dispatchers.IO) {
                 val uri = writeClipboardImage(context, blob.mime, bytes) ?: return@launch
                 withContext(Dispatchers.Main) {
-                    clipboard.setPrimaryClip(ClipData.newUri(context.contentResolver, "navette", uri))
+                    controller.commitClipboardBlob(claim, uri.toString()) {
+                        clipboard.setPrimaryClip(ClipData.newUri(context.contentResolver, "navette", uri))
+                    }
                 }
             }
         }
@@ -437,6 +441,33 @@ private fun readBoundedClipboardImage(context: Context, uri: Uri): ByteArray? =
         }
     }.getOrNull()
 
+private const val MAX_CLIPBOARD_CACHE_FILES = 8
+
+internal fun retainClipboardImages(
+    directory: File,
+    current: File,
+    maxFiles: Int = MAX_CLIPBOARD_CACHE_FILES,
+    maxBytes: Long = MAX_BLOB_BYTES,
+) {
+    var keptFiles = 0
+    var keptBytes = 0L
+    val images =
+        directory
+            .listFiles()
+            .orEmpty()
+            .filter { it.isFile && it.extension.lowercase() in setOf("png", "jpg", "webp") }
+            .sortedWith(compareByDescending<File> { it == current }.thenByDescending { it.lastModified() })
+    for (image in images) {
+        val nextBytes = keptBytes + image.length()
+        if (keptFiles < maxFiles && nextBytes <= maxBytes) {
+            keptFiles += 1
+            keptBytes = nextBytes
+        } else {
+            image.delete()
+        }
+    }
+}
+
 private fun writeClipboardImage(context: Context, mime: String, bytes: ByteArray): Uri? =
     runCatching {
         if (bytes.isEmpty() || bytes.size.toLong() > MAX_BLOB_BYTES) return@runCatching null
@@ -455,5 +486,6 @@ private fun writeClipboardImage(context: Context, mime: String, bytes: ByteArray
             partial.delete()
             return@runCatching null
         }
+        retainClipboardImages(directory, final)
         FileProvider.getUriForFile(context, context.packageName + ".clipboard", final)
     }.getOrNull()
