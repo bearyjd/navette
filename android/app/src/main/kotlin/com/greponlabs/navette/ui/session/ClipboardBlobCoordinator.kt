@@ -32,7 +32,15 @@ internal class ClipboardBlobCoordinator(
     private var generation = 0L
 
     fun upload(mime: String, bytes: ByteArray) {
-        val claim = synchronized(lock) { ++generation }
+        uploadIfCurrent(claim(), mime, bytes)
+    }
+
+    /** Claims the ordering slot before a caller begins slow local I/O. */
+    fun claim(): Long = synchronized(lock) { ++generation }
+
+    /** Starts an upload only when its pre-I/O claim is still the newest value. */
+    fun uploadIfCurrent(claim: Long, mime: String, bytes: ByteArray) {
+        if (!isCurrent(claim)) return
         scope.launch {
             val descriptor = transport.upload(mime, bytes) ?: return@launch
             commitIfCurrent(claim) { announce(descriptor) }
@@ -53,6 +61,8 @@ internal class ClipboardBlobCoordinator(
             if (claim == generation) effect()
         }
     }
+
+    private fun isCurrent(claim: Long): Boolean = synchronized(lock) { claim == generation }
 
     /** Call whenever a media connection is rebuilt; clipboard blobs do not replay. */
     fun invalidate() {

@@ -236,8 +236,11 @@ class SessionControllerTest {
             downloaded.complete(byteArrayOf(1))
             runCurrent()
 
-            controller.onLocalClipboardBlob("image/png", byteArrayOf(7), "content://outside/image")
-            controller.onLocalClipboardBlob("image/png", byteArrayOf(8), echoedUri)
+            val localClaim =
+                controller.beginLocalClipboardBlob("content://outside/image")
+                    ?: error("an unrelated URI must not consume the echo")
+            controller.onLocalClipboardBlob("image/png", byteArrayOf(7), localClaim)
+            assertEquals(null, controller.beginLocalClipboardBlob(echoedUri))
             runCurrent()
 
             assertEquals(1, uploads.size)
@@ -284,6 +287,45 @@ class SessionControllerTest {
             }
 
             assertFalse("a newer text value must win after image cache I/O", wrotePrimaryClip)
+            controller.close()
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
+    fun localImageClaimInvalidatesAnInFlightRemoteFetchBeforeItsBytesAreRead() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        try {
+            val downloaded = CompletableDeferred<ByteArray?>()
+            val transport =
+                object : BlobTransport {
+                    override suspend fun upload(mime: String, bytes: ByteArray): BlobDescriptor? = null
+
+                    override suspend fun download(blob: BlobDescriptor): ByteArray? = downloaded.await()
+                }
+            val client = FakeMediaSessionClient()
+            val controller =
+                SessionController(
+                    mediaUrl = "ws://unused/v1/sessions/demo/media",
+                    token = "unused",
+                    transformHolder = ViewTransformHolder(),
+                    bridge = ClipboardBridge(),
+                    client = client,
+                    blobTransport = transport,
+                )
+            val received = mutableListOf<ByteArray>()
+            controller.onClipboardBlobPush = { _, bytes, _ -> received += bytes }
+            controller.open()
+            client.onClipboardBlob?.invoke(BlobDescriptor("0123456789abcdef0123456789abcdef", "image/png", 1))
+            runCurrent()
+
+            val localClaim = controller.beginLocalClipboardBlob("content://outside/new-image")
+            assertTrue("a distinct local URI must claim clipboard order synchronously", localClaim != null)
+            downloaded.complete(byteArrayOf(1))
+            runCurrent()
+
+            assertTrue("the older remote fetch must not overwrite the newer local image event", received.isEmpty())
             controller.close()
         } finally {
             Dispatchers.resetMain()

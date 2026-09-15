@@ -16,7 +16,7 @@ pub const MAX_SESSION_BLOB_BYTES: u64 = 256 * 1024 * 1024;
 #[derive(Clone, Debug)]
 pub struct BlobStore {
     root: Arc<PathBuf>,
-    active: Arc<Mutex<HashMap<String, u64>>>,
+    active: Arc<Mutex<HashMap<(String, u64), u64>>>,
     lifecycle: Arc<Mutex<BlobLifecycle>>,
     max_blob_bytes: u64,
     max_session_bytes: u64,
@@ -177,13 +177,14 @@ impl BlobStore {
         (descriptor.id == id && descriptor.validate().is_ok()).then_some(descriptor)
     }
 
-    fn reserve(&self, session: &str, additional: u64) -> Result<(), BlobStoreError> {
+    fn reserve(&self, session: &str, epoch: u64, additional: u64) -> Result<(), BlobStoreError> {
         let mut active = self
             .active
             .lock()
             .map_err(|_| io::Error::other("blob lock poisoned"))?;
         let current = stable_usage(&self.root.join(session))?;
-        let reserved = active.get(session).copied().unwrap_or(0);
+        let key = (session.to_owned(), epoch);
+        let reserved = active.get(&key).copied().unwrap_or(0);
         if current
             .checked_add(reserved)
             .and_then(|used| used.checked_add(additional))
@@ -191,17 +192,17 @@ impl BlobStore {
         {
             return Err(BlobStoreError::SessionBudgetExceeded);
         }
-        *active.entry(session.to_owned()).or_default() += additional;
+        *active.entry(key).or_default() += additional;
         Ok(())
     }
 
-    fn release(&self, session: &str, bytes: u64) {
+    fn release(&self, session: &str, epoch: u64, bytes: u64) {
         if let Ok(mut active) = self.active.lock()
-            && let Some(reserved) = active.get_mut(session)
+            && let Some(reserved) = active.get_mut(&(session.to_owned(), epoch))
         {
             *reserved = reserved.saturating_sub(bytes);
             if *reserved == 0 {
-                active.remove(session);
+                active.remove(&(session.to_owned(), epoch));
             }
         }
     }
@@ -228,11 +229,11 @@ impl BlobWriter {
         {
             return Err(BlobStoreError::BlobTooLarge);
         }
-        self.store.reserve(&self.session, additional)?;
+        self.store.reserve(&self.session, self.epoch, additional)?;
         if let Some(file) = self.file.as_mut()
             && let Err(error) = file.write_all(chunk)
         {
-            self.store.release(&self.session, additional);
+            self.store.release(&self.session, self.epoch, additional);
             return Err(BlobStoreError::Io(error));
         }
         self.reserved += additional;
@@ -277,7 +278,7 @@ impl BlobWriter {
             return Err(BlobStoreError::Io(error));
         }
         self.file.take();
-        self.store.release(&self.session, self.reserved);
+        self.store.release(&self.session, self.epoch, self.reserved);
         self.reserved = 0;
         Ok(descriptor)
     }
@@ -287,7 +288,7 @@ impl Drop for BlobWriter {
     fn drop(&mut self) {
         if self.file.take().is_some() {
             let _ = fs::remove_file(&self.part_path);
-            self.store.release(&self.session, self.reserved);
+            self.store.release(&self.session, self.epoch, self.reserved);
         }
     }
 }
@@ -473,5 +474,31 @@ mod tests {
             !temp.path().join("blobs/desktop").exists(),
             "a writer leased before kill must not recreate the replacement namespace"
         );
+    }
+
+    #[test]
+    fn old_epoch_reservations_do_not_exhaust_or_release_a_recreated_sessions_budget() {
+        let temp = TempDir::new().unwrap();
+        let store = BlobStore::with_limits(temp.path().join("blobs"), 4, 4);
+        store.activate("desktop").unwrap();
+        let mut old = store.begin_write("desktop", "image/png").unwrap();
+        old.write_chunk(b"old!").unwrap();
+
+        store.deactivate("desktop").unwrap();
+        store.activate("desktop").unwrap();
+        let mut current = store.begin_write("desktop", "image/png").unwrap();
+        current.write_chunk(b"new!").unwrap();
+
+        drop(old);
+        let mut another_current = store.begin_write("desktop", "image/png").unwrap();
+        assert!(
+            matches!(
+                another_current.write_chunk(b"more"),
+                Err(BlobStoreError::SessionBudgetExceeded)
+            ),
+            "dropping an old writer must not release the recreated session's reservation"
+        );
+        drop(another_current);
+        drop(current);
     }
 }

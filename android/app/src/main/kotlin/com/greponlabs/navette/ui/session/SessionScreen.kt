@@ -74,6 +74,9 @@ import java.io.File
  * than in `AppViewModel`. `AppViewModel` owns the control channel and which
  * session is active; it has never touched media state and does not start now.
  */
+/** A resume only forwards actual text, never a URI coerced to a string. */
+internal fun resumeClipboardText(itemText: CharSequence?): String? = itemText?.toString()
+
 @Composable
 fun SessionScreen(
     sessionName: String,
@@ -129,7 +132,6 @@ fun SessionScreen(
     // Keyed like imeRaised, not the nonce: a reconnect rebuild must not
     // silently turn the HUD off while someone is watching it.
     var hudVisible by remember(pairing.host, sessionName) { mutableStateOf(false) }
-
     LockLandscapeWhileAttached()
 
     // Clipboard listener and lifecycle observer registered and torn down here,
@@ -140,7 +142,8 @@ fun SessionScreen(
     // from another app necessarily unfocuses Navette, so the listener alone
     // would miss the case this feature exists for.
     DisposableEffect(controller) {
-        fun readLocalClipboard(): String? = clipboard.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()
+        fun readLocalClipboard(): String? =
+            resumeClipboardText(clipboard.primaryClip?.getItemAt(0)?.text)
         fun readLocalImage(): Pair<String, Uri>? {
             val item = clipboard.primaryClip?.getItemAt(0) ?: return null
             val uri = item.uri ?: return null
@@ -154,9 +157,10 @@ fun SessionScreen(
                 return
             }
             val (mime, uri) = readLocalImage() ?: return
+            val claim = controller.beginLocalClipboardBlob(uri.toString()) ?: return
             clipboardScope.launch(Dispatchers.IO) {
                 readBoundedClipboardImage(context, uri)?.let {
-                    controller.onLocalClipboardBlob(mime, it, uri.toString())
+                    controller.onLocalClipboardBlob(mime, it, claim)
                 }
             }
         }

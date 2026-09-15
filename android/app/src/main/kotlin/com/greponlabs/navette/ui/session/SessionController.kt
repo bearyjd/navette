@@ -716,9 +716,12 @@ internal class SessionController(
         sendClipboardOrRetryOnConnect(forward)
     }
 
-    /** Starts an HTTP upload; only its completed descriptor reaches the socket. */
-    fun onLocalClipboardBlob(mime: String, bytes: ByteArray, sourceIdentity: String? = null) {
-        if (sourceIdentity != null && synchronized(lock) {
+    /**
+     * Claims a local image before its URI is read on the I/O dispatcher.
+     * Returning null means this exact FileProvider URI is our own remote echo.
+     */
+    fun beginLocalClipboardBlob(sourceIdentity: String): Long? {
+        if (synchronized(lock) {
                 if (localBlobEchoIdentity == sourceIdentity) {
                     localBlobEchoIdentity = null
                     true
@@ -726,8 +729,13 @@ internal class SessionController(
                     false
                 }
             }
-        ) return
-        blobCoordinator.upload(mime, bytes)
+        ) return null
+        return blobCoordinator.claim()
+    }
+
+    /** Starts an HTTP upload; only its completed descriptor reaches the socket. */
+    fun onLocalClipboardBlob(mime: String, bytes: ByteArray, claim: Long = blobCoordinator.claim()) {
+        blobCoordinator.uploadIfCurrent(claim, mime, bytes)
     }
 
     /**
