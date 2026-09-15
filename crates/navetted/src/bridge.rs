@@ -2154,7 +2154,7 @@ mod tests {
             fixture.wprsd.recv(),
             Event::Data(DataEvent::DestinationEvent(
                 DataDestinationEvent::SelectionSet(DataSource::Selection, metadata)
-            )) if metadata.mime_types == vec!["image/png", "image/jpeg", "image/webp"]
+            )) if metadata.mime_types == vec!["image/png"]
         ));
         fixture.send_requests(vec![data_request(DataRequest::DestinationRequest(
             DataDestinationRequest::RequestDataTransfer(

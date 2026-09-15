@@ -78,11 +78,11 @@ impl Registry {
             return Err(RegistryError::UnsupportedVersion(stored.version));
         }
 
-        let sessions = stored
-            .sessions
-            .into_iter()
-            .map(|session| (session.name.clone(), session))
-            .collect();
+        let mut sessions = BTreeMap::new();
+        for session in stored.sessions {
+            validate_session_name(&session.name)?;
+            sessions.insert(session.name.clone(), session);
+        }
         Ok(Self { path, sessions })
     }
 
@@ -435,6 +435,26 @@ mod tests {
         assert!(matches!(
             Registry::open(path),
             Err(RegistryError::Decode { .. })
+        ));
+    }
+
+    #[test]
+    fn reopening_refuses_a_persisted_session_name_that_escapes_runtime_storage() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("registry.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&RegistryFile {
+                version: REGISTRY_VERSION,
+                sessions: vec![session("../outside")],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            Registry::open(path),
+            Err(RegistryError::InvalidName(name)) if name == "../outside"
         ));
     }
 

@@ -711,8 +711,8 @@ internal class SessionController(
      * genuinely new value reaches [client].
      */
     fun onLocalClipboard(text: String) {
-        blobCoordinator.invalidate()
         val forward = synchronized(lock) { bridge.onLocalClipboard(text) } ?: return
+        blobCoordinator.invalidate()
         sendClipboardOrRetryOnConnect(forward)
     }
 
@@ -745,7 +745,14 @@ internal class SessionController(
      */
     fun commitClipboardBlob(claim: Long, identity: String, effect: () -> Unit) {
         blobCoordinator.commitIfCurrent(claim) {
-            synchronized(lock) { localBlobEchoIdentity = identity }
+            synchronized(lock) {
+                // Only an image that is actually becoming the primary clip
+                // replaces the text state. A failed or superseded download
+                // leaves the previous remote-text echo/resume suppression
+                // intact.
+                bridge.onRemoteClipboardBlob()
+                localBlobEchoIdentity = identity
+            }
             effect()
         }
     }
@@ -756,8 +763,8 @@ internal class SessionController(
      * why a resume needs a suppression the listener path does not.
      */
     fun onLocalClipboardResume(text: String) {
-        blobCoordinator.invalidate()
         val forward = synchronized(lock) { bridge.onLocalClipboardResume(text) } ?: return
+        blobCoordinator.invalidate()
         sendClipboardOrRetryOnConnect(forward)
     }
 

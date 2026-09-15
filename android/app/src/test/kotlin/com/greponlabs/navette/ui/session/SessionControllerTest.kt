@@ -331,4 +331,81 @@ class SessionControllerTest {
             Dispatchers.resetMain()
         }
     }
+
+    @Test
+    fun failedRemoteImageDownloadKeepsPriorRemoteTextSuppressedOnResume() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        try {
+            val transport =
+                object : BlobTransport {
+                    override suspend fun upload(mime: String, bytes: ByteArray): BlobDescriptor? = null
+
+                    override suspend fun download(blob: BlobDescriptor): ByteArray? = null
+                }
+            val client = FakeMediaSessionClient()
+            val controller =
+                SessionController(
+                    mediaUrl = "ws://unused/v1/sessions/demo/media",
+                    token = "unused",
+                    transformHolder = ViewTransformHolder(),
+                    bridge = ClipboardBridge(),
+                    client = client,
+                    blobTransport = transport,
+                )
+            controller.open()
+            client.onClipboard?.invoke("remote text")
+            runCurrent()
+            client.onClipboardBlob?.invoke(BlobDescriptor("0123456789abcdef0123456789abcdef", "image/png", 1))
+            runCurrent()
+
+            controller.onLocalClipboardResume("remote text")
+
+            assertTrue(
+                "a failed image fetch must not replay the preceding remote text",
+                client.sentClipboard.isEmpty(),
+            )
+            controller.close()
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
+    fun queuedRemoteTextEchoDoesNotCancelTheFollowingRemoteImage() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        try {
+            val downloaded = CompletableDeferred<ByteArray?>()
+            val transport =
+                object : BlobTransport {
+                    override suspend fun upload(mime: String, bytes: ByteArray): BlobDescriptor? = null
+
+                    override suspend fun download(blob: BlobDescriptor): ByteArray? = downloaded.await()
+                }
+            val client = FakeMediaSessionClient()
+            val controller =
+                SessionController(
+                    mediaUrl = "ws://unused/v1/sessions/demo/media",
+                    token = "unused",
+                    transformHolder = ViewTransformHolder(),
+                    bridge = ClipboardBridge(),
+                    client = client,
+                    blobTransport = transport,
+                )
+            val received = mutableListOf<ByteArray>()
+            controller.onClipboardPush = { text -> controller.onLocalClipboard(text) }
+            controller.onClipboardBlobPush = { _, bytes, _ -> received += bytes }
+            controller.open()
+            client.onClipboard?.invoke("remote text")
+            client.onClipboardBlob?.invoke(BlobDescriptor("0123456789abcdef0123456789abcdef", "image/png", 1))
+            runCurrent()
+            downloaded.complete(byteArrayOf(1))
+            runCurrent()
+
+            assertTrue("the queued remote-text listener must remain an echo", client.sentClipboard.isEmpty())
+            assertEquals("the remote image must remain eligible", listOf(byteArrayOf(1).toList()), received.map { it.toList() })
+            controller.close()
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
 }

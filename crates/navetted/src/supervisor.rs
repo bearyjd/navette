@@ -266,11 +266,30 @@ impl<R: ProcessRunner> Supervisor<R> {
 
     pub fn reconcile(&self) -> Result<bool, SupervisorError> {
         let runner = &self.runner;
-        self.registry
+        let mut registry = self
+            .registry
             .lock()
-            .map_err(|_| SupervisorError::RegistryLock)?
-            .reconcile(|pid| runner.is_alive(pid))
-            .map_err(Into::into)
+            .map_err(|_| SupervisorError::RegistryLock)?;
+        let running_before: Vec<String> = registry
+            .list()
+            .into_iter()
+            .filter(|session| session.status == SessionStatus::Running)
+            .map(|session| session.name)
+            .collect();
+        let changed = registry.reconcile(|pid| runner.is_alive(pid))?;
+        let stopped: Vec<String> = running_before
+            .into_iter()
+            .filter(|name| {
+                registry
+                    .get(name)
+                    .is_some_and(|session| session.status == SessionStatus::Stopped)
+            })
+            .collect();
+        drop(registry);
+        for name in stopped {
+            let _ = fs::remove_dir_all(self.blob_root().join(name));
+        }
+        Ok(changed)
     }
 
     fn spawn(&self, spec: ProcessSpec) -> Result<u32, SupervisorError> {
@@ -619,10 +638,17 @@ mod tests {
                 status: SessionStatus::Running,
             })
             .unwrap();
+        let blob_dir = supervisor.blob_root().join("work");
+        fs::create_dir_all(&blob_dir).unwrap();
+        fs::write(blob_dir.join("stale-blob"), b"old").unwrap();
 
         assert!(supervisor.reconcile().unwrap());
         let registry = supervisor.registry.lock().unwrap();
         assert_eq!(registry.get("work").unwrap().status, SessionStatus::Stopped);
         assert_eq!(registry.get("work").unwrap().client_count, 0);
+        assert!(
+            !blob_dir.exists(),
+            "crash reconciliation must remove stale blob namespaces"
+        );
     }
 }

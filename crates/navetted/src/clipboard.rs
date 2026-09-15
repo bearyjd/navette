@@ -253,10 +253,10 @@ impl ClipboardSync {
         self.echo_blob_from_guest = Some(blob.id.clone());
         self.phone_clipboard = Some(PhoneClipboard::Blob(blob));
         SyncAction::OfferToGuest {
-            mime_types: OFFERED_IMAGE_MIME_TYPES
-                .iter()
-                .map(|mime| (*mime).to_string())
-                .collect(),
+            mime_types: match &self.phone_clipboard {
+                Some(PhoneClipboard::Blob(blob)) => vec![blob.mime.clone()],
+                _ => unreachable!("the blob clipboard was just stored"),
+            },
         }
     }
 
@@ -716,10 +716,7 @@ mod tests {
         assert_eq!(
             sync.on_phone_blob(blob()),
             SyncAction::OfferToGuest {
-                mime_types: OFFERED_IMAGE_MIME_TYPES
-                    .iter()
-                    .map(|mime| (*mime).to_string())
-                    .collect()
+                mime_types: vec!["image/png".into()]
             }
         );
     }

@@ -222,4 +222,15 @@ class ClipboardBridgeTest {
             bridge.onLocalClipboard("A"),
         )
     }
+
+    @Test
+    fun `a remote image clears stale text state so the same text can be copied again`() {
+        val bridge = ClipboardBridge()
+        assertEquals("A", bridge.onLocalClipboard("A"))
+        bridge.markSent("A")
+
+        bridge.onRemoteClipboardBlob()
+
+        assertEquals("A", bridge.onLocalClipboard("A"))
+    }
 }
