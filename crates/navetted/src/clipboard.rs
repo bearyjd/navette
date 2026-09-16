@@ -171,7 +171,7 @@ impl ClipboardSync {
                 }
                 self.awaiting_guest_transfer = None;
                 self.pending_guest_mime = None;
-                if blob.validate().is_err() {
+                if blob.validate_image().is_err() {
                     return SyncAction::Nothing;
                 }
                 if self.echo_blob_from_guest.as_deref() == Some(blob.id.as_str()) {
@@ -246,7 +246,7 @@ impl ClipboardSync {
     }
 
     pub fn on_phone_blob(&mut self, blob: BlobDescriptor) -> SyncAction {
-        if blob.validate().is_err() {
+        if blob.validate_image().is_err() {
             return SyncAction::Nothing;
         }
         if self.echo_blob_from_phone.as_deref() == Some(blob.id.as_str()) {

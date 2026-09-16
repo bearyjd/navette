@@ -24,6 +24,7 @@ use wprs::serialization::{Event, RecvType, Request};
 
 use crate::blobs::BlobStore;
 use crate::clipboard::{ClipboardSync, GuestEvent, SyncAction};
+use crate::file_transfers::FileTransferStore;
 use crate::media::{MediaCommand, MediaHub};
 
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(100);
@@ -38,6 +39,7 @@ static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 pub struct BridgeManager {
     media: MediaHub,
     blobs: BlobStore,
+    transfers: Option<FileTransferStore>,
     workers: Arc<Mutex<HashMap<String, BridgeHandle>>>,
 }
 
@@ -59,8 +61,36 @@ impl BridgeManager {
         Self {
             media,
             blobs,
+            transfers: None,
             workers: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// File materialization never runs on the wprs/calloop render thread.
+    /// Keep its ownership here with the per-session bridge lifecycle while a
+    /// dedicated short-lived worker performs filesystem work.
+    pub fn with_transfers(media: MediaHub, blobs: BlobStore, transfers: FileTransferStore) -> Self {
+        Self {
+            media,
+            blobs,
+            transfers: Some(transfers),
+            workers: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn materialize_file(&self, session: &str, transfer_id: &str) {
+        let Some(transfers) = self.transfers.clone() else {
+            return;
+        };
+        let session = session.to_owned();
+        let transfer_id = transfer_id.to_owned();
+        let _ = thread::Builder::new()
+            .name(format!("navette-file-{session}"))
+            .spawn(move || {
+                if let Err(error) = transfers.materialize(&session, &transfer_id) {
+                    tracing::debug!(session, transfer_id, %error, "file transfer materialization did not complete");
+                }
+            });
     }
 
     pub fn start(&self, session: &Session) -> Result<()> {

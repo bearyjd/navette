@@ -109,6 +109,7 @@ pub struct Supervisor<R: ProcessRunner> {
     registry: Arc<Mutex<Registry>>,
     xdg_runtime_dir: PathBuf,
     runtime_root: PathBuf,
+    drop_root: PathBuf,
     wprsd_program: String,
     readiness_timeout: Duration,
     shutdown_timeout: Duration,
@@ -123,11 +124,13 @@ impl<R: ProcessRunner> Supervisor<R> {
         wprsd_program: impl Into<String>,
     ) -> Self {
         let runtime_root = xdg_runtime_dir.join("navette");
+        let drop_root = default_drop_root(&xdg_runtime_dir);
         Self {
             runner,
             registry,
             xdg_runtime_dir,
             runtime_root,
+            drop_root,
             wprsd_program: wprsd_program.into(),
             readiness_timeout: Duration::from_secs(5),
             shutdown_timeout: Duration::from_secs(2),
@@ -138,6 +141,23 @@ impl<R: ProcessRunner> Supervisor<R> {
     /// Runtime-only root for session-scoped bulk clipboard blobs.
     pub fn blob_root(&self) -> PathBuf {
         self.xdg_runtime_dir.join("navette-blobs")
+    }
+
+    /// Persistent, daemon-owned guest drop directories. This intentionally
+    /// lives outside XDG_RUNTIME_DIR: a file must remain readable by a guest
+    /// after a reconnect, but is still removed with its session lifecycle.
+    pub fn drop_root(&self) -> PathBuf {
+        self.drop_root.clone()
+    }
+
+    pub fn drop_staging_root(&self) -> PathBuf {
+        self.drop_root.join(".staging")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_drop_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.drop_root = root.into();
+        self
     }
 
     pub fn with_timeouts(
@@ -176,6 +196,8 @@ impl<R: ProcessRunner> Supervisor<R> {
 
         let resources = SessionResources::new(&self.xdg_runtime_dir, &self.runtime_root, &name);
         create_private_directory(&resources.runtime_dir)?;
+        let drop_dir = self.drop_root().join(&name);
+        create_private_directory(&drop_dir)?;
 
         // Both children must resolve the Wayland socket under the same
         // directory the supervisor polls, not whatever this process inherited.
@@ -207,12 +229,17 @@ impl<R: ProcessRunner> Supervisor<R> {
                     "WAYLAND_DISPLAY".to_string(),
                     resources.wayland_display.clone(),
                 ),
+                (
+                    "NAVETTE_DROP_DIR".to_string(),
+                    drop_dir.to_string_lossy().into_owned(),
+                ),
             ]),
         };
         let app_pid = match self.spawn(app_spec) {
             Ok(pid) => pid,
             Err(error) => {
                 let _ = self.runner.terminate(daemon_pid, true);
+                let _ = fs::remove_dir_all(&drop_dir);
                 return Err(error);
             }
         };
@@ -260,6 +287,8 @@ impl<R: ProcessRunner> Supervisor<R> {
             .remove(name)?;
         let _ = fs::remove_dir_all(self.runtime_root.join(name));
         let _ = fs::remove_dir_all(self.blob_root().join(name));
+        let _ = fs::remove_dir_all(self.drop_root().join(name));
+        let _ = fs::remove_dir_all(self.drop_staging_root().join(name));
         let _ = fs::remove_file(self.xdg_runtime_dir.join(&session.wayland_display));
         Ok(removed)
     }
@@ -287,7 +316,9 @@ impl<R: ProcessRunner> Supervisor<R> {
             .collect();
         drop(registry);
         for name in stopped {
-            let _ = fs::remove_dir_all(self.blob_root().join(name));
+            let _ = fs::remove_dir_all(self.blob_root().join(&name));
+            let _ = fs::remove_dir_all(self.drop_root().join(&name));
+            let _ = fs::remove_dir_all(self.drop_staging_root().join(name));
         }
         Ok(changed)
     }
@@ -330,6 +361,15 @@ impl<R: ProcessRunner> Supervisor<R> {
         }
         Ok(())
     }
+}
+
+fn default_drop_root(xdg_runtime_dir: &Path) -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .unwrap_or_else(|| xdg_runtime_dir.join("navette-data"))
+        .join("navette/drops")
 }
 
 #[derive(Debug)]
@@ -480,6 +520,7 @@ mod tests {
             Duration::from_millis(20),
             Duration::from_millis(1),
         )
+        .with_drop_root(temp.path().join("drops"))
     }
 
     #[tokio::test]
@@ -503,6 +544,13 @@ mod tests {
         assert_eq!(
             state.spawned[1].env,
             BTreeMap::from([
+                (
+                    "NAVETTE_DROP_DIR".into(),
+                    temp.path()
+                        .join("drops/work")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
                 ("WAYLAND_DISPLAY".into(), "navette-work".into()),
                 ("XDG_RUNTIME_DIR".into(), runtime_env.clone()),
             ])
@@ -595,6 +643,9 @@ mod tests {
         let blob_dir = supervisor.blob_root().join("work");
         fs::create_dir_all(&blob_dir).unwrap();
         fs::write(blob_dir.join("stale-blob"), b"old").unwrap();
+        let staging_dir = supervisor.drop_staging_root().join("work");
+        fs::create_dir_all(&staging_dir).unwrap();
+        fs::write(staging_dir.join("partial.part"), b"partial").unwrap();
 
         let removed = supervisor.kill("work").await.unwrap();
         assert_eq!(removed.name, "work");
@@ -602,6 +653,10 @@ mod tests {
         assert!(
             !blob_dir.exists(),
             "killing a session must discard its blob namespace before the name can be reused"
+        );
+        assert!(
+            !staging_dir.exists(),
+            "killing a session must discard partial file uploads before the name can be reused"
         );
         supervisor.start(&app(), Some("work")).await.unwrap();
         assert!(
@@ -641,6 +696,9 @@ mod tests {
         let blob_dir = supervisor.blob_root().join("work");
         fs::create_dir_all(&blob_dir).unwrap();
         fs::write(blob_dir.join("stale-blob"), b"old").unwrap();
+        let staging_dir = supervisor.drop_staging_root().join("work");
+        fs::create_dir_all(&staging_dir).unwrap();
+        fs::write(staging_dir.join("partial.part"), b"partial").unwrap();
 
         assert!(supervisor.reconcile().unwrap());
         let registry = supervisor.registry.lock().unwrap();
@@ -649,6 +707,10 @@ mod tests {
         assert!(
             !blob_dir.exists(),
             "crash reconciliation must remove stale blob namespaces"
+        );
+        assert!(
+            !staging_dir.exists(),
+            "crash reconciliation must remove stale partial file uploads"
         );
     }
 }

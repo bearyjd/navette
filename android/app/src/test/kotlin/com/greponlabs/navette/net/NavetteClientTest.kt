@@ -90,4 +90,12 @@ class NavetteClientTest {
             mediaWebSocketUrl("tower", "my_session-2", port = 1234),
         )
     }
+
+    @Test
+    fun `file collection uses HTTP and replaces only the media route`() {
+        assertEquals(
+            "http://[fd7a:115c:a1e0::1]:9417/v1/sessions/work/files",
+            fileTransferCollectionUrl("ws://[fd7a:115c:a1e0::1]:9417/v1/sessions/work/media"),
+        )
+    }
 }

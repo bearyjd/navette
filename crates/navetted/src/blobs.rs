@@ -196,7 +196,7 @@ impl BlobStore {
         if validate_session_name(session).is_err() {
             return Err(BlobStoreError::InvalidSession);
         }
-        blob.validate()
+        blob.validate_image()
             .map_err(|_| BlobStoreError::InvalidDescriptor)?;
         let path = self.root.join(session).join(&blob.id);
         let metadata = fs::symlink_metadata(&path).map_err(not_found)?;
@@ -213,7 +213,7 @@ impl BlobStore {
         if validate_session_name(session).is_err() {
             return Err(BlobStoreError::InvalidSession);
         }
-        blob.validate()
+        blob.validate_image()
             .map_err(|_| BlobStoreError::InvalidDescriptor)?;
         if self.descriptor(session, &blob.id).as_ref() != Some(blob) {
             return Err(BlobStoreError::NotFound);
@@ -237,7 +237,7 @@ impl BlobStore {
         }
         let metadata = fs::read(self.root.join(session).join(format!("{}.meta", id))).ok()?;
         let descriptor: BlobDescriptor = serde_json::from_slice(&metadata).ok()?;
-        (descriptor.id == id && descriptor.validate().is_ok()).then_some(descriptor)
+        (descriptor.id == id && descriptor.validate_image().is_ok()).then_some(descriptor)
     }
 
     fn reserve(

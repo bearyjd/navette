@@ -5,6 +5,7 @@ pub mod app_index;
 pub mod blobs;
 pub mod bridge;
 pub mod clipboard;
+pub mod file_transfers;
 pub mod guard;
 pub mod media;
 pub mod registry;

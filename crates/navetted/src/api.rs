@@ -10,7 +10,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response as HttpResponse};
-use axum::routing::{any, get, post};
+use axum::routing::{any, get, post, put};
 use futures_util::{SinkExt, StreamExt};
 use navette_protocol::media::{
     MAX_INPUT_MESSAGE, MEDIA_WEBSOCKET_SUBPROTOCOL, MediaInput, MediaServerMessage,
@@ -27,6 +27,9 @@ use tokio::time::{Duration, Instant, sleep_until, timeout};
 use crate::app_index::AppIndex;
 use crate::blobs::{BlobStore, BlobStoreError};
 use crate::bridge::BridgeManager;
+use crate::file_transfers::{
+    FilePreflight, FileSessionLease, FileTransferError, FileTransferStore,
+};
 use crate::media::{MediaHub, MediaHubError};
 use crate::registry::{RegistryError, default_session_name, validate_session_name};
 use crate::supervisor::{ProcessRunner, Supervisor, SupervisorError};
@@ -113,6 +116,7 @@ pub struct ApiState<R: ProcessRunner> {
     pub supervisor: Arc<Supervisor<R>>,
     pub media: MediaHub,
     pub blobs: BlobStore,
+    pub files: FileTransferStore,
     pub bridges: BridgeManager,
     pub auth: Arc<navette_auth::AuthToken>,
     upload_slots: Arc<Semaphore>,
@@ -127,6 +131,7 @@ impl<R: ProcessRunner> Clone for ApiState<R> {
             supervisor: Arc::clone(&self.supervisor),
             media: self.media.clone(),
             blobs: self.blobs.clone(),
+            files: self.files.clone(),
             bridges: self.bridges.clone(),
             auth: Arc::clone(&self.auth),
             upload_slots: Arc::clone(&self.upload_slots),
@@ -144,19 +149,22 @@ impl<R: ProcessRunner> ApiState<R> {
     ) -> Self {
         let media = MediaHub::default();
         let blobs = BlobStore::new(supervisor.blob_root());
+        let files = FileTransferStore::new(supervisor.drop_root());
         if let Ok(registry) = supervisor.registry().lock() {
             for session in registry.list() {
                 if session.status == navette_protocol::SessionStatus::Running {
                     let _ = blobs.activate(&session.name);
+                    let _ = files.recover(&session.name);
                 }
             }
         }
         Self {
             apps,
             supervisor,
-            bridges: BridgeManager::new(media.clone(), blobs.clone()),
+            bridges: BridgeManager::with_transfers(media.clone(), blobs.clone(), files.clone()),
             media,
             blobs,
+            files,
             auth,
             upload_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_BLOB_UPLOADS)),
             download_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_BLOB_DOWNLOADS)),
@@ -204,6 +212,15 @@ pub fn router<R: ProcessRunner>(state: ApiState<R>) -> Router {
         .route("/v1/sessions/{session}/media", any(media_websocket::<R>))
         .route("/v1/sessions/{session}/blobs", post(upload_blob::<R>))
         .route("/v1/sessions/{session}/blobs/{id}", get(download_blob::<R>))
+        .route("/v1/sessions/{session}/files", post(create_file::<R>))
+        .route(
+            "/v1/sessions/{session}/files/{transfer_id}",
+            get(file_status::<R>).delete(cancel_file::<R>),
+        )
+        .route(
+            "/v1/sessions/{session}/files/{transfer_id}/content",
+            put(upload_file::<R>),
+        )
         .layer(axum::middleware::from_fn_with_state(
             auth,
             crate::guard::authenticate,
@@ -212,6 +229,112 @@ pub fn router<R: ProcessRunner>(state: ApiState<R>) -> Router {
             crate::guard::reject_browser_origin,
         ))
         .with_state(state)
+}
+
+async fn create_file<R: ProcessRunner>(
+    Path(session): Path<String>,
+    State(state): State<ApiState<R>>,
+    Json(request): Json<FilePreflight>,
+) -> HttpResponse {
+    let lease = match live_file_lease(&state, &session) {
+        Ok(lease) => lease,
+        Err(error) => return file_error_response(error),
+    };
+    match state.files.preflight_with_lease(&lease, request) {
+        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Err(error) => file_error_response(error),
+    }
+}
+
+/// Samples the file-store incarnation before checking the supervisor record.
+/// If Kill+Run reuses the name between this point and `preflight_with_lease`,
+/// the epoch check rejects the stale request instead of attaching it to the
+/// replacement session.
+fn live_file_lease<R: ProcessRunner>(
+    state: &ApiState<R>,
+    session: &str,
+) -> Result<FileSessionLease, FileTransferError> {
+    let lease = state.files.lease(session)?;
+    is_live_session(state, session)
+        .then_some(lease)
+        .ok_or(FileTransferError::SessionNotLive)
+}
+
+async fn upload_file<R: ProcessRunner>(
+    Path((session, transfer_id)): Path<(String, String)>,
+    State(state): State<ApiState<R>>,
+    headers: HeaderMap,
+    body: Body,
+) -> HttpResponse {
+    if !is_live_session(&state, &session) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let expected = match state.files.status(&session, &transfer_id) {
+        Ok(status) => status.size,
+        Err(error) => return file_error_response(error),
+    };
+    let declared = match headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        Some(length) if length == expected => length,
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    debug_assert_eq!(declared, expected);
+    let _upload_permit = match Arc::clone(&state.upload_slots).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+    };
+    let mut upload = match state.files.begin_upload(&session, &transfer_id) {
+        Ok(upload) => upload,
+        Err(error) => return file_error_response(error),
+    };
+    let mut stream = body.into_data_stream();
+    let write_body = async {
+        while let Some(chunk) = timeout(BLOB_UPLOAD_IDLE_TIMEOUT, stream.next())
+            .await
+            .map_err(|_| StatusCode::REQUEST_TIMEOUT.into_response())?
+        {
+            let chunk = chunk.map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
+            upload.write_chunk(&chunk).map_err(file_error_response)?;
+        }
+        upload.finish().map_err(file_error_response)
+    };
+    match timeout(BLOB_UPLOAD_TOTAL_TIMEOUT, write_body).await {
+        Ok(Ok(status)) => {
+            state.bridges.materialize_file(&session, &transfer_id);
+            (StatusCode::ACCEPTED, Json(status)).into_response()
+        }
+        Ok(Err(response)) => response,
+        Err(_) => StatusCode::REQUEST_TIMEOUT.into_response(),
+    }
+}
+
+async fn file_status<R: ProcessRunner>(
+    Path((session, transfer_id)): Path<(String, String)>,
+    State(state): State<ApiState<R>>,
+) -> HttpResponse {
+    if !is_live_session(&state, &session) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match state.files.status(&session, &transfer_id) {
+        Ok(status) => Json(status).into_response(),
+        Err(error) => file_error_response(error),
+    }
+}
+
+async fn cancel_file<R: ProcessRunner>(
+    Path((session, transfer_id)): Path<(String, String)>,
+    State(state): State<ApiState<R>>,
+) -> HttpResponse {
+    if !is_live_session(&state, &session) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match state.files.cancel(&session, &transfer_id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => file_error_response(error),
+    }
 }
 
 async fn upload_blob<R: ProcessRunner>(
@@ -352,6 +475,25 @@ fn blob_error_response(error: BlobStoreError) -> HttpResponse {
         | BlobStoreError::NotFound
         | BlobStoreError::SessionNotLive => StatusCode::NOT_FOUND.into_response(),
         BlobStoreError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+fn file_error_response(error: FileTransferError) -> HttpResponse {
+    match error {
+        FileTransferError::InvalidSession
+        | FileTransferError::NotFound
+        | FileTransferError::SessionNotLive => StatusCode::NOT_FOUND.into_response(),
+        FileTransferError::InvalidName
+        | FileTransferError::InvalidMime
+        | FileTransferError::SizeMismatch => StatusCode::BAD_REQUEST.into_response(),
+        FileTransferError::FileTooLarge => StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        FileTransferError::SessionBudgetExceeded => {
+            StatusCode::INSUFFICIENT_STORAGE.into_response()
+        }
+        FileTransferError::UploadInProgress
+        | FileTransferError::InvalidState
+        | FileTransferError::NotCancellable => StatusCode::CONFLICT.into_response(),
+        FileTransferError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
@@ -640,15 +782,25 @@ pub async fn dispatch<R: ProcessRunner>(state: &ApiState<R>, request: Request) -
                             "failed to initialize clipboard blob namespace: {error}"
                         )))
                     }
-                    Ok(()) => match state.bridges.start(&session) {
-                        Ok(()) => Ok(ResponseResult::Session { session }),
+                    Ok(()) => match state.files.activate(&session.name) {
                         Err(error) => {
                             let _ = state.blobs.deactivate(&session.name);
                             let _ = state.supervisor.kill(&session.name).await;
                             Err(ApiFailure::internal(format!(
-                                "failed to start media bridge: {error}"
+                                "failed to initialize file drop namespace: {error}"
                             )))
                         }
+                        Ok(()) => match state.bridges.start(&session) {
+                            Ok(()) => Ok(ResponseResult::Session { session }),
+                            Err(error) => {
+                                let _ = state.files.deactivate(&session.name);
+                                let _ = state.blobs.deactivate(&session.name);
+                                let _ = state.supervisor.kill(&session.name).await;
+                                Err(ApiFailure::internal(format!(
+                                    "failed to start media bridge: {error}"
+                                )))
+                            }
+                        },
                     },
                 },
                 Err(error) => Err(ApiFailure::from(error)),
@@ -669,6 +821,7 @@ pub async fn dispatch<R: ProcessRunner>(state: &ApiState<R>, request: Request) -
                         // registry removal succeeded. A failed kill must leave
                         // the still-running session fully usable.
                         let _ = state.blobs.deactivate(&session);
+                        let _ = state.files.deactivate(&session);
                         state.bridges.stop(&session);
                         ResponseResult::Ack
                     })
@@ -850,7 +1003,8 @@ mod tests {
             Duration::from_millis(5),
             Duration::from_millis(5),
             Duration::from_millis(1),
-        );
+        )
+        .with_drop_root(temp.path().join("drops"));
         ApiState::new(
             Arc::new(apps),
             Arc::new(supervisor),
@@ -878,6 +1032,7 @@ mod tests {
             })
             .unwrap();
         state.blobs.activate(name).unwrap();
+        state.files.activate(name).unwrap();
     }
 
     fn add_stopped_session(state: &ApiState<NoopRunner>, name: &str) {
@@ -1457,6 +1612,215 @@ mod tests {
         assert_eq!(
             app.oneshot(exhausted).await.unwrap().status(),
             StatusCode::INSUFFICIENT_STORAGE
+        );
+    }
+
+    #[test]
+    fn daemon_restart_preserves_delivered_files_for_a_live_session() {
+        let temp = TempDir::new().unwrap();
+        let state = test_state(&temp);
+        add_running_session(&state, "work");
+        let preflight = state
+            .files
+            .preflight(
+                "work",
+                FilePreflight {
+                    name: "report.pdf".into(),
+                    mime: "application/pdf".into(),
+                    size: 4,
+                },
+            )
+            .unwrap();
+        let mut upload = state
+            .files
+            .begin_upload("work", &preflight.transfer_id)
+            .unwrap();
+        upload.write_chunk(b"data").unwrap();
+        upload.finish().unwrap();
+        state
+            .files
+            .materialize("work", &preflight.transfer_id)
+            .unwrap();
+        let path = state
+            .files
+            .drop_dir("work")
+            .join(&preflight.transfer_id)
+            .join("report.pdf");
+
+        let _restarted = ApiState::new(
+            Arc::clone(&state.apps),
+            Arc::clone(&state.supervisor),
+            Arc::new(navette_auth::AuthToken::generate()),
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"data");
+    }
+
+    #[test]
+    fn handler_liveness_lease_rejects_a_preflight_after_kill_and_name_reuse() {
+        let temp = TempDir::new().unwrap();
+        let state = test_state(&temp);
+        add_running_session(&state, "work");
+
+        // This is the exact order in `create_file`: capture the file-store
+        // incarnation, observe the old running registry record, then allow a
+        // Kill+Run lifecycle transition before reservation creation.
+        let lease = live_file_lease(&state, "work").unwrap();
+        state.files.deactivate("work").unwrap();
+        state.files.activate("work").unwrap();
+
+        assert!(matches!(
+            state.files.preflight_with_lease(
+                &lease,
+                FilePreflight {
+                    name: "stale.pdf".into(),
+                    mime: "application/pdf".into(),
+                    size: 4,
+                },
+            ),
+            Err(FileTransferError::SessionNotLive)
+        ));
+    }
+
+    #[tokio::test]
+    async fn file_routes_require_auth_reserve_exact_bytes_and_materialize_off_request_path() {
+        let temp = TempDir::new().unwrap();
+        let state = test_state(&temp);
+        add_running_session(&state, "work");
+        let token = state.auth.render();
+        let app = router(state);
+
+        let unauthenticated = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/sessions/work/files")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"name":"report.pdf","mime":"application/pdf","size":4}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(unauthenticated).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let preflight = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/sessions/work/files")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"name":"report.pdf","mime":"application/pdf","size":4}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(preflight).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let preflight: crate::file_transfers::FilePreflightResponse = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(preflight.upload_url.ends_with("/content"));
+
+        let wrong_length = axum::http::Request::builder()
+            .method("PUT")
+            .uri(&preflight.upload_url)
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-length", "3")
+            .body(axum::body::Body::from("data"))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(wrong_length).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let upload = axum::http::Request::builder()
+            .method("PUT")
+            .uri(&preflight.upload_url)
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-length", "4")
+            .body(axum::body::Body::from("data"))
+            .unwrap();
+        let response = app.clone().oneshot(upload).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let status = axum::http::Request::builder()
+            .uri(format!("/v1/sessions/work/files/{}", preflight.transfer_id))
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(status).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let status: crate::file_transfers::FileTransferStatus = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            status.state,
+            crate::file_transfers::FileTransferState::Queued
+                | crate::file_transfers::FileTransferState::Materializing
+                | crate::file_transfers::FileTransferState::Delivered
+        ));
+    }
+
+    #[tokio::test]
+    async fn file_routes_cancel_untrusted_names_and_non_live_sessions() {
+        let temp = TempDir::new().unwrap();
+        let state = test_state(&temp);
+        add_running_session(&state, "work");
+        let token = state.auth.render();
+        let app = router(state);
+        let payload = r#"{"name":"report.pdf","mime":"application/pdf","size":4}"#;
+
+        let traversal = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/sessions/work/files")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"name":"../report","mime":"application/pdf","size":4}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(traversal).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        let missing_session = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/sessions/missing/files")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(payload))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(missing_session).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let create = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/sessions/work/files")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(payload))
+            .unwrap();
+        let response = app.clone().oneshot(create).await.unwrap();
+        let preflight: crate::file_transfers::FilePreflightResponse = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let cancel = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/sessions/work/files/{}", preflight.transfer_id))
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(cancel).await.unwrap().status(),
+            StatusCode::NO_CONTENT
         );
     }
 }

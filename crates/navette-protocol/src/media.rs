@@ -42,10 +42,7 @@ impl BlobDescriptor {
         {
             return Err(BlobValidationError::InvalidId);
         }
-        if !matches!(
-            self.mime.as_str(),
-            "image/png" | "image/jpeg" | "image/webp"
-        ) {
+        if !is_valid_mime(&self.mime) {
             return Err(BlobValidationError::UnsupportedMime);
         }
         if self.size == 0 || self.size > MAX_BLOB_BYTES as u64 {
@@ -53,6 +50,57 @@ impl BlobDescriptor {
         }
         Ok(())
     }
+
+    /// Clipboard images deliberately support a narrower set than generic
+    /// stored objects. Keep that policy at the clipboard boundary rather than
+    /// making the descriptor format unusable for files.
+    pub fn validate_image(&self) -> Result<(), BlobValidationError> {
+        self.validate()?;
+        if !matches!(
+            self.mime.as_str(),
+            "image/png" | "image/jpeg" | "image/webp"
+        ) {
+            return Err(BlobValidationError::UnsupportedMime);
+        }
+        Ok(())
+    }
+}
+
+/// A conservative RFC 9110 media-type token check. Parameters are rejected:
+/// callers must preserve a single, canonical stored MIME value.
+pub fn is_valid_mime(mime: &str) -> bool {
+    if mime.is_empty() || mime.len() > 255 {
+        return false;
+    }
+    let Some((kind, subtype)) = mime.split_once('/') else {
+        return false;
+    };
+    !kind.is_empty()
+        && !subtype.is_empty()
+        && !subtype.contains('/')
+        && kind.bytes().all(is_token_byte)
+        && subtype.bytes().all(is_token_byte)
+}
+
+fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -378,7 +426,7 @@ impl MediaInput {
                 Err(InputValidationError::ClipboardTooLarge(text.len()))
             }
             Self::SetClipboardBlob { blob } => blob
-                .validate()
+                .validate_image()
                 .map_err(InputValidationError::InvalidBlobDescriptor),
             _ => Ok(()),
         }
@@ -613,7 +661,7 @@ mod tests {
             mime: "image/png".into(),
             size: 42,
         };
-        assert_eq!(blob.validate(), Ok(()));
+        assert_eq!(blob.validate_image(), Ok(()));
         let input = MediaInput::SetClipboardBlob { blob: blob.clone() };
         assert_eq!(input.validate(), Ok(()));
         assert_eq!(
@@ -663,7 +711,39 @@ mod tests {
                 size: (MAX_BLOB_BYTES + 1) as u64,
             },
         ] {
-            assert!(blob.validate().is_err(), "{blob:?}");
+            assert!(blob.validate_image().is_err(), "{blob:?}");
+        }
+    }
+
+    #[test]
+    fn generic_descriptors_accept_safe_file_media_types_but_clipboard_does_not() {
+        let file = BlobDescriptor {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            mime: "application/pdf".into(),
+            size: 1,
+        };
+        assert!(file.validate().is_ok());
+        assert!(file.validate_image().is_err());
+        assert!(matches!(
+            MediaInput::SetClipboardBlob { blob: file }.validate(),
+            Err(InputValidationError::InvalidBlobDescriptor(_))
+        ));
+    }
+
+    #[test]
+    fn generic_descriptor_rejects_media_type_parameters_and_path_like_values() {
+        for mime in [
+            "text/plain; charset=utf-8",
+            "../image/png",
+            "image/",
+            "/png",
+        ] {
+            let blob = BlobDescriptor {
+                id: "0123456789abcdef0123456789abcdef".into(),
+                mime: mime.into(),
+                size: 1,
+            };
+            assert!(blob.validate().is_err(), "{mime}");
         }
     }
 }
