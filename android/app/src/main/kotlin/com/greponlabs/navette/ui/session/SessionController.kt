@@ -13,6 +13,7 @@ import com.greponlabs.navette.media.StreamGateEvent
 import com.greponlabs.navette.net.BTN_LEFT
 import com.greponlabs.navette.net.BTN_RIGHT
 import com.greponlabs.navette.net.ConnectionState
+import com.greponlabs.navette.net.BlobDescriptor
 import com.greponlabs.navette.net.MediaClient
 import com.greponlabs.navette.net.MediaInput
 import com.greponlabs.navette.net.MediaPacket
@@ -50,6 +51,7 @@ internal interface MediaSessionClient {
     val connectionState: StateFlow<ConnectionState>
     var onPong: ((ULong) -> Unit)?
     var onClipboard: ((String) -> Unit)?
+    var onClipboardBlob: ((BlobDescriptor) -> Unit)?
 
     fun connect()
     fun close()
@@ -76,6 +78,11 @@ private class OkHttpMediaSessionClient(
         get() = delegate.onClipboard
         set(value) {
             delegate.onClipboard = value
+        }
+    override var onClipboardBlob: ((BlobDescriptor) -> Unit)?
+        get() = delegate.onClipboardBlob
+        set(value) {
+            delegate.onClipboardBlob = value
         }
 
     override fun connect() = delegate.connect()
@@ -142,9 +149,22 @@ internal class SessionController(
     // in open() -- so it is guarded by `lock` rather than getting its own.
     private val bridge: ClipboardBridge,
     private val client: MediaSessionClient = OkHttpMediaSessionClient(mediaUrl, token),
+    private val blobTransport: BlobTransport = HttpBlobTransport(mediaUrl, token),
+    private val pendingBlobAnnouncement: PendingClipboardBlobAnnouncement = PendingClipboardBlobAnnouncement(),
 ) {
     private val gate = StreamGate()
     private val scope = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
+    private val blobCoordinator =
+        ClipboardBlobCoordinator(
+            scope = scope,
+            transport = blobTransport,
+            announce = { blob -> client.sendInput(MediaInput.SetClipboardBlob(blob)) },
+            pendingAnnouncement = pendingBlobAnnouncement,
+        )
+    // The platform listener identifies the URI it observed. Only that exact
+    // FileProvider URI may consume this one-shot echo, so an unrelated local
+    // image cannot accidentally suppress the remote write's echo.
+    private var localBlobEchoIdentity: String? = null
 
     /**
      * Guards [decoder], [surface] and [surfaceSize], which two threads reach:
@@ -207,6 +227,9 @@ internal class SessionController(
      */
     var onClipboardPush: ((String) -> Unit)? = null
 
+    /** Called with an image downloaded from the authenticated blob route. */
+    var onClipboardBlobPush: ((BlobDescriptor, ByteArray, Long) -> Unit)? = null
+
     /**
      * The surface the most recent successfully-sent motion was addressed to.
      *
@@ -267,8 +290,18 @@ internal class SessionController(
         // runs on OkHttp's reader thread, and onClipboardPush ends in a
         // ClipboardManager call the screen must make from the main thread.
         client.onClipboard = { text ->
+            // A text clipboard value is newer than any in-flight image blob
+            // operation, even if the text bridge later identifies it as an
+            // echo. Invalidate before making that decision so no old fetch
+            // can overwrite the phone after this callback returns.
+            blobCoordinator.invalidate()
             val toWrite = synchronized(lock) { bridge.onRemoteClipboard(text) }
             if (toWrite != null) scope.launch { onClipboardPush?.invoke(toWrite) }
+        }
+        client.onClipboardBlob = { blob ->
+            blobCoordinator.download(blob) { bytes, claim ->
+                onClipboardBlobPush?.invoke(blob, bytes, claim)
+            }
         }
         // connect() before the state collector, not after. The client's flow
         // starts at Disconnected; connect() moves it to Connecting
@@ -280,7 +313,10 @@ internal class SessionController(
         client.connect()
         connectionJob =
             scope.launch {
-                client.connectionState.collect { connection -> _state.update { it.copy(connection = connection) } }
+                client.connectionState.collect { connection ->
+                    if (connection is ConnectionState.Connected) blobCoordinator.retryPendingAnnouncement()
+                    _state.update { it.copy(connection = connection) }
+                }
             }
         hudJob?.cancel()
         hudJob =
@@ -316,6 +352,9 @@ internal class SessionController(
         hudJob?.cancel()
         client.onPong = null
         client.onClipboard = null
+        client.onClipboardBlob = null
+        blobCoordinator.invalidate(clearPendingAnnouncement = false)
+        synchronized(lock) { localBlobEchoIdentity = null }
         // Clear the surface BEFORE stopping the decoder. Cancelling
         // packetsJob above does not preempt a route() already inside
         // startDecoder, and with the old order that call could publish a
@@ -678,7 +717,49 @@ internal class SessionController(
      */
     fun onLocalClipboard(text: String) {
         val forward = synchronized(lock) { bridge.onLocalClipboard(text) } ?: return
+        blobCoordinator.invalidate()
         sendClipboardOrRetryOnConnect(forward)
+    }
+
+    /**
+     * Claims a local image before its URI is read on the I/O dispatcher.
+     * Returning null means this exact FileProvider URI is our own remote echo.
+     */
+    fun beginLocalClipboardBlob(sourceIdentity: String): Long? {
+        if (synchronized(lock) {
+                if (localBlobEchoIdentity == sourceIdentity) {
+                    localBlobEchoIdentity = null
+                    true
+                } else {
+                    false
+                }
+            }
+        ) return null
+        return blobCoordinator.claim()
+    }
+
+    /** Starts an HTTP upload; only its completed descriptor reaches the socket. */
+    fun onLocalClipboardBlob(mime: String, bytes: ByteArray, claim: Long = blobCoordinator.claim()) {
+        blobCoordinator.uploadIfCurrent(claim, mime, bytes)
+    }
+
+    /**
+     * Commits a downloaded image to the Android clipboard only if no newer
+     * clipboard event has invalidated its blob claim. The effect runs while
+     * the coordinator's generation is serialized with invalidation.
+     */
+    fun commitClipboardBlob(claim: Long, identity: String, effect: () -> Unit) {
+        blobCoordinator.commitIfCurrent(claim) {
+            synchronized(lock) {
+                // Only an image that is actually becoming the primary clip
+                // replaces the text state. A failed or superseded download
+                // leaves the previous remote-text echo/resume suppression
+                // intact.
+                bridge.onRemoteClipboardBlob()
+                localBlobEchoIdentity = identity
+            }
+            effect()
+        }
     }
 
     /**
@@ -688,6 +769,7 @@ internal class SessionController(
      */
     fun onLocalClipboardResume(text: String) {
         val forward = synchronized(lock) { bridge.onLocalClipboardResume(text) } ?: return
+        blobCoordinator.invalidate()
         sendClipboardOrRetryOnConnect(forward)
     }
 

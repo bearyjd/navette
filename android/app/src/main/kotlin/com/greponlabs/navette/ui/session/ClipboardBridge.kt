@@ -160,4 +160,11 @@ class ClipboardBridge {
         lastRemote = text
         return text
     }
+
+    /** A remote image replaces any text value this bridge remembered. */
+    fun onRemoteClipboardBlob() {
+        lastSent = null
+        lastRemote = null
+        echoFromLocal = null
+    }
 }

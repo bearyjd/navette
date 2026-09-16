@@ -253,9 +253,9 @@ impl InputState {
             // interception is ever incomplete for some path, fail loudly
             // rather than silently swallowing real user input -- name only
             // the variant, never the clipboard text.
-            MediaInput::SetClipboard { .. } => {
+            MediaInput::SetClipboard { .. } | MediaInput::SetClipboardBlob { .. } => {
                 tracing::warn!(
-                    variant = "SetClipboard",
+                    variant = "Clipboard",
                     "unhandled MediaInput reached InputState::apply; \
                      Task 6's interception must have missed a path"
                 );

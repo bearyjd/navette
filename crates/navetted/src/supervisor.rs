@@ -135,6 +135,11 @@ impl<R: ProcessRunner> Supervisor<R> {
         }
     }
 
+    /// Runtime-only root for session-scoped bulk clipboard blobs.
+    pub fn blob_root(&self) -> PathBuf {
+        self.xdg_runtime_dir.join("navette-blobs")
+    }
+
     pub fn with_timeouts(
         mut self,
         readiness_timeout: Duration,
@@ -254,17 +259,37 @@ impl<R: ProcessRunner> Supervisor<R> {
             .map_err(|_| SupervisorError::RegistryLock)?
             .remove(name)?;
         let _ = fs::remove_dir_all(self.runtime_root.join(name));
+        let _ = fs::remove_dir_all(self.blob_root().join(name));
         let _ = fs::remove_file(self.xdg_runtime_dir.join(&session.wayland_display));
         Ok(removed)
     }
 
     pub fn reconcile(&self) -> Result<bool, SupervisorError> {
         let runner = &self.runner;
-        self.registry
+        let mut registry = self
+            .registry
             .lock()
-            .map_err(|_| SupervisorError::RegistryLock)?
-            .reconcile(|pid| runner.is_alive(pid))
-            .map_err(Into::into)
+            .map_err(|_| SupervisorError::RegistryLock)?;
+        let running_before: Vec<String> = registry
+            .list()
+            .into_iter()
+            .filter(|session| session.status == SessionStatus::Running)
+            .map(|session| session.name)
+            .collect();
+        let changed = registry.reconcile(|pid| runner.is_alive(pid))?;
+        let stopped: Vec<String> = running_before
+            .into_iter()
+            .filter(|name| {
+                registry
+                    .get(name)
+                    .is_some_and(|session| session.status == SessionStatus::Stopped)
+            })
+            .collect();
+        drop(registry);
+        for name in stopped {
+            let _ = fs::remove_dir_all(self.blob_root().join(name));
+        }
+        Ok(changed)
     }
 
     fn spawn(&self, spec: ProcessSpec) -> Result<u32, SupervisorError> {
@@ -567,10 +592,22 @@ mod tests {
         let runner = Arc::new(FakeRunner::new(runtime));
         let supervisor = harness(runner.clone(), &temp);
         supervisor.start(&app(), Some("work")).await.unwrap();
+        let blob_dir = supervisor.blob_root().join("work");
+        fs::create_dir_all(&blob_dir).unwrap();
+        fs::write(blob_dir.join("stale-blob"), b"old").unwrap();
 
         let removed = supervisor.kill("work").await.unwrap();
         assert_eq!(removed.name, "work");
         assert!(supervisor.registry.lock().unwrap().get("work").is_none());
+        assert!(
+            !blob_dir.exists(),
+            "killing a session must discard its blob namespace before the name can be reused"
+        );
+        supervisor.start(&app(), Some("work")).await.unwrap();
+        assert!(
+            !blob_dir.exists(),
+            "recreating the same session name must not resurrect stale blob data"
+        );
         assert_eq!(
             runner.state.lock().unwrap().terminated,
             [(101, false), (100, false)]
@@ -601,10 +638,17 @@ mod tests {
                 status: SessionStatus::Running,
             })
             .unwrap();
+        let blob_dir = supervisor.blob_root().join("work");
+        fs::create_dir_all(&blob_dir).unwrap();
+        fs::write(blob_dir.join("stale-blob"), b"old").unwrap();
 
         assert!(supervisor.reconcile().unwrap());
         let registry = supervisor.registry.lock().unwrap();
         assert_eq!(registry.get("work").unwrap().status, SessionStatus::Stopped);
         assert_eq!(registry.get("work").unwrap().client_count, 0);
+        assert!(
+            !blob_dir.exists(),
+            "crash reconciliation must remove stale blob namespaces"
+        );
     }
 }

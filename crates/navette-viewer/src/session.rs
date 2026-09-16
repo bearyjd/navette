@@ -496,7 +496,8 @@ mod tests {
             MediaInput::ViewportResize { .. }
             | MediaInput::RequestKeyframe
             | MediaInput::Ping { .. }
-            | MediaInput::SetClipboard { .. } => None,
+            | MediaInput::SetClipboard { .. }
+            | MediaInput::SetClipboardBlob { .. } => None,
         }
     }
 

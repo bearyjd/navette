@@ -3,6 +3,7 @@ package com.greponlabs.navette.ui.session
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.net.Uri
 import android.view.SurfaceView
 import android.view.View
 import androidx.compose.foundation.background
@@ -41,10 +42,18 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
+import androidx.core.content.FileProvider
 import com.greponlabs.navette.net.ConnectionState
+import com.greponlabs.navette.net.MAX_BLOB_BYTES
 import com.greponlabs.navette.net.Pairing
 import com.greponlabs.navette.net.mediaWebSocketUrl
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import androidx.compose.runtime.rememberCoroutineScope
+import java.io.ByteArrayOutputStream
+import java.io.File
 
 
 /**
@@ -65,6 +74,20 @@ import kotlinx.coroutines.flow.first
  * than in `AppViewModel`. `AppViewModel` owns the control channel and which
  * session is active; it has never touched media state and does not start now.
  */
+/** A resume only forwards actual text, never a URI coerced to a string. */
+internal fun resumeClipboardText(itemText: CharSequence?): String? = itemText?.toString()
+
+/** Claims ordering before a provider MIME lookup, which can block on another process. */
+internal fun claimClipboardImageBeforeMime(
+    uriIdentity: String,
+    claim: (String) -> Long?,
+    lookupMime: () -> String?,
+): Pair<Long, String>? {
+    val token = claim(uriIdentity) ?: return null
+    val mime = lookupMime() ?: return null
+    return mime.takeIf { it in setOf("image/png", "image/jpeg", "image/webp") }?.let { token to it }
+}
+
 @Composable
 fun SessionScreen(
     sessionName: String,
@@ -92,6 +115,9 @@ fun SessionScreen(
     // push as if the phone had copied it new, clobbering whatever the guest
     // copied while the socket was down.
     val clipboardBridge = remember(pairing.host, sessionName) { ClipboardBridge() }
+    val pendingBlobAnnouncement =
+        remember(pairing.host, sessionName) { PendingClipboardBlobAnnouncement() }
+    val clipboardScope = rememberCoroutineScope()
     val controller =
         remember(pairing.host, pairing.port, sessionName, reconnectNonce) {
             SessionController(
@@ -99,6 +125,7 @@ fun SessionScreen(
                 pairing.token,
                 transformHolder,
                 clipboardBridge,
+                pendingBlobAnnouncement = pendingBlobAnnouncement,
             )
         }
     val state by controller.state.collectAsState()
@@ -119,7 +146,6 @@ fun SessionScreen(
     // Keyed like imeRaised, not the nonce: a reconnect rebuild must not
     // silently turn the HUD off while someone is watching it.
     var hudVisible by remember(pairing.host, sessionName) { mutableStateOf(false) }
-
     LockLandscapeWhileAttached()
 
     // Clipboard listener and lifecycle observer registered and torn down here,
@@ -130,10 +156,33 @@ fun SessionScreen(
     // from another app necessarily unfocuses Navette, so the listener alone
     // would miss the case this feature exists for.
     DisposableEffect(controller) {
-        fun readLocalClipboard(): String? = clipboard.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()
+        fun readLocalClipboard(): String? =
+            resumeClipboardText(clipboard.primaryClip?.getItemAt(0)?.text)
+        fun readLocalImageUri(): Uri? {
+            val item = clipboard.primaryClip?.getItemAt(0) ?: return null
+            return item.uri
+        }
+        fun offerLocalClipboard() {
+            val text = readLocalClipboard()
+            if (!text.isNullOrEmpty() && clipboard.primaryClip?.getItemAt(0)?.text != null) {
+                controller.onLocalClipboard(text)
+                return
+            }
+            val uri = readLocalImageUri() ?: return
+            val (claim, mime) =
+                claimClipboardImageBeforeMime(
+                    uri.toString(),
+                    controller::beginLocalClipboardBlob,
+                ) { context.contentResolver.getType(uri) } ?: return
+            clipboardScope.launch(Dispatchers.IO) {
+                readBoundedClipboardImage(context, uri)?.let {
+                    controller.onLocalClipboardBlob(mime, it, claim)
+                }
+            }
+        }
         val clipboardListener =
             ClipboardManager.OnPrimaryClipChangedListener {
-                readLocalClipboard()?.let { controller.onLocalClipboard(it) }
+                offerLocalClipboard()
             }
         clipboard.addPrimaryClipChangedListener(clipboardListener)
         // Goes through onLocalClipboardResume, not onLocalClipboard: this
@@ -160,6 +209,16 @@ fun SessionScreen(
     LaunchedEffect(controller) {
         controller.onToggleHud = { hudVisible = !hudVisible }
         controller.onClipboardPush = { text -> clipboard.setPrimaryClip(ClipData.newPlainText("navette", text)) }
+        controller.onClipboardBlobPush = { blob, bytes, claim ->
+            clipboardScope.launch(Dispatchers.IO) {
+                val uri = writeClipboardImage(context, blob.mime, bytes) ?: return@launch
+                withContext(Dispatchers.Main) {
+                    controller.commitClipboardBlob(claim, uri.toString()) {
+                        clipboard.setPrimaryClip(ClipData.newUri(context.contentResolver, "navette", uri))
+                    }
+                }
+            }
+        }
     }
 
     // Re-asserts whichever focus target is correct, every time this effect
@@ -386,3 +445,67 @@ private fun BoxScope.ImeLayer(
         Text(text = if (imeRaised) "Hide keyboard" else "Keyboard", color = Color.White)
     }
 }
+
+private fun readBoundedClipboardImage(context: Context, uri: Uri): ByteArray? =
+    runCatching {
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            val output = ByteArrayOutputStream()
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                if (output.size().toLong() + count > MAX_BLOB_BYTES) return@use null
+                output.write(buffer, 0, count)
+            }
+            output.toByteArray().takeIf { it.isNotEmpty() }
+        }
+    }.getOrNull()
+
+private const val MAX_CLIPBOARD_CACHE_FILES = 8
+
+internal fun retainClipboardImages(
+    directory: File,
+    current: File,
+    maxFiles: Int = MAX_CLIPBOARD_CACHE_FILES,
+    maxBytes: Long = MAX_BLOB_BYTES,
+) {
+    var keptFiles = 0
+    var keptBytes = 0L
+    val images =
+        directory
+            .listFiles()
+            .orEmpty()
+            .filter { it.isFile && it.extension.lowercase() in setOf("png", "jpg", "webp") }
+            .sortedWith(compareByDescending<File> { it == current }.thenByDescending { it.lastModified() })
+    for (image in images) {
+        val nextBytes = keptBytes + image.length()
+        if (keptFiles < maxFiles && nextBytes <= maxBytes) {
+            keptFiles += 1
+            keptBytes = nextBytes
+        } else {
+            image.delete()
+        }
+    }
+}
+
+private fun writeClipboardImage(context: Context, mime: String, bytes: ByteArray): Uri? =
+    runCatching {
+        if (bytes.isEmpty() || bytes.size.toLong() > MAX_BLOB_BYTES) return@runCatching null
+        val suffix =
+            when (mime) {
+                "image/png" -> ".png"
+                "image/jpeg" -> ".jpg"
+                "image/webp" -> ".webp"
+                else -> return@runCatching null
+            }
+        val directory = File(context.cacheDir, "clipboard").apply { mkdirs() }
+        val partial = File.createTempFile("navette-", ".part", directory)
+        partial.outputStream().use { it.write(bytes) }
+        val final = File(directory, partial.name.removeSuffix(".part") + suffix)
+        if (!partial.renameTo(final)) {
+            partial.delete()
+            return@runCatching null
+        }
+        retainClipboardImages(directory, final)
+        FileProvider.getUriForFile(context, context.packageName + ".clipboard", final)
+    }.getOrNull()
