@@ -8,15 +8,38 @@ use freedesktop_desktop_entry::{
 };
 use navette_protocol::App;
 
+use crate::icons::{default_data_dirs, resolve_icon};
+
+/// One `.desktop` entry plus what the daemon resolved about it at load time.
+/// The icon path stays here rather than on the protocol `App`: clients fetch
+/// icons through `/v1/apps/{id}/icon`, and a host filesystem path is neither
+/// useful to them nor something to hand out.
+#[derive(Clone, Debug)]
+struct IndexedApp {
+    app: App,
+    icon_path: Option<PathBuf>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct AppIndex {
-    apps: BTreeMap<String, App>,
+    apps: BTreeMap<String, IndexedApp>,
 }
 
 impl AppIndex {
     pub fn from_apps(apps: impl IntoIterator<Item = App>) -> Self {
         Self {
-            apps: apps.into_iter().map(|app| (app.id.clone(), app)).collect(),
+            apps: apps
+                .into_iter()
+                .map(|app| {
+                    (
+                        app.id.clone(),
+                        IndexedApp {
+                            app,
+                            icon_path: None,
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -24,14 +47,24 @@ impl AppIndex {
         let locales = get_languages_from_env();
         let desktops = current_desktop().unwrap_or_default();
         let path = env::var_os("PATH").unwrap_or_default();
-        Self::load_from_paths(default_paths(), &locales, &desktops, &path)
+        Self::load_from_paths(
+            default_paths(),
+            &locales,
+            &desktops,
+            &path,
+            &default_data_dirs(),
+        )
     }
 
+    /// `paths` are the `.desktop` directories; `icon_data_dirs` are the XDG
+    /// data roots icons are resolved under (see [`resolve_icon`]). They are
+    /// different lists: the first already points inside `applications/`.
     pub fn load_from_paths<I>(
         paths: I,
         locales: &[String],
         desktops: &[String],
         executable_path: &std::ffi::OsStr,
+        icon_data_dirs: &[PathBuf],
     ) -> Self
     where
         I: IntoIterator<Item = PathBuf>,
@@ -58,24 +91,34 @@ impl AppIndex {
                 continue;
             }
 
+            let icon = entry
+                .icon()
+                .filter(|icon| !icon.is_empty())
+                .map(str::to_string);
+            // Resolved once here, not per request: the lookup touches up to
+            // seven paths per data dir, and the answer only changes when the
+            // index is reloaded anyway.
+            let icon_path = icon
+                .as_deref()
+                .and_then(|name| resolve_icon(name, icon_data_dirs));
             apps.insert(
                 id.clone(),
-                App {
-                    id,
-                    name: name.into_owned(),
-                    icon: entry
-                        .icon()
-                        .filter(|icon| !icon.is_empty())
-                        .map(str::to_string),
-                    categories: entry
-                        .categories()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|category| !category.is_empty())
-                        .map(str::to_string)
-                        .collect(),
-                    exec,
-                    terminal: entry.terminal(),
+                IndexedApp {
+                    app: App {
+                        id,
+                        name: name.into_owned(),
+                        icon,
+                        categories: entry
+                            .categories()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|category| !category.is_empty())
+                            .map(str::to_string)
+                            .collect(),
+                        exec,
+                        terminal: entry.terminal(),
+                    },
+                    icon_path,
                 },
             );
         }
@@ -84,11 +127,20 @@ impl AppIndex {
     }
 
     pub fn get(&self, id: &str) -> Option<&App> {
-        self.apps.get(id)
+        self.apps.get(id).map(|indexed| &indexed.app)
+    }
+
+    /// The PNG resolved for this app's `Icon=` at load time, if any.
+    pub fn icon_path(&self, id: &str) -> Option<&Path> {
+        self.apps.get(id)?.icon_path.as_deref()
     }
 
     pub fn list(&self) -> Vec<App> {
-        let mut apps = self.apps.values().cloned().collect::<Vec<_>>();
+        let mut apps = self
+            .apps
+            .values()
+            .map(|indexed| indexed.app.clone())
+            .collect::<Vec<_>>();
         apps.sort_by(|left, right| {
             left.name
                 .to_lowercase()
@@ -166,7 +218,11 @@ mod tests {
     }
 
     fn load(paths: Vec<PathBuf>) -> AppIndex {
-        AppIndex::load_from_paths(paths, &[], &["kde".into()], "/bin".as_ref())
+        load_with_icons(paths, &[])
+    }
+
+    fn load_with_icons(paths: Vec<PathBuf>, icon_dirs: &[PathBuf]) -> AppIndex {
+        AppIndex::load_from_paths(paths, &[], &["kde".into()], "/bin".as_ref(), icon_dirs)
     }
 
     #[test]
@@ -271,6 +327,34 @@ mod tests {
         let index = load(vec![temp.path().to_path_buf()]);
         assert!(index.get("missing").is_none());
         assert!(index.get("present").is_some());
+    }
+
+    #[test]
+    fn icon_paths_are_resolved_at_load_and_never_leak_onto_the_protocol_app() {
+        let apps = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        write_entry(apps.path(), "foo.desktop", &entry("Foo", "Icon=fooapp"));
+        write_entry(apps.path(), "bare.desktop", &entry("Bare", "Icon=noicon"));
+        write_entry(apps.path(), "plain.desktop", &entry("Plain", ""));
+        let png = data.path().join("icons/hicolor/64x64/apps/fooapp.png");
+        fs::create_dir_all(png.parent().unwrap()).unwrap();
+        fs::write(&png, b"png").unwrap();
+
+        let index = load_with_icons(
+            vec![apps.path().to_path_buf()],
+            &[data.path().to_path_buf()],
+        );
+
+        assert_eq!(index.icon_path("foo"), Some(png.as_path()));
+        assert_eq!(index.get("foo").unwrap().icon.as_deref(), Some("fooapp"));
+        assert_eq!(index.icon_path("bare"), None, "a name with no PNG");
+        assert_eq!(index.icon_path("plain"), None, "no Icon= at all");
+        assert_eq!(index.icon_path("missing"), None, "unknown app");
+        assert_eq!(
+            AppIndex::from_apps(index.list()).icon_path("foo"),
+            None,
+            "the protocol App carries no path to rebuild from"
+        );
     }
 
     #[test]
