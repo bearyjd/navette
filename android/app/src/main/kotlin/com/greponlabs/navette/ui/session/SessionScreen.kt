@@ -433,6 +433,7 @@ private fun BoxScope.FileTransferLayer(
             is FileTransferUiState.WaitingForGuest -> "Delivering ${state.name}"
             is FileTransferUiState.Delivered -> "Delivered ${state.name}"
             is FileTransferUiState.Cancelled -> "Cancelled ${state.name}"
+            is FileTransferUiState.Unconfirmed -> state.message
             is FileTransferUiState.Failed -> state.message
         }
     val active = state is FileTransferUiState.Preparing ||

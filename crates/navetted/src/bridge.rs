@@ -79,18 +79,29 @@ impl BridgeManager {
     }
 
     pub fn materialize_file(&self, session: &str, transfer_id: &str) {
-        let Some(transfers) = self.transfers.clone() else {
+        let Some(transfers) = self.transfers.as_ref() else {
             return;
         };
         let session = session.to_owned();
         let transfer_id = transfer_id.to_owned();
-        let _ = thread::Builder::new()
+        let worker_transfers = transfers.clone();
+        let worker_session = session.clone();
+        let worker_transfer_id = transfer_id.clone();
+        if let Err(error) = thread::Builder::new()
             .name(format!("navette-file-{session}"))
             .spawn(move || {
-                if let Err(error) = transfers.materialize(&session, &transfer_id) {
-                    tracing::debug!(session, transfer_id, %error, "file transfer materialization did not complete");
+                if let Err(error) =
+                    worker_transfers.materialize(&worker_session, &worker_transfer_id)
+                {
+                    tracing::debug!(session = worker_session, transfer_id = worker_transfer_id, %error, "file transfer materialization did not complete");
                 }
-            });
+            })
+        {
+            tracing::error!(session, transfer_id, %error, "failed to spawn file materialization worker");
+            if let Err(error) = transfers.fail_queued_materialization(&session, &transfer_id) {
+                tracing::debug!(session, transfer_id, %error, "could not mark unstarted file materialization as failed");
+            }
+        }
     }
 
     pub fn start(&self, session: &Session) -> Result<()> {

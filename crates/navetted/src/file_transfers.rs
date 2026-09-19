@@ -9,6 +9,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use nix::fcntl::{OFlag, open, openat, renameat};
+#[cfg(unix)]
+use nix::sys::stat::{Mode, SFlag, fchmod, fstat, mkdirat};
+#[cfg(unix)]
+use nix::unistd::{UnlinkatFlags, unlinkat};
+
 use navette_protocol::media::{BLOB_ID_LEN, MAX_BLOB_BYTES, is_valid_mime};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -167,9 +174,11 @@ impl FileTransferStore {
         }
     }
 
-    /// Starts a fresh per-session drop namespace. A session name is not
-    /// reusable until its old guest process has been stopped, so stale files
-    /// must never become visible to a new guest with the same name.
+    /// Test-only shortcut for the production sequence of a supervisor drop
+    /// directory reset followed by [`Self::activate_prepared`]. Production
+    /// never clears the drop directory from here: that must happen before
+    /// the guest process is spawned, which only the supervisor can order.
+    #[cfg(test)]
     pub fn activate(&self, session: &str) -> Result<(), FileTransferError> {
         validate(session)?;
         let mut lifecycle = self.lock_lifecycle()?;
@@ -183,6 +192,23 @@ impl FileTransferStore {
         remove_tree(&self.staging_dir(session))?;
         fs::create_dir_all(&directory)?;
         set_private_directory(&directory)?;
+        drop(lifecycle);
+        Ok(())
+    }
+
+    /// Records a new session incarnation after `Supervisor::start` has
+    /// already reset the guest-visible directory. Keeping that reset before
+    /// process spawn prevents a newly launched guest from observing old files
+    /// (or losing files it creates in the small interval after spawn).
+    pub fn activate_prepared(&self, session: &str) -> Result<(), FileTransferError> {
+        validate(session)?;
+        let mut lifecycle = self.lock_lifecycle()?;
+        let epoch = next_epoch(&mut lifecycle);
+        lifecycle.live.insert(session.to_owned(), epoch);
+        let mut entries = self.lock_entries()?;
+        entries.retain(|(entry_session, _), _| entry_session != session);
+        drop(entries);
+        remove_tree(&self.staging_dir(session))?;
         drop(lifecycle);
         Ok(())
     }
@@ -436,26 +462,13 @@ impl FileTransferStore {
             entry.state = FileTransferState::Materializing;
             (entry.name.clone(), entry.size)
         };
-        let source = self.staging_path(session, id);
-        let drop_dir = self.drop_dir(session);
-        let destination_dir = drop_dir.join(id);
-        let outcome = (|| -> Result<(), io::Error> {
-            fs::create_dir_all(&drop_dir)?;
-            set_private_directory(&drop_dir)?;
-            fs::create_dir_all(&destination_dir)?;
-            set_private_directory(&destination_dir)?;
-            let metadata = fs::symlink_metadata(&source)?;
-            if !metadata.file_type().is_file() || metadata.len() != expected {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "staged file is invalid",
-                ));
-            }
-            set_private_file(&source)?;
-            let destination = destination_dir.join(name);
-            fs::rename(source, &destination)?;
-            Ok(())
-        })();
+        let outcome = deliver_staged_file(
+            &self.drop_dir(session),
+            &self.staging_dir(session),
+            id,
+            &name,
+            expected,
+        );
         let mut entries = self.lock_entries()?;
         {
             let entry = entries
@@ -479,11 +492,42 @@ impl FileTransferStore {
         drop(entries);
         if outcome.is_err() {
             let _ = remove_file(&self.staging_path(session, id));
-            let _ = fs::remove_dir_all(&destination_dir);
         }
         drop(lifecycle);
         outcome.map_err(FileTransferError::Io)?;
         Ok(result)
+    }
+
+    /// Marks a queued transfer terminal when its materialization worker could
+    /// not even be launched. This frees the in-memory reservation immediately
+    /// instead of leaving a permanently queued transfer after a 202 response.
+    pub fn fail_queued_materialization(
+        &self,
+        session: &str,
+        id: &str,
+    ) -> Result<(), FileTransferError> {
+        validate(session)?;
+        validate_id(id)?;
+        let lifecycle = self.lock_lifecycle()?;
+        let epoch = live_epoch(&lifecycle, session)?;
+        let mut entries = self.lock_entries()?;
+        let entry = entries
+            .get_mut(&(session.to_owned(), id.to_owned()))
+            .ok_or(FileTransferError::NotFound)?;
+        if entry.epoch != epoch {
+            return Err(FileTransferError::NotFound);
+        }
+        if entry.state != FileTransferState::Queued {
+            return Err(FileTransferError::InvalidState);
+        }
+        entry.state = FileTransferState::Failed;
+        entry.terminal_at = Some(SystemTime::now());
+        self.prune_terminal_locked(&mut entries, session, Some(id));
+        drop(entries);
+        let result = remove_file(&self.staging_path(session, id));
+        drop(lifecycle);
+        result?;
+        Ok(())
     }
 
     fn complete_upload(
@@ -848,25 +892,103 @@ fn remove_tree(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Validates, locks down, and delivers a staged upload entirely through
+/// descriptors. The guest may write to the drop directory and can race the
+/// daemon, so every check must apply to the inode that is then chmod'd and
+/// moved: `openat(O_NOFOLLOW)` refuses a swapped-in symlink, `fstat` inspects
+/// that same open file, and `fchmod` tightens that same open file rather
+/// than whatever a path lookup would resolve to. The final `renameat` still
+/// resolves `<id>.part` by name; a guest swapping that entry between open and
+/// rename can only sabotage its own delivery into a fresh 0o700 directory the
+/// daemon just created, so that residual window is acceptable. A fresh id
+/// directory is required; a guest-created entry makes this transfer fail.
+#[cfg(unix)]
+fn deliver_staged_file(
+    drop_dir: &Path,
+    staging_dir: &Path,
+    id: &str,
+    name: &str,
+    expected: u64,
+) -> io::Result<()> {
+    let dir_flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let file_flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let staging = open(staging_dir, dir_flags, Mode::empty()).map_err(nix_to_io)?;
+    let staged_name = format!("{id}.part");
+    let staged =
+        openat(&staging, staged_name.as_str(), file_flags, Mode::empty()).map_err(nix_to_io)?;
+    ensure_regular_file_of_size(&staged, expected)?;
+    fchmod(&staged, Mode::from_bits_truncate(0o600)).map_err(nix_to_io)?;
+
+    let drop = open(drop_dir, dir_flags, Mode::empty()).map_err(nix_to_io)?;
+    mkdirat(&drop, id, Mode::from_bits_truncate(0o700)).map_err(nix_to_io)?;
+    let delivered = openat(&drop, id, dir_flags, Mode::empty())
+        .and_then(|destination| renameat(&staging, staged_name.as_str(), &destination, name));
+    if delivered.is_err() {
+        // The directory created above is still empty on this path, so remove
+        // it by name, best effort. That name is resolved again here: if the
+        // guest already replaced the entry with a symlink, a file, or a
+        // populated directory, unlinkat fails and is ignored, and an empty
+        // directory of theirs at that name lives inside their own drop
+        // directory anyway. The delivery error is what gets reported.
+        let _ = unlinkat(&drop, id, UnlinkatFlags::RemoveDir);
+    }
+    delivered.map_err(nix_to_io)
+}
+
+#[cfg(unix)]
+fn ensure_regular_file_of_size(file: impl std::os::fd::AsFd, expected: u64) -> io::Result<()> {
+    let stat = fstat(file).map_err(nix_to_io)?;
+    let is_regular = SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT == SFlag::S_IFREG;
+    if !is_regular || !u64::try_from(stat.st_size).is_ok_and(|size| size == expected) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "staged file is invalid",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn nix_to_io(error: nix::errno::Errno) -> io::Error {
+    io::Error::from_raw_os_error(error as i32)
+}
+
+/// Best-effort mirror of the descriptor-based unix path. Without `openat`
+/// semantics this cannot close the check-then-use window, and there is no
+/// portable private mode to apply, so it validates by path and moves.
+#[cfg(not(unix))]
+fn deliver_staged_file(
+    drop_dir: &Path,
+    staging_dir: &Path,
+    id: &str,
+    name: &str,
+    expected: u64,
+) -> io::Result<()> {
+    let source = staging_dir.join(format!("{id}.part"));
+    let metadata = fs::symlink_metadata(&source)?;
+    if !metadata.file_type().is_file() || metadata.len() != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "staged file is invalid",
+        ));
+    }
+    let destination_dir = drop_dir.join(id);
+    fs::create_dir(&destination_dir)?;
+    let delivered = fs::rename(&source, destination_dir.join(name));
+    if delivered.is_err() {
+        let _ = fs::remove_dir(&destination_dir);
+    }
+    delivered
+}
+
 #[cfg(unix)]
 fn set_private_directory(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
-#[cfg(unix)]
-fn set_private_file(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-}
-
 #[cfg(not(unix))]
 fn set_private_directory(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_private_file(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -1005,6 +1127,21 @@ mod tests {
     }
 
     #[test]
+    fn prepared_activation_keeps_the_supervisor_initialized_drop_directory() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("drops");
+        let store = FileTransferStore::with_limits(&root, 8, 12, 2, Duration::from_secs(60));
+        let drop_dir = store.drop_dir("work");
+        fs::create_dir_all(&drop_dir).unwrap();
+        fs::write(drop_dir.join("guest-created"), b"keep").unwrap();
+
+        store.activate_prepared("work").unwrap();
+
+        assert_eq!(fs::read(drop_dir.join("guest-created")).unwrap(), b"keep");
+        assert!(store.preflight("work", request("report.pdf", 1)).is_ok());
+    }
+
+    #[test]
     fn recovery_accounts_for_durable_deliveries_before_accepting_new_preflights() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("drops");
@@ -1037,9 +1174,11 @@ mod tests {
         let mut upload = store.begin_upload("work", &uploading.transfer_id).unwrap();
         upload.write_chunk(b"data").unwrap();
 
-        // This models Kill followed by Run using the same session name while
-        // an old HTTP request is still streaming. `activate` advances the
-        // incarnation and removes the old transfer registry atomically.
+        // Exercises the lease/epoch invariant directly through the test-only
+        // `activate` shortcut, which advances the incarnation and drops the
+        // old transfer registry atomically while an old HTTP request is
+        // still streaming. The production Kill + Run order is covered by
+        // queued_transfer_from_previous_incarnation_cannot_materialize_after_supervisor_reset.
         store.deactivate("work").unwrap();
         store.activate("work").unwrap();
         assert!(matches!(
@@ -1064,6 +1203,147 @@ mod tests {
         assert!(
             !store.drop_dir("work").join(&queued.transfer_id).exists(),
             "the old incarnation must not materialize into the reused drop directory"
+        );
+    }
+
+    /// Drives the exact production name-reuse order: `Kill` deactivates the
+    /// store, `Run` has the supervisor reset the drop directory before the
+    /// guest spawns, then `activate_prepared` records the new incarnation.
+    #[test]
+    fn queued_transfer_from_previous_incarnation_cannot_materialize_after_supervisor_reset() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("drops");
+        // A long expiry keeps the queued transfer from being purged by age;
+        // only the incarnation change may make it unreachable.
+        let store = FileTransferStore::with_limits(&root, 8, 64 * 1024, 4, Duration::from_secs(60));
+        store.activate("work").unwrap();
+        let queued = store.preflight("work", request("queued.pdf", 4)).unwrap();
+        let mut upload = store.begin_upload("work", &queued.transfer_id).unwrap();
+        upload.write_chunk(b"data").unwrap();
+        assert_eq!(upload.finish().unwrap().state, FileTransferState::Queued);
+        let staged = store.staging_path("work", &queued.transfer_id);
+        assert!(
+            staged.is_file(),
+            "the queued transfer must be staged on disk"
+        );
+
+        store.deactivate("work").unwrap();
+        let drop_dir = store.drop_dir("work");
+        if let Err(error) = fs::remove_dir_all(&drop_dir) {
+            assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        }
+        fs::create_dir_all(&drop_dir).unwrap();
+        set_private_directory(&drop_dir).unwrap();
+        store.activate_prepared("work").unwrap();
+
+        assert!(matches!(
+            store.materialize("work", &queued.transfer_id),
+            Err(FileTransferError::NotFound)
+        ));
+        assert!(matches!(
+            store.status("work", &queued.transfer_id),
+            Err(FileTransferError::NotFound)
+        ));
+        assert!(drop_dir.is_dir());
+        assert_eq!(fs::read_dir(&drop_dir).unwrap().count(), 0);
+        assert!(!staged.exists());
+        store
+            .preflight("work", request("fresh.pdf", 4))
+            .expect("the new incarnation starts with a clean quota");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialization_rejects_a_guest_precreated_transfer_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let preflight = store.preflight("work", request("report.pdf", 4)).unwrap();
+        let mut upload = store.begin_upload("work", &preflight.transfer_id).unwrap();
+        upload.write_chunk(b"data").unwrap();
+        upload.finish().unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        symlink(
+            &outside,
+            store.drop_dir("work").join(&preflight.transfer_id),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            store.materialize("work", &preflight.transfer_id),
+            Err(FileTransferError::Io(_))
+        ));
+        assert_eq!(
+            store.status("work", &preflight.transfer_id).unwrap().state,
+            FileTransferState::Failed
+        );
+        assert!(
+            !outside.join("report.pdf").exists(),
+            "a guest-controlled transfer-id symlink must not redirect the destination"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialization_never_follows_a_swapped_staged_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let preflight = store.preflight("work", request("report.pdf", 4)).unwrap();
+        let mut upload = store.begin_upload("work", &preflight.transfer_id).unwrap();
+        upload.write_chunk(b"data").unwrap();
+        upload.finish().unwrap();
+        // Same size and type as the staged upload, so only a refusal to
+        // follow the link (not a metadata mismatch) can make this fail.
+        let outside = temp.path().join("outside.bin");
+        fs::write(&outside, b"data").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o644)).unwrap();
+        let staged = store.staging_path("work", &preflight.transfer_id);
+        fs::remove_file(&staged).unwrap();
+        symlink(&outside, &staged).unwrap();
+
+        assert!(matches!(
+            store.materialize("work", &preflight.transfer_id),
+            Err(FileTransferError::Io(_))
+        ));
+        assert_eq!(
+            store.status("work", &preflight.transfer_id).unwrap().state,
+            FileTransferState::Failed
+        );
+        let mode = fs::metadata(&outside).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o644,
+            "a swapped staged symlink must not be followed to chmod its target"
+        );
+        assert!(
+            !store.drop_dir("work").join(&preflight.transfer_id).exists(),
+            "validation fails before any transfer directory is created"
+        );
+    }
+
+    #[test]
+    fn failed_queued_materialization_releases_its_reservation() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let preflight = store.preflight("work", request("first.pdf", 8)).unwrap();
+        let mut upload = store.begin_upload("work", &preflight.transfer_id).unwrap();
+        upload.write_chunk(b"contents").unwrap();
+        upload.finish().unwrap();
+
+        store
+            .fail_queued_materialization("work", &preflight.transfer_id)
+            .unwrap();
+        assert_eq!(
+            store.status("work", &preflight.transfer_id).unwrap().state,
+            FileTransferState::Failed
+        );
+        assert!(!store.staging_path("work", &preflight.transfer_id).exists());
+        assert!(
+            store.preflight("work", request("second.pdf", 8)).is_ok(),
+            "a failed worker launch must not keep its queued quota reservation"
         );
     }
 }

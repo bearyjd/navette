@@ -782,7 +782,7 @@ pub async fn dispatch<R: ProcessRunner>(state: &ApiState<R>, request: Request) -
                             "failed to initialize clipboard blob namespace: {error}"
                         )))
                     }
-                    Ok(()) => match state.files.activate(&session.name) {
+                    Ok(()) => match state.files.activate_prepared(&session.name) {
                         Err(error) => {
                             let _ = state.blobs.deactivate(&session.name);
                             let _ = state.supervisor.kill(&session.name).await;
