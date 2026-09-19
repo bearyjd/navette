@@ -1,4 +1,6 @@
+use std::net::Ipv4Addr;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
@@ -6,6 +8,7 @@ use navette_auth::SecretString;
 use navette_protocol::{
     Request, RequestCommand, Response, ResponseOutcome, ResponseResult, WEBSOCKET_SUBPROTOCOL,
 };
+use navette_wake::MacAddress;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio_tungstenite::connect_async;
@@ -13,6 +16,15 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_util::io::ReaderStream;
 use url::Url;
+
+/// How long any HTTP request waits for the TCP connection alone. Connect
+/// only: the same client streams 64 MiB uploads, which must not be capped.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Whole-request budget for a wake POST, whose answer is an empty 204. A relay
+/// that accepts the connection and never answers would otherwise hold the
+/// command for the OS default of about two minutes.
+const WAKE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug)]
 pub struct Client {
@@ -56,6 +68,17 @@ struct FilePreflight<'a> {
     name: &'a str,
     mime: &'a str,
     size: u64,
+}
+
+/// Body of `POST /v1/wake`. Omitted fields take the daemon's defaults
+/// (`255.255.255.255`, port 9) rather than a copy of them held here.
+#[derive(Serialize)]
+struct WakeRequest {
+    mac: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    broadcast: Option<Ipv4Addr>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
 }
 
 impl Client {
@@ -202,6 +225,50 @@ impl Client {
         }
     }
 
+    /// Asks the daemon to send a wake-on-LAN magic packet onto its own LAN,
+    /// for callers (a phone on the tailnet, a laptop elsewhere) that cannot
+    /// broadcast there themselves. The daemon answers 204 once the packet has
+    /// left its socket; it has no way to know whether the host woke.
+    pub async fn request_wake(
+        &self,
+        mac: MacAddress,
+        broadcast: Option<Ipv4Addr>,
+        port: Option<u16>,
+    ) -> Result<()> {
+        self.request_wake_with_timeout(mac, broadcast, port, WAKE_REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// The timeout is a parameter so a test can prove it fires without
+    /// waiting out the real one.
+    async fn request_wake_with_timeout(
+        &self,
+        mac: MacAddress,
+        broadcast: Option<Ipv4Addr>,
+        port: Option<u16>,
+        timeout: Duration,
+    ) -> Result<()> {
+        let url = self.endpoint_url(["v1", "wake"])?;
+        let response = self
+            .http_client()?
+            .post(url)
+            .timeout(timeout)
+            .header(reqwest::header::AUTHORIZATION, self.authorization_header()?)
+            .json(&WakeRequest {
+                mac: mac.to_string(),
+                broadcast,
+                port,
+            })
+            .send()
+            .await
+            .context("failed to send wake request")?;
+        if response.status() == StatusCode::NO_CONTENT {
+            Ok(())
+        } else {
+            response_error(response, "wake request").await
+        }
+    }
+
     fn authorization_header(&self) -> Result<reqwest::header::HeaderValue> {
         format!("Bearer {}", self.token.as_str())
             .parse()
@@ -211,8 +278,13 @@ impl Client {
     fn http_client(&self) -> Result<reqwest::Client> {
         // Do not let a redirect turn an authenticated daemon request into a
         // request to another authority. The API never needs redirects.
+        //
+        // Connect timeout only, no overall one: uploads here run to 64 MiB and
+        // their pace belongs to the link, not a wall clock. Requests whose
+        // answer is small and prompt set their own budget per call.
         reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
             .build()
             .context("failed to configure HTTP client")
     }
@@ -456,6 +528,79 @@ mod tests {
                 .unwrap()
                 .as_str(),
             "http://[::1]:19417/v1/sessions/work/files/deadbeef/content"
+        );
+    }
+
+    #[test]
+    fn wake_endpoint_reuses_the_daemon_authority_but_not_its_websocket_path() {
+        let client = Client::new("ws://tower.ts.net:19417/v1/ws", "token".to_owned());
+        assert_eq!(
+            client.endpoint_url(["v1", "wake"]).unwrap().as_str(),
+            "http://tower.ts.net:19417/v1/wake"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wake_request_gives_up_on_a_relay_that_accepts_and_never_answers() {
+        // Item 1 of the review: with no timeout, `wake --via` against a
+        // black-holed relay sat for the OS default of ~2 minutes. The listener
+        // below completes the TCP handshake (the kernel does that from the
+        // backlog) and is never read, so the request is sent and no response
+        // ever comes -- the exact shape of a hung relay. The private entry
+        // point takes the timeout so the test runs in well under a second
+        // while the public one keeps its 15 s.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = Client::new(format!("ws://{address}/v1/ws"), "token".to_owned());
+        let mac: MacAddress = "aa:bb:cc:dd:ee:ff".parse().unwrap();
+
+        let started = std::time::Instant::now();
+        let error = client
+            .request_wake_with_timeout(mac, None, None, Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the request must give up promptly, took {elapsed:?}"
+        );
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("failed to send wake request"),
+            "the timeout must surface as a wake failure: {rendered}"
+        );
+        assert_eq!(WAKE_REQUEST_TIMEOUT, Duration::from_secs(15));
+        drop(listener);
+    }
+
+    #[test]
+    fn wake_request_body_matches_the_daemon_contract() {
+        // The MAC goes over the wire in canonical form whatever the operator
+        // typed, and omitted fields are omitted rather than sent as null, so
+        // the daemon's defaults apply and nothing here has to mirror them.
+        let mac: MacAddress = "AA-BB-CC-DD-EE-FF".parse().unwrap();
+        let minimal = serde_json::to_value(WakeRequest {
+            mac: mac.to_string(),
+            broadcast: None,
+            port: None,
+        })
+        .unwrap();
+        assert_eq!(minimal, serde_json::json!({"mac": "aa:bb:cc:dd:ee:ff"}));
+
+        let explicit = serde_json::to_value(WakeRequest {
+            mac: mac.to_string(),
+            broadcast: Some(Ipv4Addr::new(192, 168, 1, 255)),
+            port: Some(7),
+        })
+        .unwrap();
+        assert_eq!(
+            explicit,
+            serde_json::json!({
+                "mac": "aa:bb:cc:dd:ee:ff",
+                "broadcast": "192.168.1.255",
+                "port": 7
+            })
         );
     }
 

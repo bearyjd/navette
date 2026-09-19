@@ -9,3 +9,6 @@ build/
 .cxx
 local.properties
 .omc/
+
+# Kotlin compiler session scratch
+.kotlin/

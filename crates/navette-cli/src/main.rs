@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -10,6 +11,7 @@ use clap::{Parser, Subcommand};
 use navette_auth::SecretString;
 use navette_cli::{Client, FileTransferState, render_result};
 use navette_protocol::{AttachInfo, RequestCommand, ResponseResult};
+use navette_wake::{DEFAULT_BROADCAST, DEFAULT_PORT, MacAddress};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
@@ -103,6 +105,24 @@ enum Command {
         #[arg(long)]
         advertise_host: Option<String>,
     },
+    /// Send a wake-on-LAN magic packet, from this machine or via the daemon.
+    ///
+    /// By default the packet leaves this machine directly, which only works
+    /// from the sleeping host's own LAN. Pass --via to have navetted send it
+    /// from its LAN instead, for when this machine is on the tailnet only.
+    Wake {
+        /// MAC address of the host to wake: aa:bb:cc:dd:ee:ff, aa-bb-cc-dd-ee-ff or aabbccddeeff.
+        mac: String,
+        /// IPv4 broadcast address to send to. Defaults to 255.255.255.255.
+        #[arg(long)]
+        broadcast: Option<String>,
+        /// UDP port to send to (1-65535). Defaults to 9.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+        port: Option<u16>,
+        /// Ask the daemon at --url to send the packet from its LAN.
+        #[arg(long)]
+        via: bool,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -115,23 +135,8 @@ struct AttachRecord {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    // `token` is a local admin command that reads the daemon's token file
-    // directly and never dials the daemon, so it must not force token
-    // resolution: on a remote --url that would demand an explicit --token
-    // for no reason, since this command never sends one anywhere.
-    if let Command::Token {
-        qr,
-        rotate,
-        advertise_host,
-    } = cli.command
-    {
-        return show_token(
-            &cli.url,
-            qr,
-            rotate,
-            advertise_host.as_deref(),
-            cli.token_file.as_deref(),
-        );
+    if let Some(outcome) = run_local_command(&cli) {
+        return outcome;
     }
 
     let token = navette_auth::resolve_token(
@@ -160,8 +165,118 @@ async fn main() -> Result<()> {
             name,
             no_wait,
         } => copy_file(&client, &session, &source, name.as_deref(), no_wait).await,
-        Command::Token { .. } => unreachable!("handled above"),
+        Command::Wake {
+            mac,
+            broadcast,
+            port,
+            via: _,
+        } => {
+            // Parsed a second time only to unpack it: `run_local_command`
+            // already refused anything here that does not parse.
+            let target = parse_wake_target(&mac, broadcast.as_deref(), port)?;
+            wake_via_daemon(&client, &cli.url, target).await
+        }
+        Command::Token { .. } => unreachable!("handled by run_local_command"),
     }
+}
+
+/// Runs the commands that must not force token resolution, ahead of it.
+///
+/// `token` is a local admin command that reads the daemon's token file
+/// directly and never dials the daemon; `wake` without `--via` sends from
+/// this machine and never dials it either. Resolving a token for them would,
+/// on a remote `--url`, demand an explicit `--token` that is never sent
+/// anywhere. `wake --via` does dial the daemon, but its MAC and broadcast are
+/// validated here first so a typo is reported as a typo rather than as a
+/// missing token; it then returns `None` and continues to the daemon path.
+fn run_local_command(cli: &Cli) -> Option<Result<()>> {
+    match &cli.command {
+        Command::Token {
+            qr,
+            rotate,
+            advertise_host,
+        } => Some(show_token(
+            &cli.url,
+            *qr,
+            *rotate,
+            advertise_host.as_deref(),
+            cli.token_file.as_deref(),
+        )),
+        Command::Wake {
+            mac,
+            broadcast,
+            port,
+            via,
+        } => match parse_wake_target(mac, broadcast.as_deref(), *port) {
+            Err(error) => Some(Err(error)),
+            Ok(_) if *via => None,
+            Ok(target) => Some(wake_directly(target)),
+        },
+        Command::Ls
+        | Command::Run { .. }
+        | Command::Attach { .. }
+        | Command::Detach { .. }
+        | Command::Kill { .. }
+        | Command::Cp { .. } => None,
+    }
+}
+
+/// A wake request as the operator gave it. Omitted fields stay `None` so that
+/// on the `--via` path the daemon applies its own defaults, and only the
+/// direct path fills them in here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WakeTarget {
+    mac: MacAddress,
+    broadcast: Option<Ipv4Addr>,
+    port: Option<u16>,
+}
+
+/// Validates everything `wake` needs before any socket is opened or any token
+/// resolved, in both modes. The port needs no check: clap already refuses 0.
+fn parse_wake_target(mac: &str, broadcast: Option<&str>, port: Option<u16>) -> Result<WakeTarget> {
+    let mac = mac
+        .parse()
+        .with_context(|| format!("invalid MAC address {mac:?}"))?;
+    let broadcast = broadcast
+        .map(|literal| {
+            literal.parse::<Ipv4Addr>().with_context(|| {
+                format!(
+                    "invalid broadcast address {literal:?}: expected an IPv4 literal such as 192.168.1.255"
+                )
+            })
+        })
+        .transpose()?;
+    Ok(WakeTarget {
+        mac,
+        broadcast,
+        port,
+    })
+}
+
+fn wake_directly(target: WakeTarget) -> Result<()> {
+    let broadcast = target.broadcast.unwrap_or(DEFAULT_BROADCAST);
+    let port = target.port.unwrap_or(DEFAULT_PORT);
+    navette_wake::send_magic_packet(target.mac, broadcast, port)
+        .with_context(|| format!("failed to send a magic packet to {broadcast}:{port}"))?;
+    println!("magic packet sent to {} via {broadcast}:{port}", target.mac);
+    Ok(())
+}
+
+async fn wake_via_daemon(client: &Client, url: &str, target: WakeTarget) -> Result<()> {
+    client
+        .request_wake(target.mac, target.broadcast, target.port)
+        .await?;
+    println!("wake request sent via {}", daemon_host(url));
+    Ok(())
+}
+
+/// The host part of `--url` for the success line; the whole URL if it does
+/// not parse, which `Client` will already have refused before this prints.
+fn daemon_host(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_owned))
+        .unwrap_or_else(|| url.to_owned())
 }
 
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
@@ -735,6 +850,143 @@ mod tests {
                     && name.as_deref() == Some("guest-report.pdf")
                     && no_wait
         ));
+    }
+
+    #[test]
+    fn parses_wake_with_a_mac() {
+        let cli = Cli::try_parse_from(["navette", "wake", "aa:bb:cc:dd:ee:ff"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Wake { mac, broadcast: None, port: None, via: false }
+                if mac == "aa:bb:cc:dd:ee:ff"
+        ));
+    }
+
+    #[test]
+    fn parses_wake_via_with_broadcast_and_port() {
+        let cli = Cli::try_parse_from([
+            "navette",
+            "wake",
+            "aa-bb-cc-dd-ee-ff",
+            "--via",
+            "--broadcast",
+            "192.168.1.255",
+            "--port",
+            "7",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Wake { mac, broadcast: Some(broadcast), port: Some(7), via: true }
+                if mac == "aa-bb-cc-dd-ee-ff" && broadcast == "192.168.1.255"
+        ));
+    }
+
+    #[test]
+    fn rejects_wake_port_zero_and_a_missing_mac_at_parse_time() {
+        // Port 0 is not a UDP destination; the daemon answers it with 400 and
+        // clap refuses it here before anything is sent or dialled.
+        assert!(
+            Cli::try_parse_from(["navette", "wake", "aa:bb:cc:dd:ee:ff", "--port", "0"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["navette", "wake", "aa:bb:cc:dd:ee:ff", "--port", "65536"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["navette", "wake"]).is_err());
+    }
+
+    #[test]
+    fn wake_target_validation_rejects_a_bad_mac_and_broadcast_before_dialling() {
+        // Like `validate_file_name`, this runs before any network activity —
+        // and in `wake`'s case before token resolution, so a bad MAC on a
+        // remote --url is reported as a bad MAC, not as a missing --token.
+        for mac in [
+            "nope",
+            "",
+            "aa:bb:cc:dd:ee",
+            "aa:bb-cc:dd:ee:ff",
+            "gg:bb:cc:dd:ee:ff",
+        ] {
+            let error = parse_wake_target(mac, None, None).unwrap_err();
+            assert!(
+                error.to_string().contains("invalid MAC address"),
+                "{mac:?}: {error}"
+            );
+        }
+        for broadcast in ["", "192.168.1", "ff02::1", "broadcast", "192.168.1.255:9"] {
+            let error = parse_wake_target("aa:bb:cc:dd:ee:ff", Some(broadcast), None).unwrap_err();
+            assert!(
+                error.to_string().contains("invalid broadcast address"),
+                "{broadcast:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn wake_target_keeps_omitted_fields_unset_for_the_daemon() {
+        // Direct sends fill in the defaults at send time; the --via body must
+        // leave them out so the daemon's own defaults apply.
+        assert_eq!(
+            parse_wake_target("AABBCCDDEEFF", None, None).unwrap(),
+            WakeTarget {
+                mac: "aa:bb:cc:dd:ee:ff".parse().unwrap(),
+                broadcast: None,
+                port: None,
+            }
+        );
+        assert_eq!(
+            parse_wake_target("aa:bb:cc:dd:ee:ff", Some("10.0.0.255"), Some(7)).unwrap(),
+            WakeTarget {
+                mac: "aa:bb:cc:dd:ee:ff".parse().unwrap(),
+                broadcast: Some(Ipv4Addr::new(10, 0, 0, 255)),
+                port: Some(7),
+            }
+        );
+    }
+
+    #[test]
+    fn local_commands_run_before_token_resolution_and_daemon_commands_fall_through() {
+        // Direct wake: handled locally, packet actually leaves, no token.
+        let receiver = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let port = receiver.local_addr().unwrap().port().to_string();
+        let direct = Cli::try_parse_from([
+            "navette",
+            "--url",
+            "ws://tower.example:9417/v1/ws",
+            "wake",
+            "aa:bb:cc:dd:ee:ff",
+            "--broadcast",
+            "127.0.0.1",
+            "--port",
+            &port,
+        ])
+        .unwrap();
+        assert!(matches!(run_local_command(&direct), Some(Ok(()))));
+        let mut buffer = [0; 256];
+        assert_eq!(receiver.recv_from(&mut buffer).unwrap().0, 102);
+
+        // `--via` with a bad MAC: refused here, before any token is resolved.
+        let bad_via = Cli::try_parse_from(["navette", "wake", "nope", "--via"]).unwrap();
+        assert!(matches!(run_local_command(&bad_via), Some(Err(_))));
+
+        // `--via` with a good MAC falls through to the daemon path.
+        let via = Cli::try_parse_from(["navette", "wake", "aa:bb:cc:dd:ee:ff", "--via"]).unwrap();
+        assert!(run_local_command(&via).is_none());
+
+        // Ordinary daemon commands are never handled here.
+        let ls = Cli::try_parse_from(["navette", "ls"]).unwrap();
+        assert!(run_local_command(&ls).is_none());
+    }
+
+    #[test]
+    fn the_via_success_line_names_the_daemon_host() {
+        assert_eq!(daemon_host("ws://tower.ts.net:9417/v1/ws"), "tower.ts.net");
+        assert_eq!(daemon_host("ws://[fd7a::1]:9417/v1/ws"), "[fd7a::1]");
+        assert_eq!(daemon_host("not a url"), "not a url");
     }
 
     #[test]

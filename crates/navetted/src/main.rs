@@ -1,10 +1,11 @@
 use std::env;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use navette_wake::{DEFAULT_BROADCAST, LAN_BROADCAST_RULE, is_lan_broadcast_target};
 use navetted::api::{ApiState, router};
 use navetted::app_index::AppIndex;
 use navetted::registry::Registry;
@@ -38,6 +39,29 @@ struct Arguments {
     /// wprsd executable to supervise.
     #[arg(long, default_value = "wprsd")]
     wprsd: String,
+
+    /// Broadcast address for wake-on-LAN requests that name none (the phone
+    /// never does). 255.255.255.255 leaves by the default route, which on a
+    /// multi-homed host or behind a VPN/exit node is the wrong interface; set
+    /// this to the LAN's subnet broadcast, e.g. 192.168.1.255.
+    #[arg(long, default_value_t = DEFAULT_BROADCAST, value_parser = parse_wake_broadcast)]
+    wake_broadcast: Ipv4Addr,
+}
+
+/// Applies the same allowlist as the request path, so a misconfigured flag
+/// fails at startup rather than making every wake request a packet to the
+/// internet.
+fn parse_wake_broadcast(literal: &str) -> Result<Ipv4Addr, String> {
+    let address: Ipv4Addr = literal
+        .parse()
+        .map_err(|_| format!("{literal:?} is not an IPv4 address"))?;
+    if is_lan_broadcast_target(address) {
+        Ok(address)
+    } else {
+        Err(format!(
+            "{address} is not a LAN target: {LAN_BROADCAST_RULE}"
+        ))
+    }
 }
 
 /// Installs the log subscriber, defaulting to `info` and letting `RUST_LOG`
@@ -115,7 +139,7 @@ async fn main() -> Result<()> {
     );
     // Never log the value itself.
     tracing::info!(path = %token_path.display(), "API token loaded");
-    let state = ApiState::new(apps, supervisor, auth);
+    let state = ApiState::new(apps, supervisor, auth).with_wake_broadcast(arguments.wake_broadcast);
     state.start_existing_bridges();
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())
@@ -144,5 +168,39 @@ async fn shutdown_signal() {
     tokio::select! {
         () = interrupt => {},
         () = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wake_broadcast_defaults_to_the_limited_broadcast() {
+        let arguments = Arguments::try_parse_from(["navetted"]).unwrap();
+        assert_eq!(arguments.wake_broadcast, navette_wake::DEFAULT_BROADCAST);
+    }
+
+    #[test]
+    fn wake_broadcast_accepts_a_subnet_directed_lan_address() {
+        let arguments =
+            Arguments::try_parse_from(["navetted", "--wake-broadcast", "192.168.1.255"]).unwrap();
+        assert_eq!(arguments.wake_broadcast, Ipv4Addr::new(192, 168, 1, 255));
+    }
+
+    #[test]
+    fn wake_broadcast_refuses_a_public_address_at_startup_naming_the_rule() {
+        // The same allowlist the request path applies: a misconfigured flag
+        // fails here, at start, rather than turning every phone tap into a
+        // packet to the internet.
+        for rejected in ["8.8.8.8", "not-an-address", "ff02::1", "100.63.255.255"] {
+            let error =
+                Arguments::try_parse_from(["navetted", "--wake-broadcast", rejected]).unwrap_err();
+            assert!(
+                error.to_string().contains("100.64.0.0/10")
+                    || rejected.parse::<Ipv4Addr>().is_err(),
+                "{rejected}: {error}"
+            );
+        }
     }
 }

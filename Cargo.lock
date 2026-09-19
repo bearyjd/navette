@@ -1414,6 +1414,7 @@ dependencies = [
  "futures-util",
  "navette-auth",
  "navette-protocol",
+ "navette-wake",
  "nix 0.30.1",
  "qrcode",
  "reqwest",
@@ -1458,6 +1459,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "navette-wake"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "navetted"
 version = "0.1.0"
 dependencies = [
@@ -1470,6 +1478,7 @@ dependencies = [
  "navette-auth",
  "navette-bridge",
  "navette-protocol",
+ "navette-wake",
  "nix 0.30.1",
  "serde",
  "serde_json",

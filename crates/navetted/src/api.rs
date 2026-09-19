@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,6 +20,10 @@ use navette_protocol::{
     API_VERSION, AttachInfo, ErrorCode, Request, RequestCommand, Response, ResponseResult,
     WEBSOCKET_SUBPROTOCOL,
 };
+use navette_wake::{
+    DEFAULT_BROADCAST, DEFAULT_PORT, LAN_BROADCAST_RULE, MacAddress, is_lan_broadcast_target,
+};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
@@ -38,6 +43,9 @@ const MAX_CONTROL_MESSAGE_SIZE: usize = 1024 * 1024;
 const MAX_INPUT_MESSAGES_PER_SECOND: u32 = 240;
 const MAX_CONCURRENT_BLOB_UPLOADS: usize = 4;
 const MAX_CONCURRENT_BLOB_DOWNLOADS: usize = 4;
+/// Two is plenty for a person waking a machine and a ceiling on what an
+/// authenticated client can make the daemon broadcast.
+const MAX_CONCURRENT_WAKES: usize = 2;
 const BLOB_UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const BLOB_UPLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
 const BLOB_READ_CHUNK_BYTES: usize = 64 * 1024;
@@ -121,6 +129,10 @@ pub struct ApiState<R: ProcessRunner> {
     pub auth: Arc<navette_auth::AuthToken>,
     upload_slots: Arc<Semaphore>,
     download_slots: Arc<Semaphore>,
+    wake_slots: Arc<Semaphore>,
+    /// Where a wake request that names no `broadcast` is sent. The phone never
+    /// names one, so on a multi-homed relay this is what makes it reach the LAN.
+    wake_broadcast: Ipv4Addr,
     lifecycle_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
 }
 
@@ -136,6 +148,8 @@ impl<R: ProcessRunner> Clone for ApiState<R> {
             auth: Arc::clone(&self.auth),
             upload_slots: Arc::clone(&self.upload_slots),
             download_slots: Arc::clone(&self.download_slots),
+            wake_slots: Arc::clone(&self.wake_slots),
+            wake_broadcast: self.wake_broadcast,
             lifecycle_locks: Arc::clone(&self.lifecycle_locks),
         }
     }
@@ -174,7 +188,19 @@ impl<R: ProcessRunner> ApiState<R> {
             auth,
             upload_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_BLOB_UPLOADS)),
             download_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_BLOB_DOWNLOADS)),
+            wake_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_WAKES)),
+            wake_broadcast: DEFAULT_BROADCAST,
             lifecycle_locks: Arc::new(AsyncMutex::new(HashMap::new())),
+        }
+    }
+
+    /// Sets the broadcast address used when a wake request omits one. The
+    /// caller (`--wake-broadcast`) is responsible for having checked it
+    /// against [`navette_wake::is_lan_broadcast_target`].
+    pub fn with_wake_broadcast(self, wake_broadcast: Ipv4Addr) -> Self {
+        Self {
+            wake_broadcast,
+            ..self
         }
     }
 
@@ -227,6 +253,7 @@ pub fn router<R: ProcessRunner>(state: ApiState<R>) -> Router {
             "/v1/sessions/{session}/files/{transfer_id}/content",
             put(upload_file::<R>),
         )
+        .route("/v1/wake", post(wake_host::<R>))
         .layer(axum::middleware::from_fn_with_state(
             auth,
             crate::guard::authenticate,
@@ -235,6 +262,98 @@ pub fn router<R: ProcessRunner>(state: ApiState<R>) -> Router {
             crate::guard::reject_browser_origin,
         ))
         .with_state(state)
+}
+
+/// Body of `POST /v1/wake`. `broadcast` is an IPv4 literal and `port` is
+/// 1-65535; both default when omitted.
+#[derive(Debug, Deserialize)]
+pub struct WakeRequest {
+    pub mac: String,
+    pub broadcast: Option<String>,
+    pub port: Option<u16>,
+}
+
+/// A validated wake request, ready to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WakeTarget {
+    mac: MacAddress,
+    broadcast: Ipv4Addr,
+    port: u16,
+}
+
+/// Every failure here is the client's and becomes a 400 carrying the reason:
+/// a body that is not JSON, a MAC or broadcast address that does not parse,
+/// port 0, or a broadcast address outside the ranges a LAN relay may send to.
+fn parse_wake_request(
+    body: &[u8],
+    default_broadcast: Ipv4Addr,
+) -> Result<WakeTarget, &'static str> {
+    let request: WakeRequest =
+        serde_json::from_slice(body).map_err(|_| "body is not a valid wake request")?;
+    let mac = request.mac.parse().map_err(|_| "invalid MAC address")?;
+    let broadcast = match request.broadcast {
+        Some(literal) => literal
+            .parse()
+            .map_err(|_| "broadcast must be an IPv4 literal")?,
+        None => default_broadcast,
+    };
+    if !is_lan_broadcast_target(broadcast) {
+        return Err(LAN_BROADCAST_RULE);
+    }
+    let port = request.port.unwrap_or(DEFAULT_PORT);
+    if port == 0 {
+        return Err("port must be 1-65535");
+    }
+    Ok(WakeTarget {
+        mac,
+        broadcast,
+        port,
+    })
+}
+
+/// Relays a wake-on-LAN magic packet onto the daemon's LAN. The phone lives
+/// on the tailnet and cannot broadcast onto the home network itself.
+///
+/// The body is read as raw bytes rather than through `Json<_>`: axum's
+/// extractor answers a missing Content-Type with 415 and a wrong-shaped body
+/// with 422, and the contract the clients code against is 400 for anything
+/// short of a valid request.
+async fn wake_host<R: ProcessRunner>(
+    State(state): State<ApiState<R>>,
+    body: Bytes,
+) -> HttpResponse {
+    let target = match parse_wake_request(&body, state.wake_broadcast) {
+        Ok(target) => target,
+        Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
+    };
+    // Held across the blocking send, like the upload slots: the relay is a
+    // small fixed budget, not a queue.
+    let _wake_permit = match Arc::clone(&state.wake_slots).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+    };
+    let WakeTarget {
+        mac,
+        broadcast,
+        port,
+    } = target;
+    let sent =
+        tokio::task::spawn_blocking(move || navette_wake::send_magic_packet(mac, broadcast, port))
+            .await;
+    match sent {
+        Ok(Ok(())) => {
+            tracing::info!(%mac, %broadcast, port, "sent wake-on-LAN magic packet");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%mac, %broadcast, port, %error, "wake-on-LAN send failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Err(error) => {
+            tracing::error!(%mac, %error, "wake-on-LAN send task did not complete");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 async fn create_file<R: ProcessRunner>(
@@ -2007,5 +2126,282 @@ mod tests {
             status.state,
             crate::file_transfers::FileTransferState::Cancelled
         );
+    }
+
+    fn wake_request() -> axum::http::request::Builder {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/wake")
+            .header("content-type", "application/json")
+    }
+
+    #[test]
+    fn wake_requests_default_the_broadcast_address_and_port() {
+        let target =
+            parse_wake_request(br#"{"mac":"AA-BB-CC-DD-EE-FF"}"#, DEFAULT_BROADCAST).unwrap();
+        assert_eq!(
+            target,
+            WakeTarget {
+                mac: "aa:bb:cc:dd:ee:ff".parse().unwrap(),
+                broadcast: Ipv4Addr::BROADCAST,
+                port: 9,
+            }
+        );
+        // The default is whatever the daemon was started with, not a constant
+        // baked in here: `--wake-broadcast` exists for multi-homed hosts whose
+        // routing table sends 255.255.255.255 out the wrong interface.
+        let configured = parse_wake_request(
+            br#"{"mac":"aabbccddeeff"}"#,
+            Ipv4Addr::new(192, 168, 1, 255),
+        )
+        .unwrap();
+        assert_eq!(configured.broadcast, Ipv4Addr::new(192, 168, 1, 255));
+        let explicit = parse_wake_request(
+            br#"{"mac":"aabbccddeeff","broadcast":"10.0.0.255","port":7}"#,
+            DEFAULT_BROADCAST,
+        )
+        .unwrap();
+        assert_eq!(explicit.broadcast, Ipv4Addr::new(10, 0, 0, 255));
+        assert_eq!(explicit.port, 7);
+    }
+
+    #[test]
+    fn wake_requests_may_only_name_lan_broadcast_targets() {
+        // Subnet-directed broadcasts are the fix for multi-homed relays and
+        // cannot be delivered to a loopback receiver in a test, so the parse
+        // is what gets pinned here.
+        for accepted in [
+            "192.168.1.255",
+            "10.0.0.255",
+            "172.16.4.255",
+            "100.100.1.255",
+        ] {
+            let body = format!(r#"{{"mac":"aabbccddeeff","broadcast":"{accepted}"}}"#);
+            assert!(
+                parse_wake_request(body.as_bytes(), DEFAULT_BROADCAST).is_ok(),
+                "{accepted} must be accepted"
+            );
+        }
+        for rejected in ["8.8.8.8", "203.0.113.255", "0.0.0.0", "100.63.255.255"] {
+            let body = format!(r#"{{"mac":"aabbccddeeff","broadcast":"{rejected}"}}"#);
+            let reason = parse_wake_request(body.as_bytes(), DEFAULT_BROADCAST).unwrap_err();
+            assert!(
+                reason.contains("100.64.0.0/10"),
+                "{rejected} must be rejected naming the rule, got {reason:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wake_route_refuses_a_public_broadcast_target_and_names_the_rule() {
+        let (app, token) = tests_support::test_router_with_token();
+        let request = wake_request()
+            .header("authorization", format!("Bearer {}", token.render()))
+            .body(axum::body::Body::from(
+                r#"{"mac":"aa:bb:cc:dd:ee:ff","broadcast":"8.8.8.8"}"#,
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .contains("100.64.0.0/10"),
+            "the 400 must say which addresses are allowed: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_route_answers_429_while_both_relay_slots_are_held() {
+        let temp = TempDir::new().unwrap();
+        let state = test_state(&temp);
+        let token = state.auth.render();
+        // Deterministic contention: hold the permits through the state handle
+        // rather than racing requests, since a UDP send completes at once.
+        let first = Arc::clone(&state.wake_slots).try_acquire_owned().unwrap();
+        let _second = Arc::clone(&state.wake_slots).try_acquire_owned().unwrap();
+        assert!(
+            Arc::clone(&state.wake_slots).try_acquire_owned().is_err(),
+            "the relay must offer exactly two slots"
+        );
+        let app = router(state);
+        let body = r#"{"mac":"aa:bb:cc:dd:ee:ff","broadcast":"127.0.0.1","port":9}"#;
+
+        let saturated = wake_request()
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(saturated).await.unwrap().status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        drop(first);
+        let receiver = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let port = receiver.local_addr().unwrap().port();
+        let body =
+            format!(r#"{{"mac":"aa:bb:cc:dd:ee:ff","broadcast":"127.0.0.1","port":{port}}}"#);
+        let released = wake_request()
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(released).await.unwrap().status(),
+            StatusCode::NO_CONTENT,
+            "a released slot must be reusable"
+        );
+        let mut buffer = [0; 256];
+        assert_eq!(receiver.recv_from(&mut buffer).unwrap().0, 102);
+    }
+
+    #[tokio::test]
+    async fn wake_route_uses_the_configured_default_broadcast_when_the_request_omits_it() {
+        let receiver = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let port = receiver.local_addr().unwrap().port();
+        let temp = TempDir::new().unwrap();
+        // This is what the phone does: it never sends `broadcast`, so a
+        // multi-homed relay needs the daemon-side default to point at its LAN.
+        let state = test_state(&temp).with_wake_broadcast(Ipv4Addr::LOCALHOST);
+        let token = state.auth.render();
+        let app = router(state);
+
+        let body = format!(r#"{{"mac":"aa:bb:cc:dd:ee:ff","port":{port}}}"#);
+        let request = wake_request()
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+        let mut buffer = [0; 256];
+        let (received, _) = receiver.recv_from(&mut buffer).unwrap();
+        let mac: MacAddress = "aa:bb:cc:dd:ee:ff".parse().unwrap();
+        assert_eq!(&buffer[..received], &navette_wake::magic_packet(mac));
+    }
+
+    #[tokio::test]
+    async fn wake_route_sits_behind_the_auth_and_origin_guards() {
+        let (app, token) = tests_support::test_router_with_token();
+        let body = r#"{"mac":"aa:bb:cc:dd:ee:ff","broadcast":"127.0.0.1","port":9}"#;
+
+        let unauthenticated = wake_request().body(axum::body::Body::from(body)).unwrap();
+        assert_eq!(
+            app.clone().oneshot(unauthenticated).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let wrong_token = wake_request()
+            .header("authorization", "Bearer 0000000000000000000000000")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(wrong_token).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // guard.rs owns the origin loop for the other routes; this pins the
+        // same protection for the wake route without editing that file.
+        let from_a_browser = wake_request()
+            .header("authorization", format!("Bearer {}", token.render()))
+            .header("origin", "https://evil.example")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(from_a_browser).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_route_answers_every_malformed_request_with_400() {
+        let (app, token) = tests_support::test_router_with_token();
+        let bearer = format!("Bearer {}", token.render());
+
+        for (label, body) in [
+            ("invalid mac", r#"{"mac":"nope"}"#),
+            ("port 0", r#"{"mac":"aa:bb:cc:dd:ee:ff","port":0}"#),
+            (
+                "port out of range",
+                r#"{"mac":"aa:bb:cc:dd:ee:ff","port":70000}"#,
+            ),
+            (
+                "port as string",
+                r#"{"mac":"aa:bb:cc:dd:ee:ff","port":"9"}"#,
+            ),
+            (
+                "broadcast not an IPv4 literal",
+                r#"{"mac":"aa:bb:cc:dd:ee:ff","broadcast":"192.168.1"}"#,
+            ),
+            (
+                "broadcast is IPv6",
+                r#"{"mac":"aa:bb:cc:dd:ee:ff","broadcast":"ff02::1"}"#,
+            ),
+            ("missing mac", r#"{"broadcast":"255.255.255.255"}"#),
+            ("not an object", r#"["aa:bb:cc:dd:ee:ff"]"#),
+        ] {
+            let request = wake_request()
+                .header("authorization", &bearer)
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::BAD_REQUEST,
+                "{label}"
+            );
+        }
+
+        // No Content-Type and no JSON at all: `Json<_>` would say 415 here,
+        // and the contract says 400.
+        let not_json = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/wake")
+            .header("authorization", &bearer)
+            .body(axum::body::Body::from("wake up"))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(not_json).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_route_relays_a_magic_packet_to_the_requested_target() {
+        let receiver = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let port = receiver.local_addr().unwrap().port();
+        let (app, token) = tests_support::test_router_with_token();
+
+        let body =
+            format!(r#"{{"mac":"AA-BB-CC-DD-EE-FF","broadcast":"127.0.0.1","port":{port}}}"#);
+        let request = wake_request()
+            .header("authorization", format!("Bearer {}", token.render()))
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            axum::body::to_bytes(response.into_body(), 16)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut buffer = [0; 256];
+        let (received, _) = receiver.recv_from(&mut buffer).unwrap();
+        let mac: MacAddress = "aa:bb:cc:dd:ee:ff".parse().unwrap();
+        assert_eq!(received, 102);
+        assert_eq!(&buffer[..received], &navette_wake::magic_packet(mac));
     }
 }

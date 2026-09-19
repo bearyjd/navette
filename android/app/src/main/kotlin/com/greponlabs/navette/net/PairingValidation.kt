@@ -50,6 +50,35 @@ internal fun canonicalHost(raw: String): String? {
 
 internal fun canonicalPort(raw: String): Int? = raw.toIntOrNull()?.takeIf { it in 1..65535 }
 
+/**
+ * Mirrors the MAC grammar `navetted`'s `/v1/wake` accepts: six hex octets as
+ * `aa:bb:cc:dd:ee:ff`, `aa-bb-cc-dd-ee-ff` or `aabbccddeeff`, any case, and
+ * nothing else -- no mixed separators, no surrounding whitespace (the caller
+ * trims, as [canonicalHost]'s callers do). Grammar only: broadcast and
+ * all-zero addresses pass, because refusing what the daemon would send is a
+ * second definition of "valid" that can drift from the first.
+ */
+internal fun canonicalMac(raw: String): String? {
+    if (raw.isEmpty() || raw != raw.trim()) return null
+    val octets =
+        when (raw.length) {
+            MAC_BARE_LENGTH -> raw.chunked(2)
+            MAC_SEPARATED_LENGTH -> {
+                val separator = raw[2]
+                if (separator != ':' && separator != '-') return null
+                raw.split(separator)
+            }
+            else -> return null
+        }
+    if (octets.size != MAC_OCTETS || octets.any { octet -> octet.length != 2 || !octet.all { it in HEX_DIGITS } }) return null
+    return octets.joinToString(":") { it.lowercase(Locale.ROOT) }
+}
+
+private const val MAC_OCTETS = 6
+private const val MAC_BARE_LENGTH = MAC_OCTETS * 2
+private const val MAC_SEPARATED_LENGTH = MAC_BARE_LENGTH + MAC_OCTETS - 1
+private const val HEX_DIGITS = "0123456789abcdefABCDEF"
+
 /** Mirrors navette-auth's parser: formatting separators are accepted, not aliases. */
 internal fun normalizePairingToken(raw: String): String? {
     // Rust validates bytes with to_ascii_uppercase; Unicode case folding (for
