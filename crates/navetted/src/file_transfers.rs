@@ -10,6 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
+use std::os::fd::OwnedFd;
+
+#[cfg(unix)]
 use nix::fcntl::{OFlag, open, openat, renameat};
 #[cfg(unix)]
 use nix::sys::stat::{Mode, SFlag, fchmod, fstat, mkdirat};
@@ -136,6 +139,8 @@ pub enum FileTransferError {
     InvalidState,
     #[error("transfer cannot be cancelled")]
     NotCancellable,
+    #[error("transfer was cancelled")]
+    Cancelled,
     #[error("upload length does not match its preflight")]
     SizeMismatch,
     #[error("file transfer I/O failed: {0}")]
@@ -190,8 +195,8 @@ impl FileTransferStore {
         let directory = self.drop_dir(session);
         remove_tree(&directory)?;
         remove_tree(&self.staging_dir(session))?;
-        fs::create_dir_all(&directory)?;
-        set_private_directory(&directory)?;
+        create_private_root(&self.root)?;
+        open_private_directory(&directory)?;
         drop(lifecycle);
         Ok(())
     }
@@ -220,18 +225,25 @@ impl FileTransferStore {
     pub fn recover(&self, session: &str) -> Result<(), FileTransferError> {
         validate(session)?;
         let mut lifecycle = self.lock_lifecycle()?;
+        // All directory work happens before the session turns live, so a
+        // refused or missing directory leaves it non-live (every transfer
+        // request fails closed) rather than live with no usable drop dir.
+        // The supervisor only creates the drop root when it starts a session,
+        // and this runs before any start in a restarted daemon, so the root
+        // is healed here, recursively: the guest cannot reach that level. The
+        // guest-visible leaf is one non-recursive step that refuses to follow
+        // a planted entry instead of tightening its target.
+        create_private_root(&self.root)?;
+        open_private_directory(&self.drop_dir(session))?;
+        // The in-memory transfer registry is lost across a daemon restart, so
+        // no partial upload can be resumed safely. Keep public delivered files
+        // for the live guest, but discard their private staging siblings.
+        remove_tree(&self.staging_dir(session))?;
         let epoch = next_epoch(&mut lifecycle);
         lifecycle.live.insert(session.to_owned(), epoch);
         let mut entries = self.lock_entries()?;
         entries.retain(|(entry_session, _), _| entry_session != session);
         drop(entries);
-        let directory = self.drop_dir(session);
-        fs::create_dir_all(&directory)?;
-        set_private_directory(&directory)?;
-        // The in-memory transfer registry is lost across a daemon restart, so
-        // no partial upload can be resumed safely. Keep public delivered files
-        // for the live guest, but discard their private staging siblings.
-        remove_tree(&self.staging_dir(session))?;
         drop(lifecycle);
         Ok(())
     }
@@ -356,8 +368,10 @@ impl FileTransferStore {
         }
         entry.uploading = true;
         let directory = self.staging_dir(session);
-        if let Err(error) =
-            fs::create_dir_all(&directory).and_then(|_| set_private_directory(&directory))
+        // Both levels are daemon-private. A recursive create would leave the
+        // shared `.staging` parent at whatever the process umask allows.
+        if let Err(error) = open_private_directory(&self.staging_root())
+            .and_then(|_| open_private_directory(&directory))
         {
             entry.uploading = false;
             return Err(FileTransferError::Io(error));
@@ -403,6 +417,12 @@ impl FileTransferStore {
         Ok(status(id, entry))
     }
 
+    /// Cancellation is authoritative over an in-flight upload: the entry
+    /// turns terminal here, and the streaming handler observes that on its
+    /// next chunk (or at `finish`) instead of the client having to retry the
+    /// DELETE until the upload is torn down. Unlinking a staging file the
+    /// upload still holds open only orphans its inode, which vanishes when
+    /// that handle closes.
     pub fn cancel(&self, session: &str, id: &str) -> Result<(), FileTransferError> {
         validate(session)?;
         validate_id(id)?;
@@ -419,8 +439,7 @@ impl FileTransferStore {
         if !matches!(
             entry.state,
             FileTransferState::AwaitingUpload | FileTransferState::Queued
-        ) || entry.uploading
-        {
+        ) {
             return Err(FileTransferError::NotCancellable);
         }
         entry.state = FileTransferState::Cancelled;
@@ -548,6 +567,13 @@ impl FileTransferStore {
         if entry.epoch != epoch {
             return Err(FileTransferError::NotFound);
         }
+        // A cancel that raced this finish already made the entry terminal;
+        // nothing here may move it back to Queued.
+        match entry.state {
+            FileTransferState::AwaitingUpload => {}
+            FileTransferState::Cancelled => return Err(FileTransferError::Cancelled),
+            _ => return Err(FileTransferError::InvalidState),
+        }
         entry.uploading = false;
         if written != entry.size {
             entry.state = FileTransferState::Failed;
@@ -643,12 +669,30 @@ impl FileTransferStore {
         })
     }
 
-    fn ensure_live(&self, session: &str, epoch: u64) -> Result<(), FileTransferError> {
+    /// Checks, per chunk, that the session incarnation is still live and the
+    /// transfer is still awaiting this upload. Observing a cancel here bounds
+    /// how much of a body the handler streams into an orphaned staging inode.
+    fn ensure_upload_open(
+        &self,
+        session: &str,
+        id: &str,
+        epoch: u64,
+    ) -> Result<(), FileTransferError> {
         let lifecycle = self.lock_lifecycle()?;
-        if live_epoch(&lifecycle, session)? == epoch {
-            Ok(())
-        } else {
-            Err(FileTransferError::SessionNotLive)
+        if live_epoch(&lifecycle, session)? != epoch {
+            return Err(FileTransferError::SessionNotLive);
+        }
+        let entries = self.lock_entries()?;
+        let entry = entries
+            .get(&(session.to_owned(), id.to_owned()))
+            .ok_or(FileTransferError::NotFound)?;
+        if entry.epoch != epoch {
+            return Err(FileTransferError::NotFound);
+        }
+        match entry.state {
+            FileTransferState::AwaitingUpload => Ok(()),
+            FileTransferState::Cancelled => Err(FileTransferError::Cancelled),
+            _ => Err(FileTransferError::InvalidState),
         }
     }
 
@@ -664,8 +708,13 @@ impl FileTransferStore {
         }
     }
 
+    /// Daemon-private parent of every session's staging directory.
+    fn staging_root(&self) -> PathBuf {
+        self.root.join(".staging")
+    }
+
     fn staging_dir(&self, session: &str) -> PathBuf {
-        self.root.join(".staging").join(session)
+        self.staging_root().join(session)
     }
 
     fn staging_path(&self, session: &str, id: &str) -> PathBuf {
@@ -687,7 +736,8 @@ pub struct FileUpload {
 
 impl FileUpload {
     pub fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), FileTransferError> {
-        self.store.ensure_live(&self.session, self.epoch)?;
+        self.store
+            .ensure_upload_open(&self.session, &self.id, self.epoch)?;
         let additional = u64::try_from(chunk.len()).map_err(|_| FileTransferError::FileTooLarge)?;
         if self
             .written
@@ -707,6 +757,10 @@ impl FileUpload {
     }
 
     pub fn finish(mut self) -> Result<FileTransferStatus, FileTransferError> {
+        // A cancel outranks a truncated body: the entry is already terminal,
+        // so report that rather than failing it a second time.
+        self.store
+            .ensure_upload_open(&self.session, &self.id, self.epoch)?;
         if self.written != self.expected {
             self.store
                 .abort_upload(&self.session, &self.id, self.epoch, true);
@@ -902,6 +956,9 @@ fn remove_tree(path: &Path) -> io::Result<()> {
 /// rename can only sabotage its own delivery into a fresh 0o700 directory the
 /// daemon just created, so that residual window is acceptable. A fresh id
 /// directory is required; a guest-created entry makes this transfer fail.
+/// The drop directory itself is recreated if the guest removed it, so one
+/// deleted directory does not fail every later transfer for the session; a
+/// symlink or file planted at that name still fails closed.
 #[cfg(unix)]
 fn deliver_staged_file(
     drop_dir: &Path,
@@ -919,7 +976,7 @@ fn deliver_staged_file(
     ensure_regular_file_of_size(&staged, expected)?;
     fchmod(&staged, Mode::from_bits_truncate(0o600)).map_err(nix_to_io)?;
 
-    let drop = open(drop_dir, dir_flags, Mode::empty()).map_err(nix_to_io)?;
+    let drop = open_private_directory(drop_dir)?;
     mkdirat(&drop, id, Mode::from_bits_truncate(0o700)).map_err(nix_to_io)?;
     let delivered = openat(&drop, id, dir_flags, Mode::empty())
         .and_then(|destination| renameat(&staging, staged_name.as_str(), &destination, name));
@@ -981,15 +1038,57 @@ fn deliver_staged_file(
     delivered
 }
 
+/// Creates the daemon-owned drop root, including missing parents, at a
+/// private mode. Only this level may be recursive: nothing under the guest's
+/// control can plant an entry above its own drop directory, and a relocated
+/// or wiped data directory must not disable file transfers until a restart.
 #[cfg(unix)]
-fn set_private_directory(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+fn create_private_root(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
 }
 
 #[cfg(not(unix))]
-fn set_private_directory(_path: &Path) -> io::Result<()> {
-    Ok(())
+fn create_private_root(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)
+}
+
+/// Creates one daemon-private directory level and returns it open. The
+/// create is deliberately non-recursive so a missing parent is an error
+/// rather than a directory silently created at the process umask, and the
+/// mode is tightened through the descriptor: with `O_DIRECTORY | O_NOFOLLOW`
+/// a symlink, file or other non-directory planted at `path` fails with
+/// `ENOTDIR` (or `ELOOP` on some platforms) instead of having its target
+/// chmod'd.
+#[cfg(unix)]
+fn open_private_directory(path: &Path) -> io::Result<OwnedFd> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    match fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let directory = open(path, flags, Mode::empty()).map_err(nix_to_io)?;
+    fchmod(&directory, Mode::from_bits_truncate(0o700)).map_err(nix_to_io)?;
+    Ok(directory)
+}
+
+/// Without descriptor-relative calls there is neither a private mode to
+/// apply nor a way to refuse a planted symlink; only the non-recursive
+/// create is preserved.
+#[cfg(not(unix))]
+fn open_private_directory(path: &Path) -> io::Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -1232,8 +1331,7 @@ mod tests {
         if let Err(error) = fs::remove_dir_all(&drop_dir) {
             assert_eq!(error.kind(), io::ErrorKind::NotFound);
         }
-        fs::create_dir_all(&drop_dir).unwrap();
-        set_private_directory(&drop_dir).unwrap();
+        open_private_directory(&drop_dir).unwrap();
         store.activate_prepared("work").unwrap();
 
         assert!(matches!(
@@ -1345,5 +1443,231 @@ mod tests {
             store.preflight("work", request("second.pdf", 8)).is_ok(),
             "a failed worker launch must not keep its queued quota reservation"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recover_refuses_a_symlinked_drop_directory() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("drops");
+        fs::create_dir_all(&root).unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+        let store = FileTransferStore::with_limits(&root, 8, 12, 2, Duration::from_secs(60));
+        symlink(&outside, store.drop_dir("work")).unwrap();
+
+        assert!(matches!(
+            store.recover("work"),
+            Err(FileTransferError::Io(_))
+        ));
+        let mode = fs::metadata(&outside).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "recovery must not follow a planted symlink to chmod its target"
+        );
+        assert!(
+            fs::symlink_metadata(store.drop_dir("work"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "recovery must not replace or follow the planted entry"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn begin_upload_creates_the_staging_root_privately() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        // Pre-existing at a permissive mode, so the assertion does not depend
+        // on the test process umask: the helper must tighten what it finds.
+        let staging_root = store.staging_root();
+        fs::create_dir(&staging_root).unwrap();
+        fs::set_permissions(&staging_root, fs::Permissions::from_mode(0o755)).unwrap();
+        let preflight = store.preflight("work", request("report.pdf", 4)).unwrap();
+        let _upload = store.begin_upload("work", &preflight.transfer_id).unwrap();
+
+        for directory in [staging_root, store.staging_dir("work")] {
+            let mode = fs::metadata(&directory).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode,
+                0o700,
+                "{} must be private to the daemon, observed {mode:o}",
+                directory.display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialization_recreates_a_deleted_drop_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let preflight = store.preflight("work", request("report.pdf", 4)).unwrap();
+        let mut upload = store.begin_upload("work", &preflight.transfer_id).unwrap();
+        upload.write_chunk(b"data").unwrap();
+        upload.finish().unwrap();
+        let drop_dir = store.drop_dir("work");
+        fs::remove_dir_all(&drop_dir).unwrap();
+
+        let delivered = store.materialize("work", &preflight.transfer_id).unwrap();
+        assert_eq!(delivered.state, FileTransferState::Delivered);
+        assert_eq!(
+            fs::read(drop_dir.join(&preflight.transfer_id).join("report.pdf")).unwrap(),
+            b"data"
+        );
+        let mode = fs::metadata(&drop_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "a recreated drop directory must be private to the daemon"
+        );
+    }
+
+    #[test]
+    fn cancel_wins_over_an_in_flight_upload() {
+        let temp = TempDir::new().unwrap();
+        // A budget of exactly one file proves the reservation is released by
+        // the cancel itself, not by the upload handle going away later.
+        let store = FileTransferStore::with_limits(
+            temp.path().join("drops"),
+            8,
+            8,
+            1,
+            Duration::from_secs(60),
+        );
+        store.activate("work").unwrap();
+        let first = store.preflight("work", request("first.pdf", 8)).unwrap();
+        let mut upload = store.begin_upload("work", &first.transfer_id).unwrap();
+        upload.write_chunk(b"data").unwrap();
+        assert!(matches!(
+            store.preflight("work", request("blocked.pdf", 8)),
+            Err(FileTransferError::SessionBudgetExceeded)
+        ));
+
+        store.cancel("work", &first.transfer_id).unwrap();
+
+        assert!(matches!(
+            upload.write_chunk(b"more"),
+            Err(FileTransferError::Cancelled)
+        ));
+        assert_eq!(
+            store.status("work", &first.transfer_id).unwrap().state,
+            FileTransferState::Cancelled
+        );
+        assert!(!store.staging_path("work", &first.transfer_id).exists());
+        store
+            .preflight("work", request("second.pdf", 8))
+            .expect("cancellation releases the whole reservation immediately");
+        drop(upload);
+        assert_eq!(
+            store.status("work", &first.transfer_id).unwrap().state,
+            FileTransferState::Cancelled,
+            "dropping the orphaned upload handle must not disturb the cancelled entry"
+        );
+    }
+
+    #[test]
+    fn finish_after_cancel_cannot_resurrect_the_transfer() {
+        let temp = TempDir::new().unwrap();
+        let store = FileTransferStore::with_limits(
+            temp.path().join("drops"),
+            8,
+            12,
+            2,
+            Duration::from_secs(60),
+        );
+        store.activate("work").unwrap();
+        let preflight = store.preflight("work", request("report.pdf", 4)).unwrap();
+        let mut upload = store.begin_upload("work", &preflight.transfer_id).unwrap();
+        upload.write_chunk(b"data").unwrap();
+
+        store.cancel("work", &preflight.transfer_id).unwrap();
+
+        assert!(matches!(upload.finish(), Err(FileTransferError::Cancelled)));
+        assert_eq!(
+            store.status("work", &preflight.transfer_id).unwrap().state,
+            FileTransferState::Cancelled
+        );
+        assert!(!store.staging_path("work", &preflight.transfer_id).exists());
+        assert!(matches!(
+            store.materialize("work", &preflight.transfer_id),
+            Err(FileTransferError::InvalidState)
+        ));
+        assert!(
+            !store.drop_dir("work").join(&preflight.transfer_id).exists(),
+            "a cancelled transfer must never reach the guest"
+        );
+    }
+
+    #[test]
+    fn short_finish_after_cancel_reports_cancelled_not_size_mismatch() {
+        let temp = TempDir::new().unwrap();
+        let store = FileTransferStore::with_limits(
+            temp.path().join("drops"),
+            8,
+            12,
+            2,
+            Duration::from_secs(60),
+        );
+        store.activate("work").unwrap();
+        let preflight = store.preflight("work", request("report.pdf", 4)).unwrap();
+        let mut upload = store.begin_upload("work", &preflight.transfer_id).unwrap();
+        upload.write_chunk(b"da").unwrap();
+
+        store.cancel("work", &preflight.transfer_id).unwrap();
+
+        assert!(matches!(upload.finish(), Err(FileTransferError::Cancelled)));
+        assert_eq!(
+            store.status("work", &preflight.transfer_id).unwrap().state,
+            FileTransferState::Cancelled
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recover_leaves_the_session_non_live_when_its_drop_directory_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("drops");
+        fs::create_dir_all(&root).unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let store = FileTransferStore::with_limits(&root, 8, 12, 2, Duration::from_secs(60));
+        symlink(&outside, store.drop_dir("work")).unwrap();
+
+        assert!(store.recover("work").is_err());
+        assert!(
+            matches!(
+                store.preflight("work", request("report.pdf", 1)),
+                Err(FileTransferError::SessionNotLive)
+            ),
+            "a session whose drop directory was refused must not accept transfers"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recover_recreates_a_missing_drop_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("relocated").join("navette").join("drops");
+        let store = FileTransferStore::with_limits(&root, 8, 12, 2, Duration::from_secs(60));
+
+        store.recover("work").unwrap();
+
+        for directory in [root, store.drop_dir("work")] {
+            let mode = fs::metadata(&directory).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} must be private", directory.display());
+        }
+        assert!(store.preflight("work", request("report.pdf", 1)).is_ok());
     }
 }
