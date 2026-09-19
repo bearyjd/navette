@@ -154,7 +154,13 @@ impl<R: ProcessRunner> ApiState<R> {
             for session in registry.list() {
                 if session.status == navette_protocol::SessionStatus::Running {
                     let _ = blobs.activate(&session.name);
-                    let _ = files.recover(&session.name);
+                    if let Err(error) = files.recover(&session.name) {
+                        tracing::warn!(
+                            session = %session.name,
+                            %error,
+                            "file transfer recovery failed; transfers disabled for this session until restart"
+                        );
+                    }
                 }
             }
         }
@@ -492,7 +498,8 @@ fn file_error_response(error: FileTransferError) -> HttpResponse {
         }
         FileTransferError::UploadInProgress
         | FileTransferError::InvalidState
-        | FileTransferError::NotCancellable => StatusCode::CONFLICT.into_response(),
+        | FileTransferError::NotCancellable
+        | FileTransferError::Cancelled => StatusCode::CONFLICT.into_response(),
         FileTransferError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -1821,6 +1828,184 @@ mod tests {
         assert_eq!(
             app.oneshot(cancel).await.unwrap().status(),
             StatusCode::NO_CONTENT
+        );
+    }
+
+    /// The upload is held open through the store handle, exactly as a PUT
+    /// whose body is still streaming holds it, so the DELETE below races a
+    /// real in-flight upload rather than a finished one.
+    #[tokio::test]
+    async fn delete_wins_over_an_in_flight_put() {
+        let temp = TempDir::new().unwrap();
+        let state = test_state(&temp);
+        add_running_session(&state, "work");
+        let token = state.auth.render();
+        let app = router(state.clone());
+
+        let create = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/sessions/work/files")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"name":"report.pdf","mime":"application/pdf","size":4}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let preflight: crate::file_transfers::FilePreflightResponse = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let mut upload = state
+            .files
+            .begin_upload("work", &preflight.transfer_id)
+            .unwrap();
+        upload.write_chunk(b"da").unwrap();
+
+        let cancel = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/sessions/work/files/{}", preflight.transfer_id))
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(cancel).await.unwrap().status(),
+            StatusCode::NO_CONTENT,
+            "DELETE must be authoritative while the PUT body is still streaming"
+        );
+
+        assert!(matches!(
+            upload.write_chunk(b"ta"),
+            Err(FileTransferError::Cancelled)
+        ));
+        let retry = axum::http::Request::builder()
+            .method("PUT")
+            .uri(&preflight.upload_url)
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-length", "4")
+            .body(axum::body::Body::from("data"))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(retry).await.unwrap().status(),
+            StatusCode::CONFLICT,
+            "a cancelled transfer cannot be re-uploaded"
+        );
+        let status = axum::http::Request::builder()
+            .uri(format!("/v1/sessions/work/files/{}", preflight.transfer_id))
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(status).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let status: crate::file_transfers::FileTransferStatus = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            status.state,
+            crate::file_transfers::FileTransferState::Cancelled
+        );
+    }
+
+    /// Drives a real streaming PUT: the body yields one chunk, the DELETE
+    /// lands while the handler waits for the next, and the second chunk makes
+    /// the handler itself answer 409 rather than a later request.
+    #[tokio::test]
+    async fn put_streaming_after_delete_gets_conflict() {
+        let temp = TempDir::new().unwrap();
+        let state = test_state(&temp);
+        add_running_session(&state, "work");
+        let token = state.auth.render();
+        let app = router(state);
+
+        let create = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/sessions/work/files")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"name":"report.pdf","mime":"application/pdf","size":4}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let preflight: crate::file_transfers::FilePreflightResponse = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        let (sender, receiver) = tokio::sync::mpsc::channel::<axum::body::Bytes>(1);
+        let body = axum::body::Body::from_stream(futures_util::stream::unfold(
+            receiver,
+            |mut receiver| async move {
+                receiver
+                    .recv()
+                    .await
+                    .map(|chunk| (Ok::<_, std::convert::Infallible>(chunk), receiver))
+            },
+        ));
+        let put = axum::http::Request::builder()
+            .method("PUT")
+            .uri(&preflight.upload_url)
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-length", "4")
+            .body(body)
+            .unwrap();
+        let cancel = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/sessions/work/files/{}", preflight.transfer_id))
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let drive = async {
+            sender
+                .send(axum::body::Bytes::from_static(b"da"))
+                .await
+                .unwrap();
+            // The bounded channel hands out its next permit only once the
+            // handler has taken the first chunk, which happens after its
+            // `begin_upload`, so the DELETE below races a live upload.
+            let permit = sender.reserve().await.unwrap();
+            let cancelled = app.clone().oneshot(cancel).await.unwrap();
+            permit.send(axum::body::Bytes::from_static(b"ta"));
+            drop(sender);
+            cancelled.status()
+        };
+        let (upload, cancelled) = tokio::join!(app.clone().oneshot(put), drive);
+        assert_eq!(
+            cancelled,
+            StatusCode::NO_CONTENT,
+            "DELETE must succeed while the PUT body is mid-stream"
+        );
+        assert_eq!(
+            upload.unwrap().status(),
+            StatusCode::CONFLICT,
+            "the streaming PUT must end with 409 once cancelled"
+        );
+
+        let status = axum::http::Request::builder()
+            .uri(format!("/v1/sessions/work/files/{}", preflight.transfer_id))
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(status).await.unwrap();
+        let status: crate::file_transfers::FileTransferStatus = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            status.state,
+            crate::file_transfers::FileTransferState::Cancelled
         );
     }
 }
