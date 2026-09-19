@@ -2940,3 +2940,158 @@ a secret (a redacting `Debug`, an encrypted store, a clearing-on-use rule), grep
 every *other* place the same value is held or constructed, and confirm each one is
 covered too. The bug is never in the guarded copy — it's the copy nobody thought to
 check.
+
+## Log gap: PRs #23–#32 (2026-09-14 → 2026-09-16)
+
+This file was not updated for the Codex-driven sessions between the hardening
+branch and file transfer. The merged work in that window, for orientation only
+(each PR body is the record; nothing here was re-derived from the code):
+
+- #23 fix(android): stop HUD work after media disconnect
+- #24 feat(android): redesign remote workbench launcher
+- #25 refactor(android): extract session controller
+- #28 fix(android): supersede stale clipboard retries
+- #29 test(android): cover reconnect wiring
+- #30 feat(android): scroll guest at zoom pan edges
+- #31 feat(android): add multi-host pairing registry (Phase 2 "multi-host registry")
+- #32 feat: add session image clipboard transport (Phase 2 "image clipboard";
+  established the per-session bulk blob transport that #33 builds on)
+
+## File transfer: landed, four review rounds deep (2026-09-19)
+
+PR #33 (`b56f33b` feature + `2bfd942` hardening, merged as `f343aa2`) closes the
+Phase 2 "file transfer" item: a phone or the CLI delivers a file into a running guest
+session, bounded per session and per file. This entry records the shape, the
+defects the reviews found (so nobody reintroduces them), and what was deliberately
+left for later.
+
+### Shape
+
+- **Daemon** (`crates/navetted/src/file_transfers.rs`): `FileTransferStore`, one
+  drop root under `XDG_DATA_HOME/navette/drops`. Guest-visible `root/<session>` is
+  exported as `NAVETTE_DROP_DIR`; daemon-private staging is `root/.staging/<session>/<id>.part`.
+  Lifecycle `awaiting_upload → queued → materializing → delivered`, terminals
+  `failed`/`cancelled`. Limits: 64 MiB/file, 256 MiB and 64 objects per session,
+  15 min preflight expiry, 64 retained terminal records. A per-session **epoch
+  lease** makes a same-name replacement session invisible to the old incarnation's
+  uploads, status reads, and materialization workers.
+- **API** (`crates/navetted/src/api.rs`): `POST /v1/sessions/{s}/files` (preflight →
+  id + upload URL), `PUT …/{id}/content` (exact `Content-Length`, existing upload
+  slots and timeouts), `GET`/`DELETE …/{id}`. Auth/origin middleware applies. The
+  PUT's 202 schedules materialization on a `BridgeManager` thread, off the render loop.
+- **Supervisor** (`crates/navetted/src/supervisor.rs`): resets `root/<session>`
+  *before* spawning the guest, then the API calls `FileTransferStore::activate_prepared`,
+  which only records the new epoch. The old `activate` (reset after spawn) is
+  `#[cfg(test)]` — see "Defects" for why it must stay that way.
+- **Protocol/CLI**: `crates/navette-protocol/src/media.rs` separates generic safe-MIME
+  blob descriptors from the image-only clipboard ones. `navette cp SESSION SOURCE
+  [--name] [--no-wait]` streams, polls, cleans up on Ctrl-C, and refuses any
+  server-provided upload URL that changes authority.
+- **Android** (`ui/session/FileTransferCoordinator.kt`, 759 lines): document picker →
+  re-openable `ContentResolver` source (bytes are never buffered) → streaming
+  `HttpURLConnection` PUT → polling coordinator. UI states include a new
+  `Unconfirmed(name, message)` — shown when the daemon's state could not be
+  confirmed; it offers no Retry.
+
+### How it got here
+
+The feature commit came out of Codex. Codex's own review found four lifecycle
+defects, an executor patched them, a second review found three more, and then the
+Codex runner died (exit 139 / `ETXTBSY` on `/bin/echo`) with the patch uncommitted.
+The work moved to Claude Code, which fixed the three, ran two more independent
+review rounds (code + security) that found a further HIGH and several MEDIUMs, and
+fixed those too. Final verdicts: code-reviewer APPROVE (round 4), security-reviewer
+APPROVE. Every Android guard added in the hardening commit was mutation-checked
+against its own test (remove the guard → exactly that test fails).
+
+### Defects found and closed — the reasons behind non-obvious code
+
+1. **Guest spawned before its drop directory was reset.** `activate` removed and
+   recreated `root/<session>` after `Supervisor::start` had already exported the path
+   to a running guest. A fast guest could see the previous incarnation's files or
+   lose files it created in the gap. Fix: reset in the supervisor pre-spawn;
+   `activate_prepared` never touches the directory. Test:
+   `supervisor::tests::resets_drop_directory_before_spawning_the_guest`.
+2. **Symlink escape via a guest-precreated `drop/<id>`.** `create_dir_all` followed a
+   planted symlink out of the tree. Fix: `deliver_staged_file` opens the drop dir
+   `O_DIRECTORY|O_NOFOLLOW`, `mkdirat`s the id (EEXIST fails the transfer), `openat`s
+   it, and `renameat`s into it. The 32-hex id is unguessable, so this is
+   defense-in-depth behind a random token.
+3. **Path-based chmod of the staged file (TOCTOU).** `symlink_metadata` then
+   `set_permissions(path)` — the latter follows symlinks. Fix: `openat(O_NOFOLLOW)` →
+   `fstat` (regular, expected size) → `fchmod` on the same fd → `renameat`. The
+   remaining open→rename window lets a guest sabotage only its own delivery. Test:
+   `materialization_never_follows_a_swapped_staged_symlink`.
+4. **Materialization worker spawn failure stranded quota.** Thread spawn error after
+   a 202 left the entry `queued` forever with its reservation held. Fix:
+   `fail_queued_materialization` (bridge.rs failure branch) → `failed`, staging
+   removed, quota released.
+5. **`reset_private_directory` used a recursive mkdir for the leaf**, which returns
+   Ok over a planted symlink-to-dir. Fix: non-recursive leaf creation fails closed.
+   Note: a symlink planted *before* start is simply unlinked by `remove_dir_all`, so
+   the integration test can't discriminate this; the unit test on the helper does.
+6. **Android treated DELETE→409 as "materializing".** The daemon returns 409 for three
+   distinct states: PUT body still tearing down (`entry.uploading`), materializing/
+   delivered, or already terminal. After Cancel the first is the common case (the
+   client's socket disconnect races the DELETE), and the coordinator showed
+   "Delivering…" for 30 s then "timed out". Fix: on 409 read `status()` and branch —
+   AwaitingUpload/Queued → retry DELETE; Materializing/Delivered → resume polling;
+   terminal → Cancelled. 404 → `Gone` → confirmed immediately.
+7. **"Cancelled" rendered without server confirmation** when the network was down.
+   Fix: after the DELETE budget, one status read decides; unknown → `Unconfirmed`.
+8. **Duplicate delivery via Retry.** `fail()` released the reservation with
+   `cancelRemote` and ignored the verdict; a transient poll failure on a file the
+   daemon already held produced "Failed [Retry]", and Retry re-uploads under a new
+   id. Fix: a transfer is `committed` at the 202; from then on every failure path
+   follows the file to its end (`waitForDelivery`) or ends `Unconfirmed` — never
+   Retry. Three consecutive dropped polls are tolerated before failing at all.
+9. **Back-out-of-session leaked the reservation for 15 minutes.** `close()` ran in
+   the Compose scope being disposed in the same pass; its `launch` died before the
+   first dispatch. Fix: `close()`/replacement/`cancel()` release with
+   `launch(UNDISPATCHED) { withContext(NonCancellable) { withTimeoutOrNull(5 s) … } }`
+   around only the DELETE; the verdict handling stays cancellable.
+   `RELEASE_TIMEOUT_MS` is a soft bound — it cannot interrupt a blocking connect.
+10. **Resumed polling left the cancellation latch set and `work` pointing at a dead
+    Job**, so a later replace/cancel never released anything and couldn't stop the
+    poll. Fix: the resume path resets `remoteCancellationStarted` and re-points
+    `work`. `settleCancellation` handles the one other latch producer (Cancel tapped
+    while `fail()`'s own release loop is mid-retry) by reading status and spending a
+    fresh DELETE budget if the entry is still cancellable.
+11. Smaller: stale `onProgress` from a still-draining upload can't republish over a
+    resumed delivery (guarded by the upload Job's liveness); a late verdict for a
+    superseded attempt can't overwrite its replacement (`latest`); terminal publishes
+    clear `active`.
+
+### Known limitation — record it wherever this is next discussed
+
+The guest is spawned as the daemon's uid with no sandbox (no bwrap/flatpak/unshare
+anywhere in `crates/`). Items 2, 3 and 5 are therefore **defense-in-depth, not a
+privilege boundary**: a guest that can write `root/.staging` — which the current
+spawn permits — can still make the delivered inode differ from the validated one,
+because `renameat` re-resolves `<id>.part` by name. The doc comment on
+`deliver_staged_file` reads as though a boundary exists; it becomes one the moment
+the guest is confined to `NAVETTE_DROP_DIR`. Do not remove the hardening because it
+is "moot today" — it is the part that will matter.
+
+### Deliberately deferred
+
+- `recover()` and `begin_upload()` still create/chmod by path; convert to the
+  `O_DIRECTORY|O_NOFOLLOW` + `fchmod` pattern when next touched.
+- No self-heal if the guest deletes its own drop directory (every later transfer
+  fails until the session is restarted).
+- Server side: let DELETE win over an in-flight PUT (cancel marks `cancelled` even
+  while `uploading`; the PUT observes state and aborts) instead of the client
+  retrying through the teardown window.
+- Split `HttpFileTransferTransport` out of the 759-line coordinator.
+- `ActiveTransfer.finished` is a structural guard with no test that detects its
+  removal — defensive, not observed behaviour.
+- **On-device verification of the Android flow has not been done.** All Android
+  coverage is JVM unit tests (27 coordinator cases). The picker → upload → delivered
+  path on a real phone against a real daemon is the next thing to run.
+
+### Verification at merge
+
+`cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`,
+`cargo test --workspace` (315), Android `testDebugUnitTest` (315) + `assembleDebug` +
+`lintDebug`, `git diff --check` — all clean locally; CI `rust`, `android`, and
+`viewer-display` (the Xvfb gate that cannot run on this machine) all passed on the PR.
