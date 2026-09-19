@@ -59,9 +59,11 @@ jobs:
       - name: Build wprsd and xwayland-xdg-shell
         # wprsc is a desktop client and not part of the host tarball.
         run: |
-          git clone https://github.com/bearyjd/wprs.git wprs
-          git -C wprs checkout "$WPRS_REV"
-          cargo build --release --locked --manifest-path wprs/Cargo.toml --bin wprsd --bin xwayland-xdg-shell
+          # Clone OUTSIDE the checkout: a nested Cargo.toml is treated as a member
+          # of this repo's workspace and cargo refuses to build it.
+          git clone https://github.com/bearyjd/wprs.git "$RUNNER_TEMP/wprs"
+          git -C "$RUNNER_TEMP/wprs" checkout "$WPRS_REV"
+          cargo build --release --locked --manifest-path "$RUNNER_TEMP/wprs/Cargo.toml" --bin wprsd --bin xwayland-xdg-shell
       - name: Assemble tarball
         # SHA256SUMS is written from inside the staging dir so its entry is a
         # bare file name, which is what `sha256sum -c --ignore-missing` in
@@ -70,7 +72,7 @@ jobs:
           set -euo pipefail
           mkdir -p "dist/$DIST/bin" "dist/$DIST/contrib"
           install -m 0755 target/release/navetted target/release/navette \
-            wprs/target/release/wprsd wprs/target/release/xwayland-xdg-shell "dist/$DIST/bin/"
+            "$RUNNER_TEMP/wprs/target/release/wprsd" "$RUNNER_TEMP/wprs/target/release/xwayland-xdg-shell" "dist/$DIST/bin/"
           strip "dist/$DIST"/bin/* || echo "strip failed; shipping unstripped binaries"
           cp -r contrib/systemd contrib/cloud "dist/$DIST/contrib/"
           cp LICENSE "dist/$DIST/"
