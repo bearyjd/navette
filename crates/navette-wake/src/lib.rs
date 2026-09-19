@@ -134,8 +134,8 @@ impl fmt::Display for MacAddress {
 /// Builds the 102-byte magic packet for `mac`.
 pub fn magic_packet(mac: MacAddress) -> [u8; MAGIC_PACKET_LEN] {
     let mut packet = [0xFF; MAGIC_PACKET_LEN];
-    for copy in packet[MAC_OCTETS..].chunks_exact_mut(MAC_OCTETS) {
-        copy.copy_from_slice(&mac.0);
+    for copy in packet[MAC_OCTETS..].as_chunks_mut::<MAC_OCTETS>().0 {
+        *copy = mac.0;
     }
     packet
 }
