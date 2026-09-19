@@ -3075,13 +3075,18 @@ is "moot today" — it is the part that will matter.
 
 ### Deliberately deferred
 
-- `recover()` and `begin_upload()` still create/chmod by path; convert to the
-  `O_DIRECTORY|O_NOFOLLOW` + `fchmod` pattern when next touched.
-- No self-heal if the guest deletes its own drop directory (every later transfer
-  fails until the session is restarted).
-- Server side: let DELETE win over an in-flight PUT (cancel marks `cancelled` even
-  while `uploading`; the PUT observes state and aborts) instead of the client
-  retrying through the teardown window.
+- ~~`recover()` and `begin_upload()` still create/chmod by path~~ **done in
+  PR #34 (2026-09-19)** — `open_private_directory` helper; `.staging` is now 0700;
+  `recover` does its directory I/O before marking the session live and the API
+  logs recovery failures instead of swallowing them.
+- ~~No self-heal if the guest deletes its own drop directory~~ **done in PR #34** —
+  `deliver_staged_file` recreates it (0700) on the next delivery.
+- ~~Server side: let DELETE win over an in-flight PUT~~ **done in PR #34** —
+  `cancel()` is authoritative while `uploading`; `FileTransferError::Cancelled`
+  (409) surfaces on the PUT via `ensure_upload_open`/`complete_upload`/`finish`.
+  The Android 409+`AwaitingUpload` retry branch is kept for older daemons but new
+  daemons answer the first DELETE with 204. Accepted residual: at most one more
+  chunk can land in the orphaned inode before the handler observes the cancel.
 - Split `HttpFileTransferTransport` out of the 759-line coordinator.
 - `ActiveTransfer.finished` is a structural guard with no test that detects its
   removal — defensive, not observed behaviour.
