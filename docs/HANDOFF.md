@@ -3110,3 +3110,64 @@ is "moot today" — it is the part that will matter.
 `cargo test --workspace` (315), Android `testDebugUnitTest` (315) + `assembleDebug` +
 `lintDebug`, `git diff --check` — all clean locally; CI `rust`, `android`, and
 `viewer-display` (the Xvfb gate that cannot run on this machine) all passed on the PR.
+
+## Phase 2 sweep: coordinator split, wake-on-LAN, thumbnails, cloud recipe (2026-09-19)
+
+Four PRs in one evening, each through the same lane discipline (executor → independent
+code + security review → fixes → scoped confirm → CI → merge). Facts the next person
+needs, not the changelog — the PR bodies carry the detail.
+
+- **#35 `refactor(android)`** — `FileTransferCoordinator.kt` (777 lines) split into
+  `FileTransferSource.kt` / `FileTransferTransport.kt` / `FileTransferCoordinator.kt`
+  (90 / 213 / 480). Verified as a pure move by comparing the sorted multiset of
+  non-import lines before and after (686 = 686). Same package, no import churn.
+
+- **#36 `feat: wake-on-LAN`** — new crate `navette-wake` (MAC parser, 102-byte magic
+  packet, `is_lan_broadcast_target` allowlist), `POST /v1/wake` on navetted (bearer +
+  Origin middleware, 2 relay slots → 429, allowlisted `broadcast`, body parsed as
+  `Bytes` so every bad input is 400), `navette wake <mac> [--via]`, and on Android a
+  pairing-registry **schema v2** (`SavedPairing.wake: WakeTarget{mac, viaId}`; v1
+  migrates; wake-only faults degrade to `wake = null` rather than `Corrupt`) with a
+  "Wake via <relay>" action on the connect-failure screen. Things that bit us:
+  the limited broadcast `255.255.255.255` leaves ONE interface (the default route —
+  `tailscale0` under an exit node), hence `navetted --wake-broadcast <subnet.255>`
+  for multi-homed relays; a late wake verdict landing after a host switch needed the
+  same `Job`-cancel guard the file-transfer coordinator uses; and **CI's stable Rust
+  (1.98) is ahead of the local toolchain (1.95)** — a lint new in 1.98 failed CI that
+  passed locally. `rustup toolchain install 1.98.1` is now present; run
+  `cargo +1.98.1 clippy --workspace --all-targets -- -D warnings` before pushing.
+
+- **#37 `feat: session thumbnails and app icons`** — `navette-bridge::thumbnail`
+  (box-filter downscale ≤320 px + JPEG via `jpeg-encoder` 0.7.1, `forbid(unsafe)`),
+  `ThumbnailStore` + `ThumbnailCapture` on the encode thread (retains the
+  **downscaled** picture of the largest toplevel ≤1/s — never a full frame; snapshot
+  on first frame, every 10 s, and on last-client detach with a 1 s floor),
+  `GET /v1/sessions/{s}/thumbnail` and `GET /v1/apps/{id}/icon` with ETag/304,
+  freedesktop PNG icon lookup resolved once at `AppIndex::load`. Android has no image
+  library: `HttpImageFetcher` + `ImageCache` + `ImageRepository` (coalesced,
+  ETag-revalidated, URL-keyed, cleared on pairing change) and an `AuthenticatedImage`
+  composable. Two facts worth remembering: frames reach the encode thread even with
+  zero clients (compositing already happens), so detached-but-painting sessions keep
+  refreshing; and **Kill must stop the bridge before removing the thumbnail** — the
+  encode queue drains queued `Snapshot`s before honouring `stopped`. Thumbnails are
+  in-memory; after a daemon restart every tile is an icon until the session paints.
+  Android decodes with `inJustDecodeBounds` + a 4 Mpx cap: a 400 KB PNG can otherwise
+  decode to >1 GB and `OutOfMemoryError` is an `Error`, not an `Exception`.
+
+- **#38 `feat: cloud host recipe and release workflow`** — `.github/workflows/release.yml`
+  (tag `v*` → ubuntu-22.04 build of navetted/navette + the wprs fork's `wprsd`/
+  `xwayland-xdg-shell` at the pinned rev, tarball + SHA256SUMS; `workflow_dispatch`
+  builds an artifact only), `contrib/cloud/navette-host-init.sh` + `cloud-init.yaml`,
+  `docs/operators/cloud-host.md`. The security review found the documented path
+  **did not work**: cloud-init's `umask 077` made the Tailscale keyring 0600 and apt
+  refused the repo — invisible to a hand-run smoke test. Now `umask 022` in the
+  script. The bootstrap downloads the tarball + SUMS, verifies, and runs the script
+  *from the tarball*; nothing unverified executes as root. Snap Firefox cannot
+  connect (snapd's wayland interface allows only `wayland-N`; ours is
+  `navette-<session>`), so Ubuntu gets no default app. **No tag exists yet**; the
+  first release is `v0.1.0` once the dispatch dry-run proves the wprs build-dep list.
+
+Still true after all four: `api.rs` (~2.9k) and `bridge.rs` (~2.7k) are well over the
+800-line rule and should be split (`api/images.rs`, `api/wake.rs` are the obvious
+first extractions); the phone-side flows for wake and thumbnails are unit-tested
+only, not run on the Pixel.
