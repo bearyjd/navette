@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use navette_auth::SecretString;
-use navette_cli::{Client, render_result};
+use navette_cli::{Client, FileTransferState, render_result};
 use navette_protocol::{AttachInfo, RequestCommand, ResponseResult};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
@@ -74,6 +74,19 @@ enum Command {
     Kill {
         /// Session name to kill.
         session: String,
+    },
+    /// Copy a regular file into a running guest's drop directory.
+    Cp {
+        /// Destination session name.
+        session: String,
+        /// Regular file to upload.
+        source: PathBuf,
+        /// Filename exposed to the guest. Defaults to the source basename.
+        #[arg(long)]
+        name: Option<String>,
+        /// Return after the daemon has accepted the upload without waiting for delivery.
+        #[arg(long)]
+        no_wait: bool,
     },
     /// Show the API token, optionally as a QR code for phone pairing.
     ///
@@ -141,8 +154,149 @@ async fn main() -> Result<()> {
         Command::Kill { session } => {
             print_result(client.call(RequestCommand::Kill { session }).await?)
         }
+        Command::Cp {
+            session,
+            source,
+            name,
+            no_wait,
+        } => copy_file(&client, &session, &source, name.as_deref(), no_wait).await,
         Command::Token { .. } => unreachable!("handled above"),
     }
+}
+
+const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+async fn copy_file(
+    client: &Client,
+    session: &str,
+    source: &Path,
+    name: Option<&str>,
+    no_wait: bool,
+) -> Result<()> {
+    let metadata = tokio::fs::symlink_metadata(source)
+        .await
+        .with_context(|| format!("failed to read {}", source.display()))?;
+    if !metadata.is_file() {
+        bail!("{} is not a regular file", source.display());
+    }
+    let size = metadata.len();
+    if size == 0 || size > MAX_FILE_BYTES {
+        bail!("{} must be between 1 byte and 64 MiB", source.display());
+    }
+    let name = match name {
+        Some(name) => name,
+        None => source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("source filename must be valid UTF-8; pass --name")?,
+    };
+    validate_file_name(name)?;
+    let mime = mime_for_name(name);
+    let preflight = client.preflight_file(session, name, mime, size).await?;
+    let transfer_id = preflight.transfer_id.clone();
+
+    let mut interrupt = std::pin::pin!(tokio::signal::ctrl_c());
+    let uploaded = tokio::select! {
+        result = &mut interrupt => {
+            let _ = client.cancel_file(session, &transfer_id).await;
+            result.context("failed to wait for Ctrl-C")?;
+            bail!("file transfer cancelled");
+        }
+        result = client.upload_file(&preflight.upload_url, source, size) => result,
+    };
+    let uploaded = match uploaded {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = client.cancel_file(session, &transfer_id).await;
+            return Err(error);
+        }
+    };
+    if no_wait {
+        print_file_status(&uploaded);
+        return Ok(());
+    }
+
+    let mut status = uploaded;
+    loop {
+        match status.state {
+            FileTransferState::Delivered => {
+                print_file_status(&status);
+                return Ok(());
+            }
+            FileTransferState::Failed | FileTransferState::Cancelled => {
+                let _ = client.cancel_file(session, &transfer_id).await;
+                bail!("file transfer {transfer_id} ended as {:?}", status.state);
+            }
+            FileTransferState::AwaitingUpload
+            | FileTransferState::Queued
+            | FileTransferState::Materializing => {}
+        }
+        tokio::select! {
+            result = &mut interrupt => {
+                let _ = client.cancel_file(session, &transfer_id).await;
+                result.context("failed to wait for Ctrl-C")?;
+                bail!("file transfer cancelled");
+            }
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+        match client.file_status(session, &transfer_id).await {
+            Ok(next_status) => {
+                status = next_status;
+                if matches!(status.state, FileTransferState::Delivered) {
+                    print_file_status(&status);
+                    return Ok(());
+                }
+                if matches!(
+                    status.state,
+                    FileTransferState::Failed | FileTransferState::Cancelled
+                ) {
+                    let _ = client.cancel_file(session, &transfer_id).await;
+                    bail!("file transfer {transfer_id} ended as {:?}", status.state);
+                }
+            }
+            Err(error) => {
+                let _ = client.cancel_file(session, &transfer_id).await;
+                return Err(error);
+            }
+        }
+    }
+}
+
+fn validate_file_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 255
+        || matches!(name, "." | "..")
+        || name.contains(['/', '\\'])
+        || name.chars().any(char::is_control)
+    {
+        bail!("invalid file name: {name:?}");
+    }
+    Ok(())
+}
+
+fn mime_for_name(name: &str) -> &'static str {
+    match Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+    {
+        Some(extension) if extension.eq_ignore_ascii_case("pdf") => "application/pdf",
+        Some(extension) if extension.eq_ignore_ascii_case("txt") => "text/plain",
+        Some(extension) if extension.eq_ignore_ascii_case("json") => "application/json",
+        Some(extension) if extension.eq_ignore_ascii_case("png") => "image/png",
+        Some(extension)
+            if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") =>
+        {
+            "image/jpeg"
+        }
+        _ => "application/octet-stream",
+    }
+}
+
+fn print_file_status(status: &navette_cli::FileTransferStatus) {
+    println!(
+        "{}\t{}\t{:?}\t{}/{}",
+        status.transfer_id, status.name, status.state, status.bytes_received, status.size
+    );
 }
 
 fn show_token(
@@ -559,6 +713,53 @@ mod tests {
             cli.command,
             Command::Detach { session: Some(session) } if session == "work-browser"
         ));
+    }
+
+    #[test]
+    fn parses_copy_with_a_safe_name_and_no_wait() {
+        let cli = Cli::try_parse_from([
+            "navette",
+            "cp",
+            "work",
+            "/tmp/report.pdf",
+            "--name",
+            "guest-report.pdf",
+            "--no-wait",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Cp { session, source, name, no_wait }
+                if session == "work"
+                    && source.as_path() == Path::new("/tmp/report.pdf")
+                    && name.as_deref() == Some("guest-report.pdf")
+                    && no_wait
+        ));
+    }
+
+    #[test]
+    fn file_name_validation_matches_the_server_destination_contract() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "../escape",
+            "subdir/file",
+            "subdir\\file",
+            "bad\nname",
+        ] {
+            assert!(
+                validate_file_name(name).is_err(),
+                "{name:?} must be rejected"
+            );
+        }
+        assert!(validate_file_name("quarterly report.pdf").is_ok());
+    }
+
+    #[test]
+    fn file_mime_uses_a_safe_fallback() {
+        assert_eq!(mime_for_name("photo.JPEG"), "image/jpeg");
+        assert_eq!(mime_for_name("archive.unknown"), "application/octet-stream");
     }
 
     #[test]

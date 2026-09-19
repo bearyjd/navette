@@ -230,3 +230,10 @@ fun controlWebSocketUrl(host: String, port: Int = DEFAULT_NAVETTE_PORT): String 
  */
 fun mediaWebSocketUrl(host: String, session: String, port: Int = DEFAULT_NAVETTE_PORT): String =
     "ws://${formatAuthorityHost(host)}:$port/v1/sessions/$session/media"
+
+/** HTTP collection backing the session-scoped, client-to-guest file upload API. */
+fun fileTransferCollectionUrl(mediaUrl: String): String =
+    mediaUrl
+        .replaceFirst("ws://", "http://")
+        .replaceFirst("wss://", "https://")
+        .removeSuffix("/media") + "/files"

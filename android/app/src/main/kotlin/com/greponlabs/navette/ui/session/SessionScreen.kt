@@ -6,6 +6,8 @@ import android.content.Context
 import android.net.Uri
 import android.view.SurfaceView
 import android.view.View
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Box
@@ -118,6 +120,22 @@ fun SessionScreen(
     val pendingBlobAnnouncement =
         remember(pairing.host, sessionName) { PendingClipboardBlobAnnouncement() }
     val clipboardScope = rememberCoroutineScope()
+    // File delivery is deliberately keyed to the session instead of the media
+    // controller/reconnect nonce. The HTTP upload may outlive a dropped media
+    // socket, and its retained, re-openable URI is what makes an explicit
+    // retry possible without buffering the document in the app.
+    val fileTransferCoordinator =
+        remember(pairing.host, pairing.port, sessionName) {
+            FileTransferCoordinator(
+                scope = clipboardScope,
+                transport =
+                    HttpFileTransferTransport(
+                        mediaWebSocketUrl(pairing.host, sessionName, pairing.port),
+                        pairing.token,
+                    ),
+            )
+        }
+    val fileTransferState by fileTransferCoordinator.state.collectAsState()
     val controller =
         remember(pairing.host, pairing.port, sessionName, reconnectNonce) {
             SessionController(
@@ -137,6 +155,11 @@ fun SessionScreen(
     val keyboard = LocalSoftwareKeyboardController.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val context = LocalContext.current
+    val filePicker =
+        rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            uri ?: return@rememberLauncherForActivityResult
+            ContentResolverFileTransferSource.from(context.contentResolver, uri)?.let(fileTransferCoordinator::upload)
+        }
     val clipboard =
         remember(context) { context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager }
     // Keyed on the session, not the nonce, like the retry counters above: a
@@ -204,6 +227,10 @@ fun SessionScreen(
             lifecycleOwner.lifecycle.removeObserver(clipboardObserver)
             controller.close()
         }
+    }
+
+    DisposableEffect(fileTransferCoordinator) {
+        onDispose { fileTransferCoordinator.close() }
     }
 
     LaunchedEffect(controller) {
@@ -370,6 +397,13 @@ fun SessionScreen(
             onImeRaisedChange = { imeRaised = it },
         )
 
+        FileTransferLayer(
+            state = fileTransferState,
+            onPick = { filePicker.launch(arrayOf("*/*")) },
+            onCancel = fileTransferCoordinator::cancel,
+            onRetry = fileTransferCoordinator::retry,
+        )
+
         SessionHudOverlay(sample = state.hud, visible = hudVisible)
 
         SessionOverlay(
@@ -380,6 +414,49 @@ fun SessionScreen(
             onReconnect = onReconnect,
             onLeave = onLeave,
         )
+    }
+}
+
+/** Compact transfer controls intentionally stay separate from the media HUD. */
+@Composable
+private fun BoxScope.FileTransferLayer(
+    state: FileTransferUiState,
+    onPick: () -> Unit,
+    onCancel: () -> Unit,
+    onRetry: () -> Unit,
+) {
+    val label =
+        when (state) {
+            FileTransferUiState.Idle -> "Send file"
+            is FileTransferUiState.Preparing -> "Preparing ${state.name}"
+            is FileTransferUiState.Uploading -> "Uploading ${state.name}: ${state.sent / 1024} / ${state.size / 1024} KiB"
+            is FileTransferUiState.WaitingForGuest -> "Delivering ${state.name}"
+            is FileTransferUiState.Delivered -> "Delivered ${state.name}"
+            is FileTransferUiState.Cancelled -> "Cancelled ${state.name}"
+            is FileTransferUiState.Unconfirmed -> state.message
+            is FileTransferUiState.Failed -> state.message
+        }
+    val active = state is FileTransferUiState.Preparing ||
+        state is FileTransferUiState.Uploading ||
+        state is FileTransferUiState.WaitingForGuest
+    TextButton(
+        onClick = if (active) onCancel else onPick,
+        modifier = Modifier.align(Alignment.TopStart).padding(8.dp),
+    ) {
+        Text(if (active) "Cancel" else "File", color = Color.White)
+    }
+    Text(
+        text = label,
+        color = Color.White,
+        modifier = Modifier.align(Alignment.TopStart).padding(start = 64.dp, top = 14.dp),
+    )
+    if (state is FileTransferUiState.Failed) {
+        TextButton(
+            onClick = onRetry,
+            modifier = Modifier.align(Alignment.TopStart).padding(start = 64.dp, top = 38.dp),
+        ) {
+            Text("Retry", color = Color.White)
+        }
     }
 }
 
