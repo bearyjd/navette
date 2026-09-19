@@ -48,10 +48,13 @@ fun NavetteApp(
         state.showingHosts ->
             HostListScreen(
                 registry = state.registry,
+                snackbarMessage = state.snackbarMessage,
                 onSelect = { viewModel.onEvent(AppEvent.SelectHost(it)) },
                 onDelete = { viewModel.onEvent(AppEvent.DeleteHost(it)) },
+                onSetWake = { id, wake -> viewModel.onEvent(AppEvent.SetWake(id, wake)) },
                 onAdd = { viewModel.onEvent(AppEvent.AddHost) },
                 onBack = { viewModel.onEvent(AppEvent.HideHosts) },
+                onSnackbarDismissed = { shown -> viewModel.onEvent(AppEvent.DismissSnackbar(shown)) },
             )
         state.connection is ConnectionState.Connected && !state.addingHost ->
             DrawerScreen(
@@ -77,6 +80,9 @@ fun NavetteApp(
                 onRetry = { viewModel.onEvent(AppEvent.Reconnect) },
                 onBack = if (state.addingHost) ({ viewModel.onEvent(AppEvent.CancelAddHost) }) else null,
                 onManageHosts = if (state.registry.hosts.isNotEmpty()) ({ viewModel.onEvent(AppEvent.ShowHosts) }) else null,
+                wake = state.wake,
+                wakeViaLabel = state.wakeRoute?.via?.endpointLabel,
+                onWake = { viewModel.onEvent(AppEvent.WakeActive) },
             )
     }
 }

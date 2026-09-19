@@ -2,6 +2,7 @@ package com.greponlabs.navette.ui.connect
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -37,6 +38,7 @@ import com.greponlabs.navette.net.canonicalPort
 import com.greponlabs.navette.net.normalizePairingToken
 import com.greponlabs.navette.net.parsePairingUri
 import com.greponlabs.navette.net.validatedPairing
+import com.greponlabs.navette.ui.WakeUiState
 
 /**
  * Pairs with a `navetted` host by scanning the QR code it renders
@@ -77,6 +79,11 @@ internal fun manualPairing(host: String, port: String, token: String): Pairing? 
  */
 internal fun parsePort(raw: String): Int? = canonicalPort(raw.trim())
 
+/**
+ * [wakeViaLabel] is the relay a failed host can be woken through, or null when
+ * it has no wake target; [wake] is where the last wake attempt got to, and
+ * [onWake] sends one.
+ */
 @Composable
 fun ConnectScreen(
     connection: ConnectionState,
@@ -84,6 +91,9 @@ fun ConnectScreen(
     onRetry: () -> Unit,
     onBack: (() -> Unit)? = null,
     onManageHosts: (() -> Unit)? = null,
+    wake: WakeUiState = WakeUiState.Idle,
+    wakeViaLabel: String? = null,
+    onWake: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -150,9 +160,7 @@ fun ConnectScreen(
         }
         if (connection is ConnectionState.Failed) {
             Text(text = connection.reason, color = MaterialTheme.colorScheme.error)
-            Button(onClick = onRetry, enabled = !connecting) {
-                Text("Retry")
-            }
+            FailedActions(wake = wake, wakeViaLabel = wakeViaLabel, onRetry = onRetry, onWake = onWake)
         }
         // Terminal: the daemon rejected the stored token, and retrying it
         // would just fail the same way. Only a fresh pairing -- scanned or
@@ -217,5 +225,35 @@ fun ConnectScreen(
                 Text("Pair")
             }
         }
+    }
+}
+
+/**
+ * Retry, and -- for a host with a wake target -- the Wake button beside it.
+ * The button stays after a failed wake so a relay hiccup costs one tap, not a
+ * Retry round trip; it goes away after a successful one, because the useful
+ * next step is Retry, and a second packet does nothing the first did not.
+ */
+@Composable
+private fun FailedActions(
+    wake: WakeUiState,
+    wakeViaLabel: String?,
+    onRetry: () -> Unit,
+    onWake: () -> Unit,
+) {
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Button(onClick = onRetry) {
+            Text("Retry")
+        }
+        if (wakeViaLabel != null && wake !is WakeUiState.Sent) {
+            Button(onClick = onWake, enabled = wake !is WakeUiState.Sending) {
+                Text("Wake via $wakeViaLabel")
+            }
+        }
+    }
+    when (wake) {
+        WakeUiState.Idle, WakeUiState.Sending -> Unit
+        is WakeUiState.Sent -> Text("Magic packet sent via ${wake.viaLabel} — give the host a minute, then Retry.")
+        is WakeUiState.Failed -> Text(text = wake.message, color = MaterialTheme.colorScheme.error)
     }
 }

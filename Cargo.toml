@@ -4,6 +4,7 @@ members = [
     "crates/navette-protocol",
     "crates/navette-bridge",
     "crates/navette-auth",
+    "crates/navette-wake",
     "crates/navetted",
     "crates/navette-cli",
     "crates/navette-viewer",

@@ -183,6 +183,100 @@ port is a distinct host entry. Selecting a host closes the prior control
 connection and leaves its session before connecting to the new one. Deleting
 the active host returns to the host list without silently choosing another.
 
+## Wake-on-LAN
+
+A wake-on-LAN magic packet is a UDP broadcast — six `0xFF` bytes and the
+target's MAC sixteen times over — and broadcasts do not cross the tailnet. A
+phone or laptop that is only on the tailnet cannot wake a machine on the home
+LAN by itself, so `navetted` relays: it sends the packet from the LAN it is
+already on. That is the whole feature. Something on that LAN has to be awake
+to do the relaying, so this wakes *other* hosts from the daemon's network, not
+the daemon's own host.
+
+### `navette wake`
+
+```bash
+navette wake aa:bb:cc:dd:ee:ff                       # from this machine, to 255.255.255.255:9
+navette wake aa-bb-cc-dd-ee-ff --broadcast 192.168.1.255 --port 7
+navette wake aabbccddeeff --via                      # ask navetted at --url to send it
+navette --url ws://tower.ts.net:9417/v1/ws --token <token> wake aa:bb:cc:dd:ee:ff --via
+```
+
+The MAC is accepted as `aa:bb:cc:dd:ee:ff`, `aa-bb-cc-dd-ee-ff`, or
+`aabbccddeeff`, in either case. It is validated before anything is sent or
+dialled, in both modes, so a typo is reported as a typo.
+
+- **Without `--via`** the packet leaves *this* machine. That only reaches the
+  sleeping host if this machine is on its LAN; from the tailnet it goes
+  nowhere, silently — a broadcast that reaches nobody is not an error at the
+  socket. Nothing is dialled and no token is resolved, so it works with a
+  remote `--url` and no `--token`, like `navette token` does.
+- **With `--via`** the CLI does `POST /v1/wake` to the daemon at `--url`,
+  which sends the packet from *its* LAN. This is the path for a machine that is
+  on the tailnet only. It needs the same token any other daemon call needs —
+  the local file for a loopback `--url`, an explicit `--token` or
+  `NAVETTE_TOKEN` otherwise, exactly as in [Remote clients need an explicit
+  token](#remote-clients-need-an-explicit-token). `--broadcast` and `--port`
+  are forwarded when given and otherwise left to the daemon's defaults.
+- **`--broadcast`** is an IPv4 literal, default `255.255.255.255`. That
+  default does **not** go out every interface: Linux routes the limited
+  broadcast from an unbound socket out whichever *one* interface the routing
+  table picks, normally the default route's, and `ip route get 255.255.255.255`
+  shows which. On a single-NIC host with a plain default route that is the
+  LAN and the default works. On a multi-homed host, or on any host using a
+  Tailscale exit node (whose default route is `tailscale0`), it is the wrong
+  interface and the packet wakes nothing. Pass the LAN's subnet-directed
+  broadcast, `--broadcast 192.168.1.255` or whatever `ip -4 addr` reports as
+  `brd` on the LAN interface — or, for the relay, set it once with
+  `--wake-broadcast` (below) so the phone gets it too. **`--port`** is
+  1–65535, default 9. The NIC matches on the payload, not the port, so the
+  default is right unless the target's firmware says otherwise.
+
+A `204` from the daemon, or `magic packet sent` locally, means the datagram
+left a socket. Neither the CLI nor the daemon can know whether the host woke;
+check with a ping a few seconds later.
+
+### Configuring the relay: `navetted --wake-broadcast`
+
+The phone never sends a `broadcast` — it only knows the MAC — so every wake
+from the app goes to the daemon's default. Given the routing behaviour above,
+**a relay host that is multi-homed or behind an exit node must be started with
+its LAN's subnet broadcast**, or the app's wake button silently does nothing:
+
+```bash
+./target/release/navetted --bind <tailnet-ip>:9417 --allow-remote --wake-broadcast 192.168.1.255
+```
+
+The value is checked at startup against the same rule the request path
+applies (next section) and a public address is refused with a message naming
+the rule, so a typo fails where you can see it rather than turning every tap
+into a packet to the internet. A request that names its own `broadcast` still
+overrides this default. Also note, on the phone side: re-pairing the relay on
+a **new port** creates a new host entry in the app's registry, and any wake
+targets configured under the old entry stay pointed at it until that entry is
+deleted and the targets are set up again under the new one.
+
+**If nothing wakes**, the packet is almost never the problem. In order of
+likelihood:
+
+1. **WoL is off in the target's firmware or driver.** It must be enabled in
+   the BIOS/UEFI (*Wake on LAN*, *Power On By PCI-E*, or similar) **and** the
+   NIC must have it armed at the OS level — on Linux, `ethtool <iface>` must
+   show `Wake-on: g`; set it with `ethtool -s <iface> wol g` if it shows `d`.
+   Many distributions reset it to `d` on every boot unless a NetworkManager
+   connection profile or a udev rule re-arms it.
+2. **The target is on Wi-Fi.** Wake-on-Wireless-LAN is rarely supported and
+   rarer still to work. Use a wired interface.
+3. **The target was powered off, not suspended,** and the firmware only wakes
+   from S3. Some boards wake from S5 (soft-off) only with a separate setting.
+4. **The relay sent it out the wrong interface.** The default
+   `255.255.255.255` follows the routing table — see `--broadcast` above —
+   and a relay behind an exit node sends it up the tunnel. Start `navetted`
+   with `--wake-broadcast <LAN subnet broadcast>`.
+5. **The relay is on a different broadcast domain** from the target — a VLAN,
+   a guest network, a container bridge. A subnet-directed `--broadcast` helps
+   only if the daemon host has an interface on that subnet.
+
 ## Health checks
 
 <!-- AUTO-GENERATED: from crates/navetted/src/api.rs routes -->
@@ -192,8 +286,43 @@ the active host returns to the host list without silently choosing another.
 | `/healthz` | GET | Liveness |
 | `/v1/ws` | WS | Control socket (JSON request/response) |
 | `/v1/sessions/{session}/media` | WS | Media socket (binary frames + JSON text) |
+| `/v1/wake` | POST | Relay a wake-on-LAN magic packet onto the daemon's LAN |
 
 <!-- END AUTO-GENERATED -->
+
+**`POST /v1/wake`** takes a JSON body of `{"mac": "aa:bb:cc:dd:ee:ff"}`, with
+optional `"broadcast"` (an IPv4 literal, default the daemon's
+`--wake-broadcast`, itself defaulting to `255.255.255.255`) and `"port"`
+(1–65535, default 9). Responses:
+
+| Status | When |
+|---|---|
+| **204** | The datagram left the daemon's socket. No body. |
+| **400** | Body is not JSON, or the MAC, broadcast address or port does not parse (port 0 included), or the broadcast address is outside the allowed ranges. The body names the reason. |
+| **401** | No or wrong bearer token, like every route. |
+| **403** | The request carried an `Origin` header, i.e. came from a browser, like every route. |
+| **413** | Body over axum's 2 MiB default limit. |
+| **429** | Both relay slots are busy: the daemon sends at most two magic packets concurrently. Retry after a moment. |
+| **500** | The send itself failed (no route, socket error). Check the daemon log. |
+
+**Allowed broadcast addresses.** The daemon relays for any authenticated
+client and must not be a UDP reflector for arbitrary addresses, so
+`broadcast` is accepted only if it is `255.255.255.255`, an RFC 1918 private
+address (which covers subnet-directed broadcasts such as `192.168.1.255`),
+link-local (`169.254/16`), loopback, or in the CGNAT range `100.64.0.0/10`
+that tailnets use. Anything else — a public address, `0.0.0.0`, multicast —
+is a 400 whose body states this rule. `--wake-broadcast` is held to the same
+rule at startup.
+
+There is no way to learn from the response whether the host woke; see
+[Wake-on-LAN](#wake-on-lan) for what a silent failure usually means.
+
+```bash
+curl -fsS -X POST -H "Authorization: Bearer $(navette token)" \
+  -H 'Content-Type: application/json' \
+  -d '{"mac":"aa:bb:cc:dd:ee:ff","broadcast":"192.168.1.255"}' \
+  http://127.0.0.1:9417/v1/wake
+```
 
 `/healthz` requires the bearer token like every other route, so a bare `curl`
 gets a 401 and `-f` exits non-zero — reporting a perfectly healthy daemon as
