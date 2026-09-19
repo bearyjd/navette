@@ -38,13 +38,19 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import com.greponlabs.navette.net.ImageRepository
+import com.greponlabs.navette.net.Pairing
+import com.greponlabs.navette.net.appIconPath
+import com.greponlabs.navette.net.sessionThumbnailPath
 import com.greponlabs.navette.protocol.App
 import com.greponlabs.navette.protocol.Session
 import com.greponlabs.navette.protocol.SessionStatus
@@ -52,6 +58,16 @@ import com.greponlabs.navette.protocol.SessionStatus
 private val WorkbenchInk = Color(0xFF1B1F3B)
 private val WorkbenchTeal = Color(0xFF007D6A)
 private val WorkbenchPaleTeal = Color(0xFFC8F5E9)
+
+// A 16:9 tile that sits inside the session card's text block, so it adds
+// width, not height. Sized for the name to stay readable on a 360dp handset:
+// 360 - 2x20 grid padding = 320 card; - 2x18 card padding = 284 content;
+// - 80 tile - 14 gap = 190; - 8 gap - 12 dot - 6 gap - ~64 "STARTING" at
+// bold labelMedium = ~100dp for the name column, which is ~11 characters of
+// titleMedium -- "firefox-1" whole, where the 96dp tile and titleLarge left
+// room for about seven.
+private val THUMBNAIL_WIDTH = 80.dp
+private val THUMBNAIL_HEIGHT = 45.dp
 
 /**
  * The phone's remote-workbench: live sessions earn the most prominent space,
@@ -66,6 +82,9 @@ fun DrawerScreen(
     apps: List<App>,
     isLoading: Boolean,
     snackbarMessage: String?,
+    pairing: Pairing?,
+    images: ImageRepository,
+    refreshTick: Int,
     onRefresh: () -> Unit,
     onRunApp: (String) -> Unit,
     onAttachSession: (String) -> Unit,
@@ -73,6 +92,8 @@ fun DrawerScreen(
     onSnackbarDismissed: (shown: String) -> Unit,
 ) {
     val snackbarHostState = remember { SnackbarHostState() }
+    // A session knows its app by id; the letter and icon label want the name.
+    val appNames = remember(apps) { apps.associate { it.id to it.name } }
     LaunchedEffect(snackbarMessage) {
         if (snackbarMessage != null) {
             snackbarHostState.showSnackbar(snackbarMessage)
@@ -129,7 +150,14 @@ fun DrawerScreen(
                 item(span = { GridItemSpan(maxLineSpan) }) { EmptySessionsCard() }
             } else {
                 items(sessions, key = { it.name }, span = { GridItemSpan(maxLineSpan) }) { session ->
-                    SessionWorkbenchCard(session = session, onClick = { onAttachSession(session.name) })
+                    SessionWorkbenchCard(
+                        session = session,
+                        appName = appNames[session.appId] ?: session.appId,
+                        pairing = pairing,
+                        images = images,
+                        refreshTick = refreshTick,
+                        onClick = { onAttachSession(session.name) },
+                    )
                 }
             }
 
@@ -140,7 +168,7 @@ fun DrawerScreen(
                 item(span = { GridItemSpan(maxLineSpan) }) { EmptyAppsCard(isLoading) }
             } else {
                 items(apps, key = { it.id }) { app ->
-                    AppLaunchTile(app = app, onClick = { onRunApp(app.id) })
+                    AppLaunchTile(app = app, pairing = pairing, images = images, onClick = { onRunApp(app.id) })
                 }
             }
         }
@@ -180,7 +208,14 @@ private fun SectionLabel(title: String, count: Int) {
 }
 
 @Composable
-private fun SessionWorkbenchCard(session: Session, onClick: () -> Unit) {
+private fun SessionWorkbenchCard(
+    session: Session,
+    appName: String,
+    pairing: Pairing?,
+    images: ImageRepository,
+    refreshTick: Int,
+    onClick: () -> Unit,
+) {
     val statusColor = session.status.indicatorColor()
     Card(
         modifier =
@@ -199,12 +234,18 @@ private fun SessionWorkbenchCard(session: Session, onClick: () -> Unit) {
             modifier = Modifier.fillMaxWidth().padding(18.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Box(
-                modifier = Modifier.size(12.dp).clip(CircleShape).background(statusColor),
-            )
+            SessionThumbnail(session = session, appName = appName, pairing = pairing, images = images, refreshTick = refreshTick)
             Spacer(Modifier.width(14.dp))
             Column(modifier = Modifier.weight(1f)) {
-                Text(session.name, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+                // One line: the thumbnail fixes the card's height, and a name
+                // that wrapped would be the one thing that could still move it.
+                Text(
+                    session.name,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
                 Spacer(Modifier.height(3.dp))
                 Text(
                     text = session.appId,
@@ -214,6 +255,11 @@ private fun SessionWorkbenchCard(session: Session, onClick: () -> Unit) {
                     overflow = TextOverflow.Ellipsis,
                 )
             }
+            Spacer(Modifier.width(8.dp))
+            Box(
+                modifier = Modifier.size(12.dp).clip(CircleShape).background(statusColor),
+            )
+            Spacer(Modifier.width(6.dp))
             Text(
                 text = session.status.label().uppercase(),
                 style = MaterialTheme.typography.labelMedium,
@@ -222,13 +268,102 @@ private fun SessionWorkbenchCard(session: Session, onClick: () -> Unit) {
                 // small type in a decorative status colour.
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontWeight = FontWeight.Bold,
+                maxLines = 1,
             )
         }
     }
 }
 
+/**
+ * A 16:9 tile that is the same size whatever it ends up showing, so the list
+ * never jumps as images arrive: the session's latest frame, else the app's
+ * icon, else the app's initial. The frame revalidates on the drawer's refresh
+ * tick; the icon and the letter are stable.
+ */
 @Composable
-private fun AppLaunchTile(app: App, onClick: () -> Unit) {
+private fun SessionThumbnail(
+    session: Session,
+    appName: String,
+    pairing: Pairing?,
+    images: ImageRepository,
+    refreshTick: Int,
+) {
+    Box(
+        modifier =
+            Modifier
+                .size(width = THUMBNAIL_WIDTH, height = THUMBNAIL_HEIGHT)
+                .clip(RoundedCornerShape(10.dp))
+                .background(WorkbenchPaleTeal),
+        contentAlignment = Alignment.Center,
+    ) {
+        HostImage(
+            pairing = pairing,
+            images = images,
+            path = sessionThumbnailPath(session.name),
+            refreshKey = refreshTick,
+            modifier = Modifier.fillMaxSize(),
+            contentScale = ContentScale.Crop,
+        ) {
+            AppIcon(appId = session.appId, appName = appName, pairing = pairing, images = images, size = 40.dp)
+        }
+    }
+}
+
+/** The app's icon from the host, else its initial in the workbench ink. */
+@Composable
+private fun AppIcon(appId: String, appName: String, pairing: Pairing?, images: ImageRepository, size: Dp) {
+    HostImage(
+        pairing = pairing,
+        images = images,
+        path = appIconPath(appId),
+        refreshKey = null,
+        modifier = Modifier.size(size),
+        contentScale = ContentScale.Fit,
+    ) {
+        Text(
+            text = appInitial(appName),
+            style = MaterialTheme.typography.titleMedium,
+            color = WorkbenchInk,
+            fontWeight = FontWeight.Bold,
+        )
+    }
+}
+
+/**
+ * [AuthenticatedImage] when there is a host to ask; the placeholder alone when
+ * the drawer has none. Decorative either way: both cards already announce
+ * themselves ("Open work, running", "Launch Firefox, Application") and
+ * `clickable` merges descendants, so a described image would have TalkBack
+ * read the same name twice.
+ */
+@Composable
+private fun HostImage(
+    pairing: Pairing?,
+    images: ImageRepository,
+    path: String,
+    refreshKey: Any?,
+    modifier: Modifier,
+    contentScale: ContentScale,
+    placeholder: @Composable () -> Unit,
+) {
+    if (pairing == null) {
+        placeholder()
+    } else {
+        AuthenticatedImage(
+            repository = images,
+            pairing = pairing,
+            path = path,
+            refreshKey = refreshKey,
+            contentDescription = null,
+            modifier = modifier,
+            contentScale = contentScale,
+            placeholder = placeholder,
+        )
+    }
+}
+
+@Composable
+private fun AppLaunchTile(app: App, pairing: Pairing?, images: ImageRepository, onClick: () -> Unit) {
     val category = app.categories.firstOrNull()?.replace('-', ' ') ?: "Application"
     Card(
         modifier =
@@ -251,12 +386,7 @@ private fun AppLaunchTile(app: App, onClick: () -> Unit) {
                         .background(WorkbenchPaleTeal),
                 contentAlignment = Alignment.Center,
             ) {
-                Text(
-                    text = appInitial(app.name),
-                    style = MaterialTheme.typography.titleMedium,
-                    color = WorkbenchInk,
-                    fontWeight = FontWeight.Bold,
-                )
+                AppIcon(appId = app.id, appName = app.name, pairing = pairing, images = images, size = 30.dp)
             }
             Spacer(Modifier.height(18.dp))
             Text(

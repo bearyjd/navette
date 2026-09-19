@@ -286,9 +286,30 @@ likelihood:
 | `/healthz` | GET | Liveness |
 | `/v1/ws` | WS | Control socket (JSON request/response) |
 | `/v1/sessions/{session}/media` | WS | Media socket (binary frames + JSON text) |
+| `/v1/sessions/{session}/thumbnail` | GET | Latest snapshot of a live session as `image/jpeg` (≤320 px wide). `ETag` + `Cache-Control: no-cache`; a matching `If-None-Match` gets **304**. **404** when the session is not running or has not been snapshotted yet. |
+| `/v1/apps/{id}/icon` | GET | The app's PNG icon as `image/png`. `ETag` + `Cache-Control: max-age=3600`; a matching `If-None-Match` gets **304**. **404** for an unknown app or one with no resolvable PNG. |
 | `/v1/wake` | POST | Relay a wake-on-LAN magic packet onto the daemon's LAN |
 
 <!-- END AUTO-GENERATED -->
+
+**Thumbnails and icons.** A session's thumbnail is taken on its encode thread
+from the last composited frame: on the first frame, then every 10 s while
+frames arrive, and once more when the last media client detaches, so the
+drawer shows the session as it was left. Frames keep arriving (and thumbnails
+keep refreshing) while nobody is attached, as long as the application keeps
+painting. Thumbnails live in memory only — a daemon restart loses them, and
+the route 404s until the session paints again, so after a restart every tile
+in the phone's drawer shows the app icon (or its initial) until that session
+next paints. A **304** carries the `ETag` and no body. Icons are looked up
+when the app index loads, PNG only (no SVG, no `index.theme` inheritance): an
+absolute `Icon=` path is used as-is if it ends in `.png`; otherwise
+`icons/hicolor/{128x128,96x96,64x64,48x48,256x256,32x32}/apps/<name>.png`
+then `pixmaps/<name>.png`, in each of `$XDG_DATA_HOME`, `$XDG_DATA_DIRS`, and
+`/var/lib/flatpak/exports/share`, first hit wins. A file is served only if it
+is at most 1 MiB and starts with the PNG signature; at most four icon reads
+run concurrently, later requests wait. A phone whose drawer shows a
+placeholder for an app that has an icon on the host almost always has an
+SVG-only theme for that app.
 
 **`POST /v1/wake`** takes a JSON body of `{"mac": "aa:bb:cc:dd:ee:ff"}`, with
 optional `"broadcast"` (an IPv4 literal, default the daemon's

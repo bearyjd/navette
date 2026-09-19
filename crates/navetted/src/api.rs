@@ -9,7 +9,7 @@ use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response as HttpResponse};
 use axum::routing::{any, get, post, put};
 use futures_util::{SinkExt, StreamExt};
@@ -38,6 +38,7 @@ use crate::file_transfers::{
 use crate::media::{MediaHub, MediaHubError};
 use crate::registry::{RegistryError, default_session_name, validate_session_name};
 use crate::supervisor::{ProcessRunner, Supervisor, SupervisorError};
+use crate::thumbnails::ThumbnailStore;
 
 const MAX_CONTROL_MESSAGE_SIZE: usize = 1024 * 1024;
 const MAX_INPUT_MESSAGES_PER_SECOND: u32 = 240;
@@ -51,6 +52,21 @@ const BLOB_UPLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
 const BLOB_READ_CHUNK_BYTES: usize = 64 * 1024;
 const BLOB_DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const BLOB_DOWNLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
+/// A 256x256 PNG app icon is tens of kilobytes; anything past this is not an
+/// icon and is not read into memory to find out.
+const MAX_ICON_BYTES: u64 = 1024 * 1024;
+/// A drawer of fifty apps asks for fifty icons at once; four at a time keeps
+/// that off the disk without anyone noticing, and callers wait rather than
+/// get a 429 that would show up as a missing tile.
+const MAX_CONCURRENT_ICON_READS: usize = 4;
+/// The eight bytes every PNG starts with (PNG spec §5.2).
+const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+/// Thumbnails change while a session runs, so clients revalidate every time
+/// and get a 304 when nothing has.
+const THUMBNAIL_CACHE_CONTROL: &str = "no-cache";
+/// Icons change when packages do. An hour is short enough that an upgrade
+/// shows up and long enough that a drawer refresh is free.
+const ICON_CACHE_CONTROL: &str = "max-age=3600";
 
 /// Holds a transfer slot only while a response is making progress. The
 /// watchdog releases a stalled reader's permit even when Hyper stops polling
@@ -125,10 +141,12 @@ pub struct ApiState<R: ProcessRunner> {
     pub media: MediaHub,
     pub blobs: BlobStore,
     pub files: FileTransferStore,
+    pub thumbnails: ThumbnailStore,
     pub bridges: BridgeManager,
     pub auth: Arc<navette_auth::AuthToken>,
     upload_slots: Arc<Semaphore>,
     download_slots: Arc<Semaphore>,
+    icon_slots: Arc<Semaphore>,
     wake_slots: Arc<Semaphore>,
     /// Where a wake request that names no `broadcast` is sent. The phone never
     /// names one, so on a multi-homed relay this is what makes it reach the LAN.
@@ -144,10 +162,12 @@ impl<R: ProcessRunner> Clone for ApiState<R> {
             media: self.media.clone(),
             blobs: self.blobs.clone(),
             files: self.files.clone(),
+            thumbnails: self.thumbnails.clone(),
             bridges: self.bridges.clone(),
             auth: Arc::clone(&self.auth),
             upload_slots: Arc::clone(&self.upload_slots),
             download_slots: Arc::clone(&self.download_slots),
+            icon_slots: Arc::clone(&self.icon_slots),
             wake_slots: Arc::clone(&self.wake_slots),
             wake_broadcast: self.wake_broadcast,
             lifecycle_locks: Arc::clone(&self.lifecycle_locks),
@@ -164,6 +184,7 @@ impl<R: ProcessRunner> ApiState<R> {
         let media = MediaHub::default();
         let blobs = BlobStore::new(supervisor.blob_root());
         let files = FileTransferStore::new(supervisor.drop_root());
+        let thumbnails = ThumbnailStore::default();
         if let Ok(registry) = supervisor.registry().lock() {
             for session in registry.list() {
                 if session.status == navette_protocol::SessionStatus::Running {
@@ -181,13 +202,20 @@ impl<R: ProcessRunner> ApiState<R> {
         Self {
             apps,
             supervisor,
-            bridges: BridgeManager::with_transfers(media.clone(), blobs.clone(), files.clone()),
+            bridges: BridgeManager::with_transfers(
+                media.clone(),
+                blobs.clone(),
+                files.clone(),
+                thumbnails.clone(),
+            ),
             media,
             blobs,
             files,
+            thumbnails,
             auth,
             upload_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_BLOB_UPLOADS)),
             download_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_BLOB_DOWNLOADS)),
+            icon_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_ICON_READS)),
             wake_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_WAKES)),
             wake_broadcast: DEFAULT_BROADCAST,
             lifecycle_locks: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -244,6 +272,11 @@ pub fn router<R: ProcessRunner>(state: ApiState<R>) -> Router {
         .route("/v1/sessions/{session}/media", any(media_websocket::<R>))
         .route("/v1/sessions/{session}/blobs", post(upload_blob::<R>))
         .route("/v1/sessions/{session}/blobs/{id}", get(download_blob::<R>))
+        .route(
+            "/v1/sessions/{session}/thumbnail",
+            get(session_thumbnail::<R>),
+        )
+        .route("/v1/apps/{id}/icon", get(app_icon::<R>))
         .route("/v1/sessions/{session}/files", post(create_file::<R>))
         .route(
             "/v1/sessions/{session}/files/{transfer_id}",
@@ -581,6 +614,177 @@ async fn download_blob<R: ProcessRunner>(
     response
 }
 
+/// The session's most recent snapshot as `image/jpeg`. 404 until the encode
+/// thread has taken one (a session that has never painted has nothing to
+/// show) and for any session that is not live, like every session route.
+async fn session_thumbnail<R: ProcessRunner>(
+    Path(session): Path<String>,
+    State(state): State<ApiState<R>>,
+    headers: HeaderMap,
+) -> HttpResponse {
+    if !is_live_session(&state, &session) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(thumbnail) = state.thumbnails.get(&session) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if if_none_match_matches(&headers, &thumbnail.etag) {
+        return not_modified(&thumbnail.etag, THUMBNAIL_CACHE_CONTROL);
+    }
+    image_response(
+        "image/jpeg",
+        &thumbnail.etag,
+        THUMBNAIL_CACHE_CONTROL,
+        thumbnail.jpeg.clone(),
+    )
+}
+
+/// The app's PNG icon, resolved from the freedesktop icon dirs when the index
+/// was loaded. 404 for an unknown app and for one whose `Icon=` has no PNG
+/// (SVG-only themes included): the drawer falls back to a placeholder, so a
+/// missing icon is not an error worth distinguishing.
+///
+/// The path was resolved at index load from the host's own data dirs, never
+/// from the request, so nothing here joins client input into a filesystem
+/// path. The file is re-checked on every request rather than cached: an
+/// icon theme upgrade should show up, and a stat is cheap. What is served
+/// has to *be* a PNG -- signature checked, size bounded on the read itself
+/// and not only on the stat before it -- because the client will hand the
+/// body straight to an image decoder.
+async fn app_icon<R: ProcessRunner>(
+    Path(id): Path<String>,
+    State(state): State<ApiState<R>>,
+    headers: HeaderMap,
+) -> HttpResponse {
+    let Some(path) = state.apps.icon_path(&id).map(std::path::Path::to_path_buf) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    // Waits for a slot rather than answering 429: a drawer refresh fans out
+    // one request per app, and a tile that failed to load is what the user
+    // would see.
+    let Ok(_slot) = Arc::clone(&state.icon_slots).acquire_owned().await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::debug!(app = %id, path = %path.display(), %error, "app icon unreadable");
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    };
+    let metadata = match file.metadata().await {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::debug!(app = %id, path = %path.display(), %error, "app icon unreadable");
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    };
+    if metadata.len() > MAX_ICON_BYTES {
+        tracing::debug!(app = %id, path = %path.display(), size = metadata.len(), "app icon too large to serve");
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let etag = icon_etag(&metadata);
+    if if_none_match_matches(&headers, &etag) {
+        return not_modified(&etag, ICON_CACHE_CONTROL);
+    }
+    match read_png_bounded(file).await {
+        Ok(bytes) => image_response("image/png", &etag, ICON_CACHE_CONTROL, bytes),
+        Err(reason) => {
+            tracing::debug!(app = %id, path = %path.display(), reason, "app icon not served");
+            StatusCode::NOT_FOUND.into_response()
+        }
+    }
+}
+
+/// Reads at most `MAX_ICON_BYTES` from an open file and checks it starts
+/// like a PNG. The bound is on the read, not on a stat taken earlier, so a
+/// file that grows between the two cannot get past it.
+async fn read_png_bounded(file: tokio::fs::File) -> Result<Bytes, &'static str> {
+    let mut bytes = Vec::new();
+    file.take(MAX_ICON_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|_| "read failed")?;
+    if bytes.len() as u64 > MAX_ICON_BYTES {
+        return Err("larger than the icon limit");
+    }
+    if !bytes.starts_with(&PNG_SIGNATURE) {
+        return Err("not a PNG");
+    }
+    Ok(Bytes::from(bytes))
+}
+
+/// `"<mtime ms hex>-<len hex>"`, the same shape as a thumbnail's etag. Both
+/// inputs change when the package manager replaces the file.
+fn icon_etag(metadata: &std::fs::Metadata) -> String {
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default();
+    format!("\"{modified_ms:x}-{:x}\"", metadata.len())
+}
+
+/// Whether any entity tag the client presented matches `etag`. The header is
+/// a comma-separated list; `W/` weak prefixes are ignored on the client side
+/// because `If-None-Match` compares weakly (RFC 9110 §13.1.2), and `*`
+/// matches anything that exists.
+fn if_none_match_matches(headers: &HeaderMap, etag: &str) -> bool {
+    headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .any(|candidate| {
+            candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == etag
+        })
+}
+
+fn validator_headers(etag: &str, cache_control: &'static str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Ok(etag) = HeaderValue::from_str(etag) {
+        headers.insert(header::ETAG, etag);
+    }
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(cache_control),
+    );
+    headers
+}
+
+/// 304 with the validators and no body. axum's router stamps
+/// `Content-Length: 0` on the in-process response, but hyper writes no
+/// `Content-Length` at all for a 304 (it drops an explicit one too), so the
+/// wire is clean without anything done here.
+fn not_modified(etag: &str, cache_control: &'static str) -> HttpResponse {
+    (
+        StatusCode::NOT_MODIFIED,
+        validator_headers(etag, cache_control),
+    )
+        .into_response()
+}
+
+fn image_response(
+    content_type: &'static str,
+    etag: &str,
+    cache_control: &'static str,
+    body: Bytes,
+) -> HttpResponse {
+    let mut headers = validator_headers(etag, cache_control);
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(
+        header::CONTENT_LENGTH,
+        body.len()
+            .to_string()
+            .parse()
+            .expect("a usize content length is always a valid header"),
+    );
+    (StatusCode::OK, headers, body).into_response()
+}
+
 fn is_live_session<R: ProcessRunner>(state: &ApiState<R>, session: &str) -> bool {
     validate_session_name(session).is_ok()
         && state.supervisor.registry().lock().is_ok_and(|registry| {
@@ -901,34 +1105,45 @@ pub async fn dispatch<R: ProcessRunner>(state: &ApiState<R>, request: Request) -
             let _lifecycle = state.lock_session_lifecycle(&session_name).await;
             let result = state.supervisor.start(app, Some(&session_name)).await;
             match result {
-                Ok(session) => match state.blobs.activate(&session.name) {
-                    Err(error) => {
-                        let _ = state.supervisor.kill(&session.name).await;
-                        Err(ApiFailure::internal(format!(
-                            "failed to initialize clipboard blob namespace: {error}"
-                        )))
-                    }
-                    Ok(()) => match state.files.activate_prepared(&session.name) {
+                Ok(session) => {
+                    // The registry has accepted the name, so anything the
+                    // store still holds under it is a previous session's --
+                    // one that exited on its own and was never killed, since
+                    // Kill clears its own entry -- and must not become this
+                    // session's first picture. Done here, not before
+                    // `start`, so a Run rejected for an existing name does
+                    // not wipe that live session's thumbnail; and before the
+                    // bridge starts, so it cannot race a fresh snapshot.
+                    state.thumbnails.remove(&session.name);
+                    match state.blobs.activate(&session.name) {
                         Err(error) => {
-                            let _ = state.blobs.deactivate(&session.name);
                             let _ = state.supervisor.kill(&session.name).await;
                             Err(ApiFailure::internal(format!(
-                                "failed to initialize file drop namespace: {error}"
+                                "failed to initialize clipboard blob namespace: {error}"
                             )))
                         }
-                        Ok(()) => match state.bridges.start(&session) {
-                            Ok(()) => Ok(ResponseResult::Session { session }),
+                        Ok(()) => match state.files.activate_prepared(&session.name) {
                             Err(error) => {
-                                let _ = state.files.deactivate(&session.name);
                                 let _ = state.blobs.deactivate(&session.name);
                                 let _ = state.supervisor.kill(&session.name).await;
                                 Err(ApiFailure::internal(format!(
-                                    "failed to start media bridge: {error}"
+                                    "failed to initialize file drop namespace: {error}"
                                 )))
                             }
+                            Ok(()) => match state.bridges.start(&session) {
+                                Ok(()) => Ok(ResponseResult::Session { session }),
+                                Err(error) => {
+                                    let _ = state.files.deactivate(&session.name);
+                                    let _ = state.blobs.deactivate(&session.name);
+                                    let _ = state.supervisor.kill(&session.name).await;
+                                    Err(ApiFailure::internal(format!(
+                                        "failed to start media bridge: {error}"
+                                    )))
+                                }
+                            },
                         },
-                    },
-                },
+                    }
+                }
                 Err(error) => Err(ApiFailure::from(error)),
             }
         }
@@ -948,7 +1163,16 @@ pub async fn dispatch<R: ProcessRunner>(state: &ApiState<R>, request: Request) -
                         // the still-running session fully usable.
                         let _ = state.blobs.deactivate(&session);
                         let _ = state.files.deactivate(&session);
+                        // Stop first, forget second. `stop` joins the encode
+                        // thread, and that thread drains what is still
+                        // queued -- a `Snapshot` from the last detach, a
+                        // frame -- before it exits, re-putting the picture.
+                        // Removed before the join, it would come back for a
+                        // same-name successor to serve until its first
+                        // frame (see `bridge::tests::
+                        // a_snapshot_queued_before_stop_lands_so_removal_must_follow_the_join`).
                         state.bridges.stop(&session);
+                        state.thumbnails.remove(&session);
                         ResponseResult::Ack
                     })
                     .map_err(ApiFailure::from)
@@ -1085,11 +1309,39 @@ mod tests {
     pub(crate) struct NoopRunner {
         alive: Mutex<BTreeSet<u32>>,
         fail_terminate: bool,
+        /// When set, `spawn` succeeds: it hands out pids and fabricates the
+        /// readiness sockets under this runtime dir, the way the supervisor
+        /// tests' runner does, so a `Run` can reach its success path.
+        spawn_root: Option<std::path::PathBuf>,
+    }
+
+    impl NoopRunner {
+        fn spawning(runtime_dir: std::path::PathBuf) -> Self {
+            Self {
+                spawn_root: Some(runtime_dir),
+                ..Self::default()
+            }
+        }
     }
 
     impl ProcessRunner for NoopRunner {
-        fn spawn(&self, _spec: ProcessSpec) -> io::Result<u32> {
-            Err(io::Error::other("spawn is not used by this test"))
+        fn spawn(&self, spec: ProcessSpec) -> io::Result<u32> {
+            let Some(runtime_dir) = &self.spawn_root else {
+                return Err(io::Error::other("spawn is not used by this test"));
+            };
+            let mut alive = self.alive.lock().unwrap();
+            let pid = alive.iter().next_back().map_or(100, |last| last + 1);
+            alive.insert(pid);
+            std::fs::create_dir_all(runtime_dir)?;
+            for arg in &spec.args {
+                if let Some(display) = arg.strip_prefix("--wayland-display=") {
+                    std::fs::write(runtime_dir.join(display), b"")?;
+                }
+                if let Some(socket) = arg.strip_prefix("--socket=") {
+                    std::fs::write(socket, b"")?;
+                }
+            }
+            Ok(pid)
         }
 
         fn is_alive(&self, pid: u32) -> bool {
@@ -1118,6 +1370,14 @@ mod tests {
             exec: vec!["firefox".into()],
             terminal: false,
         }]);
+        test_state_with(temp, runner, apps)
+    }
+
+    fn test_state_with(
+        temp: &TempDir,
+        runner: Arc<NoopRunner>,
+        apps: AppIndex,
+    ) -> ApiState<NoopRunner> {
         let registry = Registry::open(temp.path().join("registry.json")).unwrap();
         let supervisor = Supervisor::new(
             runner,
@@ -1230,6 +1490,7 @@ mod tests {
         let runner = Arc::new(NoopRunner {
             alive: Mutex::new(BTreeSet::from([10, 11])),
             fail_terminate: true,
+            spawn_root: None,
         });
         let state = test_state_with_runner(&temp, runner);
         add_running_session(&state, "work");
@@ -1266,6 +1527,38 @@ mod tests {
                 .unwrap()
                 .get("work")
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_drops_the_sessions_thumbnail_with_its_other_state() {
+        let temp = TempDir::new().unwrap();
+        let state = test_state(&temp);
+        add_running_session(&state, "work");
+        state.thumbnails.put("work", test_thumbnail(8));
+        state.thumbnails.put("other", test_thumbnail(8));
+
+        let response = dispatch(
+            &state,
+            Request {
+                request_id: 1,
+                command: RequestCommand::Kill {
+                    session: "work".into(),
+                },
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            response.outcome,
+            ResponseOutcome::Ok {
+                result: ResponseResult::Ack
+            }
+        ));
+        assert!(state.thumbnails.get("work").is_none());
+        assert!(
+            state.thumbnails.get("other").is_some(),
+            "only the killed session's thumbnail goes"
         );
     }
 
@@ -2403,5 +2696,303 @@ mod tests {
         let mac: MacAddress = "aa:bb:cc:dd:ee:ff".parse().unwrap();
         assert_eq!(received, 102);
         assert_eq!(&buffer[..received], &navette_wake::magic_packet(mac));
+    }
+
+    fn test_thumbnail(len: usize) -> navette_bridge::Thumbnail {
+        navette_bridge::Thumbnail {
+            jpeg: vec![0xd8; len],
+            width: 320,
+            height: 180,
+        }
+    }
+
+    fn get_with_bearer(uri: &str, token: &str) -> axum::http::request::Builder {
+        axum::http::Request::builder()
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"))
+    }
+
+    #[tokio::test]
+    async fn thumbnail_route_requires_auth_and_revalidates_the_latest_snapshot_by_etag() {
+        let temp = TempDir::new().unwrap();
+        let state = test_state(&temp);
+        add_running_session(&state, "work");
+        add_stopped_session(&state, "stopped");
+        let token = state.auth.render();
+        let thumbnails = state.thumbnails.clone();
+        let app = router(state);
+
+        let unauthenticated = axum::http::Request::builder()
+            .uri("/v1/sessions/work/thumbnail")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(unauthenticated).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        for missing in [
+            "/v1/sessions/nope/thumbnail",
+            "/v1/sessions/stopped/thumbnail",
+            "/v1/sessions/work/thumbnail",
+        ] {
+            let request = get_with_bearer(missing, &token)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::NOT_FOUND,
+                "{missing}: unknown, stopped, and not-yet-snapshotted sessions all 404"
+            );
+        }
+
+        thumbnails.put("work", test_thumbnail(16));
+        let request = get_with_bearer("/v1/sessions/work/thumbnail", &token)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "image/jpeg");
+        assert_eq!(response.headers()["content-length"], "16");
+        assert_eq!(response.headers()["cache-control"], "no-cache");
+        let etag = response.headers()["etag"].to_str().unwrap().to_owned();
+        assert!(etag.starts_with('"') && etag.ends_with('"'), "{etag}");
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap(),
+            vec![0xd8; 16]
+        );
+
+        let revalidate = get_with_bearer("/v1/sessions/work/thumbnail", &token)
+            .header("if-none-match", &etag)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(revalidate).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers()["etag"], etag.as_str());
+        assert_eq!(response.headers()["cache-control"], "no-cache");
+        assert!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // A newer snapshot (different length, so a different etag even in
+        // the same millisecond) makes the client's validator stale.
+        thumbnails.put("work", test_thumbnail(24));
+        let stale = get_with_bearer("/v1/sessions/work/thumbnail", &token)
+            .header("if-none-match", &etag)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(stale).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_ne!(response.headers()["etag"], etag.as_str());
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .len(),
+            24
+        );
+    }
+
+    #[test]
+    fn if_none_match_accepts_lists_weak_tags_and_the_wildcard() {
+        let mut headers = HeaderMap::new();
+        assert!(!if_none_match_matches(&headers, "\"a\""));
+
+        headers.insert("if-none-match", "\"x\", W/\"a\"".parse().unwrap());
+        assert!(if_none_match_matches(&headers, "\"a\""));
+        assert!(if_none_match_matches(&headers, "\"x\""));
+        assert!(!if_none_match_matches(&headers, "\"b\""));
+        assert!(
+            !if_none_match_matches(&headers, "a"),
+            "quotes are part of the tag"
+        );
+
+        headers.insert("if-none-match", "*".parse().unwrap());
+        assert!(if_none_match_matches(&headers, "\"anything\""));
+    }
+
+    /// A `.desktop` naming `Icon=fooapp` next to a `hicolor/64x64` PNG under
+    /// a private data root, so the test never depends on the host's themes.
+    fn state_with_icon_index(temp: &TempDir) -> (ApiState<NoopRunner>, Vec<u8>) {
+        let apps_dir = temp.path().join("applications");
+        let data_dir = temp.path().join("share");
+        std::fs::create_dir_all(&apps_dir).unwrap();
+        for (file, icon) in [("foo.desktop", "Icon=fooapp\n"), ("bare.desktop", "")] {
+            std::fs::write(
+                apps_dir.join(file),
+                format!("[Desktop Entry]\nType=Application\nName={file}\nExec=/bin/echo\n{icon}"),
+            )
+            .unwrap();
+        }
+        let png = data_dir.join("icons/hicolor/64x64/apps/fooapp.png");
+        std::fs::create_dir_all(png.parent().unwrap()).unwrap();
+        let bytes = b"\x89PNG\r\n\x1a\nfake".to_vec();
+        std::fs::write(&png, &bytes).unwrap();
+        let apps = AppIndex::load_from_paths(
+            vec![apps_dir],
+            &[],
+            &["kde".into()],
+            "/bin".as_ref(),
+            &[data_dir],
+        );
+        assert!(apps.get("foo").is_some() && apps.get("bare").is_some());
+        (
+            test_state_with(temp, Arc::new(NoopRunner::default()), apps),
+            bytes,
+        )
+    }
+
+    #[tokio::test]
+    async fn icon_route_serves_the_resolved_png_and_revalidates_by_etag() {
+        let temp = TempDir::new().unwrap();
+        let (state, png) = state_with_icon_index(&temp);
+        let token = state.auth.render();
+        let app = router(state);
+
+        let unauthenticated = axum::http::Request::builder()
+            .uri("/v1/apps/foo/icon")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(unauthenticated).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let request = get_with_bearer("/v1/apps/foo/icon", &token)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "image/png");
+        assert_eq!(response.headers()["cache-control"], "max-age=3600");
+        assert_eq!(
+            response.headers()["content-length"],
+            png.len().to_string().as_str()
+        );
+        let etag = response.headers()["etag"].to_str().unwrap().to_owned();
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap(),
+            png
+        );
+
+        let revalidate = get_with_bearer("/v1/apps/foo/icon", &token)
+            .header("if-none-match", &etag)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(revalidate).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers()["etag"], etag.as_str());
+        assert!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        for missing in ["/v1/apps/bare/icon", "/v1/apps/nope/icon"] {
+            let request = get_with_bearer(missing, &token)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::NOT_FOUND,
+                "{missing}: no resolvable PNG and unknown app both 404"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn icon_route_refuses_an_oversized_or_vanished_file() {
+        let temp = TempDir::new().unwrap();
+        let (state, _png) = state_with_icon_index(&temp);
+        let token = state.auth.render();
+        let path = state.apps.icon_path("foo").unwrap().to_path_buf();
+        let app = router(state);
+
+        std::fs::write(&path, vec![0u8; MAX_ICON_BYTES as usize + 1]).unwrap();
+        let request = get_with_bearer("/v1/apps/foo/icon", &token)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "a file over the icon limit is not read, let alone served"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        let request = get_with_bearer("/v1/apps/foo/icon", &token)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "an icon removed after index load 404s rather than erroring"
+        );
+    }
+
+    /// Item 4a: the file the index resolved must actually be a PNG. A theme
+    /// that ships something else under a `.png` name gets a placeholder on
+    /// the phone, not a body the client would try to decode.
+    #[tokio::test]
+    async fn icon_route_refuses_a_file_without_a_png_signature() {
+        let temp = TempDir::new().unwrap();
+        let (state, _png) = state_with_icon_index(&temp);
+        let token = state.auth.render();
+        let path = state.apps.icon_path("foo").unwrap().to_path_buf();
+        let app = router(state);
+
+        std::fs::write(&path, b"<svg xmlns='http://www.w3.org/2000/svg'/>").unwrap();
+        let request = get_with_bearer("/v1/apps/foo/icon", &token)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// Item 1: a name can be reused only after its previous session is gone
+    /// from the registry; whatever the store still holds under that name
+    /// belongs to the dead session and must not be served as the new one's
+    /// first picture.
+    #[tokio::test]
+    async fn run_starts_a_reused_name_with_no_stale_thumbnail() {
+        let temp = TempDir::new().unwrap();
+        let runner = Arc::new(NoopRunner::spawning(temp.path().join("runtime")));
+        let state = test_state_with_runner(&temp, runner);
+        state.thumbnails.put("work", test_thumbnail(8));
+
+        let response = dispatch(
+            &state,
+            Request {
+                request_id: 1,
+                command: RequestCommand::Run {
+                    app_id: "firefox".into(),
+                    name: Some("work".into()),
+                },
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(
+                response.outcome,
+                ResponseOutcome::Ok {
+                    result: ResponseResult::Session { .. }
+                }
+            ),
+            "{response:?}"
+        );
+        assert!(
+            state.thumbnails.get("work").is_none(),
+            "a stale entry under a reused name must be cleared before the new session serves"
+        );
     }
 }

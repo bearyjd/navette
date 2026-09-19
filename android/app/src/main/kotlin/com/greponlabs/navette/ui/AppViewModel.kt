@@ -9,7 +9,11 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.greponlabs.navette.net.ConnectionState
 import com.greponlabs.navette.net.EncryptedPairingStore
+import com.greponlabs.navette.net.HttpImageFetcher
 import com.greponlabs.navette.net.HttpWakeTransport
+import com.greponlabs.navette.net.ImageCache
+import com.greponlabs.navette.net.ImageFetcher
+import com.greponlabs.navette.net.ImageRepository
 import com.greponlabs.navette.net.NavetteApi
 import com.greponlabs.navette.net.NavetteClient
 import com.greponlabs.navette.net.Pairing
@@ -51,6 +55,14 @@ data class AppUiState(
     val showingHosts: Boolean = false,
     val addingHost: Boolean = false,
     val wake: WakeUiState = WakeUiState.Idle,
+    /**
+     * Bumped once per completed refresh call -- a round-trip that got answers,
+     * error responses included, but not one that threw -- so the drawer's
+     * session thumbnails revalidate at exactly the cadence of the session list
+     * they sit beside: no timer of their own, and nothing while the host is
+     * not answering at all.
+     */
+    val refreshTick: Int = 0,
 ) {
     /**
      * The wake the user can send right now, resolved from [pairing] rather than
@@ -160,9 +172,9 @@ sealed interface AppEvent {
  * [pairingStore] is the single source of truth for the encrypted host
  * registry and active host -- see [AppEvent.Paired] and the `init` block
  * below, which resumes that active host on every fresh launch. [clientFactory]
- * and [wakeTransport] default to the real [NavetteClient] and
- * [HttpWakeTransport] but are overridable so tests can inject fakes instead of
- * standing up real networking -- see `AppViewModelTest`.
+ * [wakeTransport] and [imageFetcher] default to the real [NavetteClient],
+ * [HttpWakeTransport] and [HttpImageFetcher] but are overridable so tests can
+ * inject fakes instead of standing up real networking -- see `AppViewModelTest`.
  */
 class AppViewModel(
     private val pairingStore: PairingStore,
@@ -170,9 +182,18 @@ class AppViewModel(
         NavetteClient(controlWebSocketUrl(pairing.host, pairing.port), token = pairing.token)
     },
     private val wakeTransport: WakeTransport = HttpWakeTransport(),
+    imageFetcher: ImageFetcher = HttpImageFetcher(),
 ) : ViewModel() {
     private val _state = MutableStateFlow(AppUiState())
     val state: StateFlow<AppUiState> = _state.asStateFlow()
+
+    /**
+     * The drawer's thumbnails and icons. Lives here, not in the screen, so the
+     * cache survives the drawer leaving composition for a session and coming
+     * back; cleared wherever the pairing changes so one host's images are
+     * never shown for another -- see [connectWithPairing] and [deleteHost].
+     */
+    val imageRepository = ImageRepository(imageFetcher, ImageCache(), viewModelScope)
 
     private var client: NavetteApi? = null
 
@@ -344,6 +365,7 @@ class AppViewModel(
         wakeJob?.cancel()
         client?.close()
         client = null
+        imageRepository.clear()
         _state.update {
             it.copy(
                 pairing = null, registry = updated, connection = ConnectionState.Disconnected,
@@ -419,6 +441,10 @@ class AppViewModel(
         refreshJob?.cancel()
         wakeJob?.cancel()
         client?.close()
+        // Every pairing change funnels through here (init, pair, reconnect,
+        // selectHost), so this is the one place the image cache needs clearing
+        // for host A's thumbnails never to appear on host B's drawer.
+        imageRepository.clear()
         // A reconnect must not leave the user on a session screen belonging to
         // the connection being replaced, nor carry a wake verdict that was
         // advice for the previous attempt.
@@ -461,6 +487,7 @@ class AppViewModel(
                             sessions = sessionsResponse.sessionsOrNull() ?: it.sessions,
                             isLoading = false,
                             snackbarMessage = firstError?.message ?: it.snackbarMessage,
+                            refreshTick = it.refreshTick + 1,
                         )
                     }
                 } catch (error: CancellationException) {

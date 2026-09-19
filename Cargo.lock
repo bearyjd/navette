@@ -1144,6 +1144,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "jpeg-encoder"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0370574b86f7eca156b9f298392b5e69a23f8c86f3f865add60bbc2e79467a6"
+
+[[package]]
 name = "js-sys"
 version = "0.3.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1397,6 +1403,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "calloop",
+ "jpeg-encoder",
  "navette-protocol",
  "nix 0.30.1",
  "tempfile",
@@ -1471,6 +1478,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "bytes",
  "calloop",
  "clap",
  "freedesktop-desktop-entry",

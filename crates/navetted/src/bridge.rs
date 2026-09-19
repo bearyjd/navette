@@ -26,6 +26,7 @@ use crate::blobs::BlobStore;
 use crate::clipboard::{ClipboardSync, GuestEvent, SyncAction};
 use crate::file_transfers::FileTransferStore;
 use crate::media::{MediaCommand, MediaHub};
+use crate::thumbnails::{ThumbnailCapture, ThumbnailStore};
 
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(100);
 /// Report an iteration, or a waiting keystroke, at or above this. 20ms is
@@ -40,6 +41,9 @@ pub struct BridgeManager {
     media: MediaHub,
     blobs: BlobStore,
     transfers: Option<FileTransferStore>,
+    /// Shared with the API, which serves from it; each session's encode
+    /// thread writes its own entry.
+    thumbnails: ThumbnailStore,
     workers: Arc<Mutex<HashMap<String, BridgeHandle>>>,
 }
 
@@ -57,11 +61,12 @@ impl BridgeHandle {
 }
 
 impl BridgeManager {
-    pub fn new(media: MediaHub, blobs: BlobStore) -> Self {
+    pub fn new(media: MediaHub, blobs: BlobStore, thumbnails: ThumbnailStore) -> Self {
         Self {
             media,
             blobs,
             transfers: None,
+            thumbnails,
             workers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -69,11 +74,17 @@ impl BridgeManager {
     /// File materialization never runs on the wprs/calloop render thread.
     /// Keep its ownership here with the per-session bridge lifecycle while a
     /// dedicated short-lived worker performs filesystem work.
-    pub fn with_transfers(media: MediaHub, blobs: BlobStore, transfers: FileTransferStore) -> Self {
+    pub fn with_transfers(
+        media: MediaHub,
+        blobs: BlobStore,
+        transfers: FileTransferStore,
+        thumbnails: ThumbnailStore,
+    ) -> Self {
         Self {
             media,
             blobs,
             transfers: Some(transfers),
+            thumbnails,
             workers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -121,6 +132,7 @@ impl BridgeManager {
         let worker_stop = Arc::clone(&stop);
         let media = self.media.clone();
         let blobs = self.blobs.clone();
+        let thumbnails = self.thumbnails.clone();
         let name = session.name.clone();
         let worker_name = name.clone();
         let socket = PathBuf::from(&session.socket_path);
@@ -132,6 +144,7 @@ impl BridgeManager {
                     socket,
                     media.clone(),
                     blobs,
+                    thumbnails,
                     input,
                     worker_stop,
                 ) {
@@ -245,6 +258,7 @@ fn run_bridge(
     socket: PathBuf,
     media: MediaHub,
     blobs: BlobStore,
+    thumbnails: ThumbnailStore,
     mut commands: tokio::sync::mpsc::Receiver<MediaCommand>,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -267,7 +281,7 @@ fn run_bridge(
         let media = media.clone();
         thread::Builder::new()
             .name("navette-encode".to_owned())
-            .spawn(move || encode_loop(session, media, queue))
+            .spawn(move || encode_loop(session, media, thumbnails, queue))
             .context("failed to start the encode thread")?
     };
     let mut worker = WorkerState {
@@ -750,7 +764,15 @@ fn pump_input(
                 }
             }
             MediaCommand::Disconnected { attachment_id } => {
-                input_state.disconnect(attachment_id, io.transport)
+                input_state.disconnect(attachment_id, io.transport);
+                // `MediaAttachment::drop` removes the client from the hub
+                // *before* it sends this, so a zero count here means this
+                // was the last one. The drawer's tile for a detached session
+                // should be what it looked like at the moment of leaving,
+                // not up to ten seconds earlier, hence the explicit request.
+                if io.media.active_clients(io.session) == 0 {
+                    io.encode.submit(EncodeCommand::Snapshot);
+                }
             }
         }
     }
@@ -762,7 +784,7 @@ fn encode_frame(
     media: &MediaHub,
     streams: &mut HashMap<SurfaceKey, StreamState>,
     key: SurfaceKey,
-    frame: Frame,
+    frame: &Frame,
 ) -> Result<()> {
     let stream = match streams.entry(key) {
         std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -793,7 +815,7 @@ fn encode_frame(
         stream.force_keyframe = true;
         stream.discontinuity = true;
     }
-    let encoded = stream.encoder.encode(&frame, stream.force_keyframe)?;
+    let encoded = stream.encoder.encode(frame, stream.force_keyframe)?;
     stream.force_keyframe = false;
     if let Some(codec_config) = encoded.codec_config {
         stream.sequence = stream.sequence.saturating_add(1);
@@ -846,6 +868,10 @@ enum EncodeCommand {
     ClientGone {
         client_id: u64,
     },
+    /// Refresh the session thumbnail from the retained frame now, outside the
+    /// periodic schedule. Sent when the last client detaches, so the drawer
+    /// shows the session as it was left.
+    Snapshot,
 }
 
 /// Queue between the bridge loop and the encode thread.
@@ -921,6 +947,17 @@ impl EncodeQueue {
                 inner.superseded.retain(|key| key.client_id != client_id);
             }
             EncodeCommand::ForceKeyframeAll => {}
+            EncodeCommand::Snapshot => {
+                // Two detaches before the thread gets to either want one
+                // picture, not two.
+                if inner
+                    .queue
+                    .iter()
+                    .any(|queued| matches!(queued, EncodeCommand::Snapshot))
+                {
+                    return;
+                }
+            }
         }
         inner.queue.push_back(command);
         self.signal.notify_one();
@@ -974,12 +1011,19 @@ fn pop_next(inner: &mut QueueInner) -> Option<(EncodeCommand, bool)> {
 
 /// Applies one command to the stream map. Shared by the encode thread and by
 /// tests, which drive it synchronously so they can inspect the result.
+///
+/// Thumbnail bookkeeping lives here too, after the video encode: the frame is
+/// already on this thread, and the JPEG it produces once every ten seconds
+/// (a few milliseconds) is not worth another thread or another copy. The
+/// attached client's frame goes out first; the drawer can wait.
 fn apply_encode_command(
     session: &str,
     media: &MediaHub,
     streams: &mut HashMap<SurfaceKey, StreamState>,
+    thumbnails: &mut ThumbnailCapture,
     command: EncodeCommand,
     superseded: bool,
+    now: Instant,
 ) {
     match command {
         EncodeCommand::Frame { key, frame } => {
@@ -988,13 +1032,20 @@ fn apply_encode_command(
                 // so the stream really is missing data and must say so.
                 stream.discontinuity = true;
             }
-            if let Err(error) = encode_frame(session, media, streams, key, frame) {
+            if let Err(error) = encode_frame(session, media, streams, key, &frame) {
                 tracing::warn!(?key, %error, "failed to encode captured frame");
             }
+            // Independent of whether the video encode succeeded: a session
+            // whose FFmpeg is unhappy still has a picture worth showing.
+            thumbnails.observe(key, &frame, now);
         }
         EncodeCommand::ForceKeyframeAll => force_keyframe_on_all_streams(streams),
-        EncodeCommand::EndStream { key } => end_stream(session, media, streams, key),
+        EncodeCommand::EndStream { key } => {
+            thumbnails.forget_surface(key);
+            end_stream(session, media, streams, key);
+        }
         EncodeCommand::ClientGone { client_id } => {
+            thumbnails.forget_client(client_id);
             let keys: Vec<SurfaceKey> = streams
                 .keys()
                 .filter(|key| key.client_id == client_id)
@@ -1004,14 +1055,31 @@ fn apply_encode_command(
                 end_stream(session, media, streams, key);
             }
         }
+        EncodeCommand::Snapshot => {
+            thumbnails.snapshot_kept(now);
+        }
     }
 }
 
 /// Owns every encoder for one session, on a thread of its own.
-fn encode_loop(session: String, media: MediaHub, queue: Arc<EncodeQueue>) {
+fn encode_loop(
+    session: String,
+    media: MediaHub,
+    thumbnails: ThumbnailStore,
+    queue: Arc<EncodeQueue>,
+) {
     let mut streams: HashMap<SurfaceKey, StreamState> = HashMap::new();
+    let mut thumbnails = ThumbnailCapture::new(&session, thumbnails);
     while let Some((command, superseded)) = queue.next() {
-        apply_encode_command(&session, &media, &mut streams, command, superseded);
+        apply_encode_command(
+            &session,
+            &media,
+            &mut streams,
+            &mut thumbnails,
+            command,
+            superseded,
+            Instant::now(),
+        );
     }
     tracing::debug!("encode pipeline stopped");
 }
@@ -1025,9 +1093,26 @@ fn drain_encode_queue(
     media: &MediaHub,
     queue: &EncodeQueue,
     streams: &mut HashMap<SurfaceKey, StreamState>,
+    thumbnails: &mut ThumbnailCapture,
+) {
+    drain_encode_queue_at(session, media, queue, streams, thumbnails, Instant::now());
+}
+
+/// `drain_encode_queue` with the clock injected, for tests that assert on
+/// the thumbnail policy's timing without sleeping through it.
+#[cfg(test)]
+fn drain_encode_queue_at(
+    session: &str,
+    media: &MediaHub,
+    queue: &EncodeQueue,
+    streams: &mut HashMap<SurfaceKey, StreamState>,
+    thumbnails: &mut ThumbnailCapture,
+    now: Instant,
 ) {
     while let Some((command, superseded)) = queue.try_next() {
-        apply_encode_command(session, media, streams, command, superseded);
+        apply_encode_command(
+            session, media, streams, thumbnails, command, superseded, now,
+        );
     }
 }
 
@@ -1261,6 +1346,13 @@ mod tests {
         HashMap::new()
     }
 
+    /// The thumbnail policy the encode thread would own. Tests that assert
+    /// on streams and packets need one to drive the queue but never read
+    /// it; the ones that care build their own on a store they keep.
+    fn thumbnails_fixture() -> ThumbnailCapture {
+        ThumbnailCapture::new("s1", ThumbnailStore::default())
+    }
+
     #[test]
     fn normalize_frame_pads_odd_dimensions_and_preserves_pixel_rows() {
         // 3x3 source: three rows, each with a distinguishable byte value, so
@@ -1313,7 +1405,11 @@ mod tests {
     fn start_reaps_a_dead_worker_and_restarts_the_session() {
         let media = MediaHub::default();
         let dir = tempfile::tempdir().unwrap();
-        let manager = BridgeManager::new(media.clone(), BlobStore::new(dir.path().join("blobs")));
+        let manager = BridgeManager::new(
+            media.clone(),
+            BlobStore::new(dir.path().join("blobs")),
+            ThumbnailStore::default(),
+        );
 
         let dead_socket = dir.path().join("no-such-socket");
         let dead_session = session_fixture("dead", dead_socket.to_string_lossy().into_owned());
@@ -1374,6 +1470,7 @@ mod tests {
         let scene = scene_with_toplevels(&[(1, 1), (1, 2)]);
         let mut worker = worker_fixture(scene);
         let mut streams = streams_fixture();
+        let mut thumbnails = thumbnails_fixture();
         let key1 = SurfaceKey {
             client_id: 1,
             surface_id: 1,
@@ -1392,7 +1489,7 @@ mod tests {
                 SceneEvent::SurfaceCommitted(key2),
             ],
         );
-        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams, &mut thumbnails);
 
         assert_eq!(streams.len(), 2);
         let stream1_id = streams[&key1].id;
@@ -1428,7 +1525,7 @@ mod tests {
         // Publishing another frame to just one stream must not disturb the
         // other's sequence numbering.
         let frame = normalize_frame(worker.scene.compose_toplevel(key1).unwrap());
-        encode_frame("s1", &media, &mut streams, key1, frame).unwrap();
+        encode_frame("s1", &media, &mut streams, key1, &frame).unwrap();
         assert!(streams[&key1].sequence > 2);
         assert_eq!(
             streams[&key2].sequence, 2,
@@ -1458,6 +1555,7 @@ mod tests {
         let scene = scene_with_toplevels(&[(1, 1), (1, 2)]);
         let mut worker = worker_fixture(scene);
         let mut streams = streams_fixture();
+        let mut thumbnails = thumbnails_fixture();
         let key1 = SurfaceKey {
             client_id: 1,
             surface_id: 1,
@@ -1468,7 +1566,7 @@ mod tests {
         };
 
         apply_scene_batch(&mut worker, vec![SceneEvent::SurfaceCommitted(key1)]);
-        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams, &mut thumbnails);
 
         assert_eq!(
             streams.len(),
@@ -1494,7 +1592,7 @@ mod tests {
         // surface would coalesce, which is right in production but would make
         // this test measure one frame where it means to measure two.
         apply_scene_batch(&mut worker, vec![SceneEvent::SurfaceCommitted(key2)]);
-        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams, &mut thumbnails);
         assert_eq!(streams.len(), 2);
         let sequence1 = streams[&key1].sequence;
         for expected in [MediaKind::StreamConfig, MediaKind::Video] {
@@ -1504,7 +1602,7 @@ mod tests {
         }
 
         apply_scene_batch(&mut worker, vec![SceneEvent::SurfaceCommitted(key2)]);
-        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams, &mut thumbnails);
         assert_eq!(
             streams[&key1].sequence, sequence1,
             "a commit to one window must not advance another window's stream"
@@ -1528,6 +1626,7 @@ mod tests {
         let scene = scene_with_toplevel_and_subsurface(1, 1, 2);
         let mut worker = worker_fixture(scene);
         let mut streams = streams_fixture();
+        let mut thumbnails = thumbnails_fixture();
         let toplevel = SurfaceKey {
             client_id: 1,
             surface_id: 1,
@@ -1538,7 +1637,7 @@ mod tests {
         };
 
         apply_scene_batch(&mut worker, vec![SceneEvent::SurfaceCommitted(child)]);
-        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams, &mut thumbnails);
 
         assert!(
             streams.contains_key(&toplevel),
@@ -1558,7 +1657,7 @@ mod tests {
 
         let sequence = streams[&toplevel].sequence;
         apply_scene_batch(&mut worker, vec![SceneEvent::SurfaceCommitted(child)]);
-        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams, &mut thumbnails);
         assert_eq!(streams[&toplevel].id, stream);
         assert!(
             streams[&toplevel].sequence > sequence,
@@ -1581,6 +1680,7 @@ mod tests {
         let scene = scene_with_toplevels(&[(1, 1), (2, 1)]);
         let mut worker = worker_fixture(scene);
         let mut streams = streams_fixture();
+        let mut thumbnails = thumbnails_fixture();
         let key_a = SurfaceKey {
             client_id: 1,
             surface_id: 1,
@@ -1597,14 +1697,14 @@ mod tests {
                 SceneEvent::SurfaceCommitted(key_b),
             ],
         );
-        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams, &mut thumbnails);
         assert_eq!(streams.len(), 2);
         for _ in 0..4 {
             recv_packet(&client).await; // drain the initial config+video pairs
         }
 
         apply_scene_batch(&mut worker, vec![SceneEvent::ClientDisconnected(1)]);
-        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams, &mut thumbnails);
         assert!(!streams.contains_key(&key_a));
         assert!(streams.contains_key(&key_b));
         assert_eq!(
@@ -1615,7 +1715,7 @@ mod tests {
         assert_eq!(end_a.header.kind, MediaKind::StreamEnd);
 
         apply_scene_batch(&mut worker, vec![SceneEvent::SurfaceDestroyed(key_b)]);
-        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams, &mut thumbnails);
         assert!(streams.is_empty());
         let end_b = recv_packet(&client).await;
         assert_eq!(end_b.header.kind, MediaKind::StreamEnd);
@@ -1650,6 +1750,7 @@ mod tests {
 
         let mut worker = worker_fixture(scene_with_toplevels(&[(1, 1)]));
         let mut streams = streams_fixture();
+        let mut thumbnails = thumbnails_fixture();
         let key = SurfaceKey {
             client_id: 1,
             surface_id: 1,
@@ -1658,7 +1759,7 @@ mod tests {
         // Establish the stream first: a brand-new stream's first frame is
         // always a discontinuity, which would mask the flag under test.
         apply_scene_batch(&mut worker, vec![SceneEvent::SurfaceCommitted(key)]);
-        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams, &mut thumbnails);
         drain_packets(&client).await;
         assert!(
             !streams[&key].discontinuity,
@@ -1669,7 +1770,7 @@ mod tests {
         // first while it is still queued.
         apply_scene_batch(&mut worker, vec![SceneEvent::SurfaceCommitted(key)]);
         apply_scene_batch(&mut worker, vec![SceneEvent::SurfaceCommitted(key)]);
-        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams, &mut thumbnails);
 
         let published = drain_packets(&client).await;
         let video: Vec<_> = published
@@ -1702,13 +1803,14 @@ mod tests {
 
         let mut worker = worker_fixture(scene_with_toplevels(&[(1, 1)]));
         let mut streams = streams_fixture();
+        let mut thumbnails = thumbnails_fixture();
         let key = SurfaceKey {
             client_id: 1,
             surface_id: 1,
         };
 
         apply_scene_batch(&mut worker, vec![SceneEvent::SurfaceCommitted(key)]);
-        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams, &mut thumbnails);
         drain_packets(&client).await;
 
         // Commit then destroy in one batch: the frame is queued behind nothing
@@ -1720,7 +1822,7 @@ mod tests {
                 SceneEvent::SurfaceDestroyed(key),
             ],
         );
-        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams, &mut thumbnails);
 
         let published = drain_packets(&client).await;
         assert!(
@@ -1754,6 +1856,7 @@ mod tests {
 
         let mut worker = worker_fixture(scene_with_toplevels(&[(1, 1)]));
         let mut streams = streams_fixture();
+        let mut thumbnails = thumbnails_fixture();
         let key = SurfaceKey {
             client_id: 1,
             surface_id: 1,
@@ -1768,7 +1871,7 @@ mod tests {
                 SceneEvent::SurfaceDestroyed(key),
             ],
         );
-        drain_encode_queue("s1", &media, &worker.encode, &mut streams);
+        drain_encode_queue("s1", &media, &worker.encode, &mut streams, &mut thumbnails);
 
         assert!(
             worker.pending_composites.is_empty(),
@@ -2435,7 +2538,9 @@ mod tests {
         let thread = {
             let queue = Arc::clone(&queue);
             let media = media.clone();
-            thread::spawn(move || encode_loop("s1".to_owned(), media, queue))
+            thread::spawn(move || {
+                encode_loop("s1".to_owned(), media, ThumbnailStore::default(), queue)
+            })
         };
 
         queue.submit(EncodeCommand::Frame { key, frame });
@@ -2450,6 +2555,244 @@ mod tests {
             kinds,
             vec![MediaKind::StreamConfig, MediaKind::Video],
             "the queued frame must be encoded and published before the thread exits"
+        );
+    }
+
+    fn solid_frame(width: u32, height: u32) -> Frame {
+        Frame {
+            width,
+            height,
+            pixels: vec![0x40; width as usize * height as usize * 4],
+        }
+    }
+
+    /// `EncodeCommand::Snapshot` is the detach path: it must serve the frame
+    /// the worker retained, do nothing when there is none, and never
+    /// resurrect a window whose stream has ended. None of it depends on
+    /// FFmpeg -- the thumbnail is taken from the frame whether or not the
+    /// video encode behind it succeeded -- so this runs on a bare runner.
+    #[test]
+    fn a_snapshot_command_uses_the_kept_frame_and_is_a_no_op_without_one() {
+        let media = MediaHub::default();
+        let _input = media.register_session("s1");
+        let store = ThumbnailStore::default();
+        let mut thumbnails = ThumbnailCapture::new("s1", store.clone());
+        let mut streams = streams_fixture();
+        let queue = EncodeQueue::new();
+        let key = SurfaceKey {
+            client_id: 1,
+            surface_id: 1,
+        };
+        let start = Instant::now();
+        let second = Duration::from_secs(1);
+
+        queue.submit(EncodeCommand::Snapshot);
+        drain_encode_queue_at("s1", &media, &queue, &mut streams, &mut thumbnails, start);
+        assert!(
+            store.get("s1").is_none(),
+            "nothing retained yet, so nothing to snapshot"
+        );
+
+        queue.submit(EncodeCommand::Frame {
+            key,
+            frame: solid_frame(128, 64),
+        });
+        drain_encode_queue_at("s1", &media, &queue, &mut streams, &mut thumbnails, start);
+        let first = store
+            .get("s1")
+            .expect("the first frame through the worker snapshots immediately");
+        assert_eq!((first.width, first.height), (128, 64));
+
+        // Past the detach floor, so the request is honoured.
+        store.remove("s1");
+        queue.submit(EncodeCommand::Snapshot);
+        drain_encode_queue_at(
+            "s1",
+            &media,
+            &queue,
+            &mut streams,
+            &mut thumbnails,
+            start + second,
+        );
+        let again = store
+            .get("s1")
+            .expect("a detach snapshot comes from the retained frame");
+        assert_eq!((again.width, again.height), (128, 64));
+
+        queue.submit(EncodeCommand::EndStream { key });
+        store.remove("s1");
+        queue.submit(EncodeCommand::Snapshot);
+        drain_encode_queue_at(
+            "s1",
+            &media,
+            &queue,
+            &mut streams,
+            &mut thumbnails,
+            start + 2 * second,
+        );
+        assert!(
+            store.get("s1").is_none(),
+            "a destroyed window's frame must not be resurrected by a later detach"
+        );
+    }
+
+    /// The thumbnail policy itself is tested in `thumbnails.rs`; this is the
+    /// wiring: a second, larger toplevel through the same worker becomes the
+    /// retained frame, and `ClientGone` for its client forgets it.
+    #[test]
+    fn the_worker_retains_the_larger_toplevel_and_forgets_it_with_its_client() {
+        let media = MediaHub::default();
+        let _input = media.register_session("s1");
+        let store = ThumbnailStore::default();
+        let mut thumbnails = ThumbnailCapture::new("s1", store.clone());
+        let mut streams = streams_fixture();
+        let queue = EncodeQueue::new();
+        let small = SurfaceKey {
+            client_id: 1,
+            surface_id: 1,
+        };
+        let large = SurfaceKey {
+            client_id: 2,
+            surface_id: 1,
+        };
+
+        let start = Instant::now();
+        let second = Duration::from_secs(1);
+
+        queue.submit(EncodeCommand::Frame {
+            key: small,
+            frame: solid_frame(64, 32),
+        });
+        drain_encode_queue_at("s1", &media, &queue, &mut streams, &mut thumbnails, start);
+        // Past the keep interval, so the larger frame is allowed to replace
+        // the retained one without waiting for it to go stale.
+        queue.submit(EncodeCommand::Frame {
+            key: large,
+            frame: solid_frame(256, 128),
+        });
+        drain_encode_queue_at(
+            "s1",
+            &media,
+            &queue,
+            &mut streams,
+            &mut thumbnails,
+            start + second,
+        );
+
+        store.remove("s1");
+        queue.submit(EncodeCommand::Snapshot);
+        drain_encode_queue_at(
+            "s1",
+            &media,
+            &queue,
+            &mut streams,
+            &mut thumbnails,
+            start + 2 * second,
+        );
+        let stored = store.get("s1").unwrap();
+        assert_eq!((stored.width, stored.height), (256, 128));
+
+        queue.submit(EncodeCommand::ClientGone { client_id: 2 });
+        store.remove("s1");
+        queue.submit(EncodeCommand::Snapshot);
+        drain_encode_queue_at(
+            "s1",
+            &media,
+            &queue,
+            &mut streams,
+            &mut thumbnails,
+            start + 3 * second,
+        );
+        assert!(store.get("s1").is_none());
+    }
+
+    #[test]
+    fn snapshot_requests_coalesce_in_the_queue() {
+        let queue = EncodeQueue::new();
+        queue.submit(EncodeCommand::Snapshot);
+        queue.submit(EncodeCommand::Snapshot);
+
+        assert!(matches!(
+            queue.try_next(),
+            Some((EncodeCommand::Snapshot, _))
+        ));
+        assert!(
+            queue.try_next().is_none(),
+            "two detaches before the thread runs want one picture, not two"
+        );
+    }
+
+    /// The render loop asks for a snapshot when the *last* client leaves --
+    /// `MediaAttachment::drop` has already removed it from the hub by the
+    /// time `Disconnected` is pumped -- and not while another is still
+    /// attached, whose own periodic snapshots are enough.
+    #[test]
+    fn only_the_last_client_detaching_requests_a_snapshot() {
+        let mut fixture = ClipboardFixture::new();
+        let second = fixture.media.attach("s1").unwrap();
+
+        drop(second);
+        fixture.pump();
+        assert!(
+            fixture.worker.encode.try_next().is_none(),
+            "a client is still attached: no snapshot requested"
+        );
+
+        fixture.client = None;
+        fixture.pump();
+        assert!(matches!(
+            fixture.worker.encode.try_next(),
+            Some((EncodeCommand::Snapshot, _))
+        ));
+        assert!(fixture.worker.encode.try_next().is_none());
+    }
+
+    /// Item 1, the encode-thread half of the Kill ordering. `EncodeQueue::stop`
+    /// does not discard queued work -- `next()` drains it before honouring
+    /// `stopped` -- so a `Snapshot` queued by the last client's detach still
+    /// lands in the store while `BridgeManager::stop` is joining the thread.
+    /// The Kill arm in `api::dispatch` therefore stops the bridge *first* and
+    /// removes the thumbnail *after*; this pins the queue behaviour that makes
+    /// the other order wrong.
+    #[test]
+    fn a_snapshot_queued_before_stop_lands_so_removal_must_follow_the_join() {
+        let media = MediaHub::default();
+        let _input = media.register_session("s1");
+        let store = ThumbnailStore::default();
+        let key = SurfaceKey {
+            client_id: 1,
+            surface_id: 1,
+        };
+
+        // Seed the capture with a frame well before the detach so the floor
+        // on detach snapshots (item 5) does not mask the ordering hazard.
+        let mut thumbnails = ThumbnailCapture::new("s1", store.clone());
+        let start = Instant::now();
+        thumbnails.observe(key, &solid_frame(64, 64), start);
+        let queue = Arc::new(EncodeQueue::new());
+        queue.submit(EncodeCommand::Snapshot);
+
+        // Wrong order: forget, then stop. The queued snapshot outlives the
+        // removal.
+        store.remove("s1");
+        drain_encode_queue_at(
+            "s1",
+            &media,
+            &queue,
+            &mut streams_fixture(),
+            &mut thumbnails,
+            start + Duration::from_secs(5),
+        );
+        assert!(
+            store.get("s1").is_some(),
+            "a Snapshot queued before stop is drained by it and re-puts the picture"
+        );
+
+        // The Kill order: stop and join (drained above), then remove.
+        store.remove("s1");
+        assert!(
+            store.get("s1").is_none(),
+            "removing after the encode thread is joined leaves nothing for a successor"
         );
     }
 }
