@@ -3085,9 +3085,19 @@ is "moot today" — it is the part that will matter.
 - Split `HttpFileTransferTransport` out of the 759-line coordinator.
 - `ActiveTransfer.finished` is a structural guard with no test that detects its
   removal — defensive, not observed behaviour.
-- **On-device verification of the Android flow has not been done.** All Android
-  coverage is JVM unit tests (27 coordinator cases). The picker → upload → delivered
-  path on a real phone against a real daemon is the next thing to run.
+- ~~On-device verification of the Android flow has not been done.~~ **Done
+  2026-09-19** on the Pixel 10 Pro Fold over the tailnet (`tower` 100.111.143.67,
+  daemon built from `f343aa2`, isolated `XDG_DATA_HOME`/`--runtime-dir`): picker →
+  2 MiB upload → "Delivered" in <1 s, SHA-256 match, file `0600` in a `0700`
+  per-transfer dir, staging empty, visible under the guest's `NAVETTE_DROP_DIR`;
+  Cancel tapped 0.6 s into a 60 MiB upload → "Cancelled" immediately and stable, no
+  staging or quota left behind, next send succeeds; Kill+Run of the same name →
+  empty drop dir at spawn, and an upload that straddled the respawn landed only in
+  the new incarnation's dir; daemon restart mid-session preserved the delivered file
+  (`recover`). Also `navette cp` 3 MiB → 0.26 s, hash match. Trap for the next run:
+  the phone's home Wi-Fi ("crayon-mesh") isolates clients at L2, so a LAN bind is
+  unreachable from the phone — use the tailnet; the app rejects loopback, so `adb
+  reverse` is not an option either.
 
 ### Verification at merge
 
