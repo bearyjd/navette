@@ -1,0 +1,100 @@
+name: Release
+
+# Builds the host tarball that contrib/cloud/navette-host-init.sh installs:
+# navetted + navette from this workspace, wprsd + xwayland-xdg-shell from the
+# wprs fork at the exact revision the workspace pins.
+#
+# ubuntu-22.04 is deliberate, not stale. Rust binaries link glibc dynamically
+# and a binary runs on any glibc at least as new as the one it was built
+# against; 22.04's glibc 2.35 is the floor that lets one tarball run on
+# Debian 12 (2.36), Ubuntu 22.04/24.04 and anything newer. Bumping the runner
+# raises that floor for every operator.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version label for a dry-run build (uploads an artifact, creates no release)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install build dependencies
+        # wprs's own debian/control lists only these two (plus pkg-config);
+        # x11rb is pure Rust and smithay is built with default-features off.
+        # ci.yml's X11 dev libs serve navette-viewer, which is not shipped here.
+        run: sudo apt-get update && sudo apt-get install --yes libwayland-dev libxkbcommon-dev pkg-config
+      - name: Install stable Rust
+        run: |
+          rustup update stable
+          rustup default stable
+      - name: Resolve tag and wprs revision
+        # The two Cargo.toml pins must agree or the packaged wprsd would not be
+        # the one navette-bridge's in-process client was compiled against.
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG="$INPUT_TAG"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then TAG="${GITHUB_REF_NAME}"; fi
+          [ -n "$TAG" ] || TAG="dev-${GITHUB_SHA::8}"
+          [[ "$TAG" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "tag '$TAG' is not a safe file-name component" >&2; exit 1; }
+          pin() { grep -oP 'wprs = \{ git = "https://github.com/bearyjd/wprs.git", rev = "\K[0-9a-f]{40}' "$1"; }
+          WPRS_REV="$(pin crates/navetted/Cargo.toml)"
+          [ "$WPRS_REV" = "$(pin crates/navette-bridge/Cargo.toml)" ] || { echo "wprs rev pins differ between navetted and navette-bridge" >&2; exit 1; }
+          { echo "TAG=$TAG"; echo "WPRS_REV=$WPRS_REV"; echo "DIST=navette-$TAG-$TARGET"; } >> "$GITHUB_ENV"
+      - name: Build navetted and navette
+        run: cargo build --release --locked -p navetted -p navette-cli
+      - name: Build wprsd and xwayland-xdg-shell
+        # wprsc is a desktop client and not part of the host tarball.
+        run: |
+          git clone https://github.com/bearyjd/wprs.git wprs
+          git -C wprs checkout "$WPRS_REV"
+          cargo build --release --locked --manifest-path wprs/Cargo.toml --bin wprsd --bin xwayland-xdg-shell
+      - name: Assemble tarball
+        # SHA256SUMS is written from inside the staging dir so its entry is a
+        # bare file name, which is what `sha256sum -c --ignore-missing` in
+        # navette-host-init.sh matches against after downloading both files.
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/$DIST/bin" "dist/$DIST/contrib"
+          install -m 0755 target/release/navetted target/release/navette \
+            wprs/target/release/wprsd wprs/target/release/xwayland-xdg-shell "dist/$DIST/bin/"
+          strip "dist/$DIST"/bin/* || echo "strip failed; shipping unstripped binaries"
+          cp -r contrib/systemd contrib/cloud "dist/$DIST/contrib/"
+          cp LICENSE "dist/$DIST/"
+          printf '%s\n' "$TAG" > "dist/$DIST/VERSION"
+          printf '%s\n' "$WPRS_REV" > "dist/$DIST/WPRS_REV"
+          cd dist
+          tar -czf "$DIST.tar.gz" "$DIST"
+          sha256sum "$DIST.tar.gz" > SHA256SUMS
+          cat SHA256SUMS
+      - name: Publish release
+        # event_name, not ref_type: a workflow_dispatch started from a tag ref
+        # must still be a dry run.
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          files: |
+            dist/${{ env.DIST }}.tar.gz
+            dist/SHA256SUMS
+          generate_release_notes: true
+      - name: Upload dry-run artifact
+        if: github.event_name != 'push'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ env.DIST }}
+          path: |
+            dist/${{ env.DIST }}.tar.gz
+            dist/SHA256SUMS

@@ -35,6 +35,10 @@ host daemon and Linux CLI, M2 encoder bridge, M3 Android client.
 cargo build --workspace
 ```
 
+Or skip the build: tagged releases ship a `navette-<tag>-x86_64-unknown-linux-gnu.tar.gz`
+with `navetted`, `navette`, `wprsd` and `xwayland-xdg-shell`; see the
+[cloud host recipe](docs/operators/cloud-host.md) for a headless VM install.
+
 The M1 daemon discovers XDG applications, supervises named sessions through
 stock `wprsd`, and exposes a loopback WebSocket API. The CLI can list, run,
 attach, detach, and kill sessions. See the

@@ -14,6 +14,15 @@ cargo build --release
 ./target/release/navetted --bind 127.0.0.1:9417
 ```
 
+Building is optional. Every `v*` tag publishes
+`navette-<tag>-x86_64-unknown-linux-gnu.tar.gz` (plus `SHA256SUMS`) on the
+GitHub Releases page via `.github/workflows/release.yml`: `navetted`,
+`navette`, and the matching `wprsd` and `xwayland-xdg-shell` built on Ubuntu
+22.04 so they run on Debian 12 / Ubuntu 22.04 or newer. For a headless cloud
+VM, [`docs/operators/cloud-host.md`](operators/cloud-host.md) wraps that
+tarball in `contrib/cloud/navette-host-init.sh` and a `cloud-init.yaml`:
+tailnet join, service user, user unit, firewall, pairing command.
+
 To reach it from a phone or another machine, bind a **tailnet** address:
 
 ```bash
