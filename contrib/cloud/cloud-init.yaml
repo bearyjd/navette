@@ -1,0 +1,72 @@
+#cloud-config
+# Navette cloud host: paste as user-data on any Debian 12 / Ubuntu 22.04+ x86_64
+# VM (Hetzner, EC2, GCP, ...), after filling in the two values below.
+#
+# Security notes:
+# - User-data is readable from the instance metadata service by any process on
+#   the VM, on every provider. Use a single-use, ephemeral (or short-lived),
+#   pre-approved Tailscale auth key; the 0600 env file below limits later
+#   readers, not what the metadata service already handed out.
+# - Everything comes from one GitHub Release over https: the tarball is
+#   verified against the SHA256SUMS published beside it, and the init script is
+#   extracted from that verified tarball rather than fetched separately. Both
+#   share a trust root, so this is integrity in transit, not authenticity.
+#   NAVETTE_VERSION must be a release tag (vX.Y.Z), never a branch.
+# - Nothing listens publicly: navetted binds the tailnet IP only, and ufw (when
+#   present) admits only tailscale0, 22/tcp and Tailscale's 41641/udp.
+
+package_update: true
+# The bootstrap needs these before the init script installs its own deps.
+packages: [curl, ca-certificates]
+
+write_files:
+  - path: /etc/navette-host-init.env
+    permissions: "0600"
+    owner: root:root
+    content: |
+      # Release tag to install, e.g. v0.1.0 (https://github.com/bearyjd/navette/releases)
+      NAVETTE_VERSION=
+      # Tailscale auth key from https://login.tailscale.com/admin/settings/keys
+      TS_AUTHKEY=
+      # Optional overrides; see navette-host-init --help
+      #TS_HOSTNAME=
+      #NAVETTE_APPS="firefox-esr"
+      #NAVETTE_PORT=9417
+
+  # Re-runnable by hand after editing the env file (e.g. to upgrade). Kept as
+  # a bash file rather than inline runcmd because cloud-init runs runcmd
+  # under /bin/sh, which is dash here and lacks pipefail.
+  - path: /usr/local/sbin/navette-host-bootstrap
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      # umask 077 keeps the download dir and the log root-only: the log's last
+      # lines hold the pairing command. The init script resets its own umask.
+      umask 077
+      set -a
+      # shellcheck source=/dev/null
+      . /etc/navette-host-init.env
+      set +a
+      # Validated before it reaches any URL: curl normalises `../`, and a
+      # branch name would silently track a moving target.
+      [[ "${NAVETTE_VERSION:-}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] \
+        || { echo "NAVETTE_VERSION in /etc/navette-host-init.env must be a release tag like v0.1.0" >&2; exit 1; }
+      release="https://github.com/bearyjd/navette/releases/download/$NAVETTE_VERSION"
+      dist="navette-$NAVETTE_VERSION-x86_64-unknown-linux-gnu"
+      work="$(mktemp -d)"
+      trap 'rm -rf "$work"' EXIT
+      [[ "$(uname -m)" == x86_64 ]] || { echo "navette releases are x86_64 only (this VM is $(uname -m))" >&2; exit 1; }
+      curl --proto '=https' --proto-redir '=https' --retry 3 -fsSL -o "$work/$dist.tar.gz" "$release/$dist.tar.gz"
+      curl --proto '=https' --proto-redir '=https' --retry 3 -fsSL -o "$work/SHA256SUMS" "$release/SHA256SUMS"
+      (cd "$work" && sha256sum -c --ignore-missing SHA256SUMS)
+      tar -xzf "$work/$dist.tar.gz" -C "$work" --strip-components=3 "$dist/contrib/cloud/navette-host-init.sh"
+      install -m 0755 "$work/navette-host-init.sh" /usr/local/sbin/navette-host-init
+      # The script verifies the local tarball again against the SHA256SUMS beside it.
+      NAVETTE_TARBALL="$work/$dist.tar.gz" /usr/local/sbin/navette-host-init 2>&1 | tee /var/log/navette-host-init.log
+
+runcmd:
+  - /usr/local/sbin/navette-host-bootstrap
+
+final_message: "navette-host-bootstrap finished after $UPTIME s; pairing instructions are in /var/log/navette-host-init.log"
