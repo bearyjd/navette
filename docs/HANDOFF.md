@@ -3164,8 +3164,17 @@ needs, not the changelog — the PR bodies carry the detail.
   script. The bootstrap downloads the tarball + SUMS, verifies, and runs the script
   *from the tarball*; nothing unverified executes as root. Snap Firefox cannot
   connect (snapd's wayland interface allows only `wayland-N`; ours is
-  `navette-<session>`), so Ubuntu gets no default app. **No tag exists yet**; the
-  first release is `v0.1.0` once the dispatch dry-run proves the wprs build-dep list.
+  `navette-<session>`), so Ubuntu gets no default app. **`v0.1.0` is published**
+  (2026-09-20, tag on `633320d`): the dispatch dry-run first failed because the wprs
+  clone sat inside the checkout and cargo nested the workspaces (#39 moved it to
+  `$RUNNER_TEMP`); the real run then produced the tarball + `SHA256SUMS`. Trap found
+  only after publishing: **the repo was private, so the recipe's unauthenticated
+  download 404'd** — no review caught it because the dry run proves the build, not
+  the download. The repo is now public (history swept for secrets first: clean). The
+  recipe was then run against the real release in a fresh ubuntu:22.04 container:
+  checksum OK, all four binaries execute, `libx264` present, `navetted` starts and
+  mints its token. Still untested: systemd activation, `tailscale up`, ufw — needs a
+  real VM boot.
 
 Still true after all four: `api.rs` (~2.9k) and `bridge.rs` (~2.7k) are well over the
 800-line rule and should be split (`api/images.rs`, `api/wake.rs` are the obvious
