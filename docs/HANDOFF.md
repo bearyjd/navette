@@ -3173,8 +3173,13 @@ needs, not the changelog — the PR bodies carry the detail.
   the download. The repo is now public (history swept for secrets first: clean). The
   recipe was then run against the real release in a fresh ubuntu:22.04 container:
   checksum OK, all four binaries execute, `libx264` present, `navetted` starts and
-  mints its token. Still untested: systemd activation, `tailscale up`, ufw — needs a
-  real VM boot.
+  mints its token. Then (2026-09-21) the real `cloud-init.yaml` was booted under
+  local QEMU/KVM with a NoCloud seed (recipe now in `docs/operators/cloud-host.md`):
+  cloud-init finished in 97 s, `navetted.service` came up active under linger, a
+  `foot` session ran, the viewer attached through an SSH tunnel and the thumbnail
+  route served a JPEG of it. **Still untested: `tailscale up` and the ufw block** —
+  both need a real auth key; no cloud CLI or Tailscale API key exists on this
+  machine, so a Hetzner/EC2 run needs the operator to supply both.
 
 Still true after all four: `api.rs` (~2.9k) and `bridge.rs` (~2.7k) are well over the
 800-line rule and should be split (`api/images.rs`, `api/wake.rs` are the obvious

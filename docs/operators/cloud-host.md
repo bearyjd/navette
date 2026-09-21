@@ -184,3 +184,35 @@ sudo cat /var/log/navette-host-init.log                # the recipe's own run (c
   overrides the host. With a non-default `NAVETTE_PORT`, pass
   `--url ws://127.0.0.1:<port>/v1/ws --advertise-host <host>` as the script's
   final output does; see the table in [`RUNBOOK.md`](../RUNBOOK.md#pairing).
+
+## Testing the recipe locally (QEMU, no cloud account)
+
+The same `cloud-init.yaml` boots under QEMU with a NoCloud seed, which exercises
+everything except the tailnet join in about 90 seconds. Needs `qemu-system-x86_64`,
+`qemu-img`, `xorriso` and `/dev/kvm`.
+
+```bash
+mkdir -p ~/.cache/navette-vm && cd ~/.cache/navette-vm
+curl -fsSLO https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img
+ssh-keygen -t ed25519 -N "" -f id_test
+# user-data = contrib/cloud/cloud-init.yaml with NAVETTE_VERSION filled in, either
+# TS_AUTHKEY=... or SKIP_TAILSCALE=1 added to the env file, and a `users:` entry
+# carrying id_test.pub so you can ssh in.
+printf 'instance-id: navette-test-1\nlocal-hostname: navette-vm\n' > meta-data
+qemu-img create -f qcow2 -F qcow2 -b jammy-server-cloudimg-amd64.img disk.qcow2 20G
+xorriso -as mkisofs -quiet -o seed.iso -V cidata -J -r user-data meta-data
+qemu-system-x86_64 -enable-kvm -cpu host -m 4096 -smp 4 \
+  -drive file=disk.qcow2,if=virtio -drive file=seed.iso,if=virtio,format=raw,readonly=on \
+  -nic user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:2222-:22 \
+  -display none -serial file:console.log -daemonize -pidfile qemu.pid
+ssh -i id_test -p 2222 ubuntu@127.0.0.1 'sudo cloud-init status --wait; sudo tail -8 /var/log/navette-host-init.log'
+```
+
+With `SKIP_TAILSCALE=1` navetted binds `127.0.0.1:9417` inside the VM; forward it
+(`ssh -L 19417:127.0.0.1:9417 …`) and the CLI, `navette-viewer`, and the thumbnail
+route all work from the host exactly as they would over the tailnet. Verified this
+way on 2026-09-21 against the published v0.1.0: cloud-init finished in 97 s, the
+user service was active under linger, a `foot` session ran under `wprsd`, the
+viewer attached through the tunnel, and `GET /v1/sessions/<name>/thumbnail`
+returned a 320×229 JPEG of the terminal. `ufw` is left untouched when Tailscale is
+skipped, so that block and `tailscale up` itself still need a run with a real key.
