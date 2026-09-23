@@ -484,6 +484,14 @@ Ctrl+Backspace, which deletes a word in most shells. Intended, but it
 surprises people. A multi-character commit (a paste) chords only its first
 character.
 
+**Android: characters repeat when typing quickly** (`echo` arrives as `eeeecho`).
+Not the phone: the client sends one press and one release per character
+(confirmed with per-keycode logging). The guest auto-repeats because `wprsd`
+configures `repeat_delay = 200 ms` with `repeat_rate = 200` characters per
+second (`add_keyboard(Default::default(), 200, 200)`), so a release delayed past
+200 ms yields a character every 5 ms until it lands. Typing more slowly avoids
+it; the real fix is a sane repeat rate in the wprs fork.
+
 **Android: the guest behaves as if Ctrl (or Alt) is stuck down.**
 Tap that chip on the **Keys** bar: turning a modifier off always sends its
 release, which is the recovery when one went out but never arrived. Leaving

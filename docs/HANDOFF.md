@@ -3216,6 +3216,46 @@ the guest paints (`crates/navetted/src/bridge.rs`, `encode_frame`). Plan:
   (partial-chord unwind, release on disarm, release on close) are what narrow
   it, and tapping the chip off is the user's own recovery.
 
+- **Characters repeat in the guest when you type fast — and it is not the IME
+  diff.** Reported from the Pixel 10 as "typed `echo hi`, guest shows `eecho hi`",
+  which reads like a client double-send. It is not. Instrumenting
+  `onValueChange`/`onImeText` and logging every emitted keycode on a Pixel 9 Pro
+  Fold (2026-09-22) shows the client emitting **exactly one press/release pair per
+  character** — `""→"e"` emits `18v 18^`, `"e"→"ec"` emits `46v 46^`, and so on to
+  `"echo hi"` — with `MediaClient` reporting no dropped send at all, and the
+  hardware `onKeyEvent` path never entering. Yet the same taps typed fast produced
+  `eeeeeecho hi` (six e's) and `echo abcdefgh…` followed by ~30 `h`s in the guest.
+  The repeats are always the **last** key of a burst, and typing the identical
+  text with 1.2 s between taps never duplicates anything.
+  That is the guest's own auto-repeat: the wprs fork calls
+  `add_keyboard(Default::default(), 200, 200)`
+  (`wprs/src/bin/wprsd.rs:281`, and the same in `xwayland-xdg-shell.rs:226`), i.e.
+  **repeat_delay = 200 ms and repeat_rate = 200 characters per second** — the
+  daemon log prints both. Wayland's `repeat_info` rate is keys per second, so a
+  typical desktop is 25-33; at 200 the guest emits a character every 5 ms once a
+  key has been held 200 ms. So any hiccup that delays a *release* past 200 ms turns
+  one keystroke into a burst whose length is `(delay - 200) / 5`: the six e's imply
+  a release about 225 ms late, the h-burst about 350 ms. Client-side there is
+  nothing left to fix — the press and release leave `sendWhileAccepted` microseconds
+  apart (measured: `key 18 DOWN accepted=true at=…222`, `key 18 UP accepted=true
+  at=…223`) and the socket accepted both. **Nor did the daemon refuse anything.**
+  `MediaClient` reports a client-side refusal (`logDropped`, `Log.d`) *and* a server
+  error frame (`MediaClient.kt:401`, `Log.w` — which covers the `rate_limited` that
+  `api.rs:1005` returns for a full 256-slot input queue, and the
+  `MAX_INPUT_MESSAGES_PER_SECOND = 240` limiter at `api.rs:44`) under the same
+  `MediaClient` tag, and `logcat -s MediaClient` was empty for every reproducing
+  run. So the input was accepted at both ends and the delay is downstream of
+  acceptance. Worth knowing before anyone re-investigates: the client is **not**
+  blind to refusals — an earlier note of mine claimed it was, on the strength of
+  grepping for the string `rate_limited`, which never appears because the client
+  logs the code rather than matching on it. The decode is pinned by
+  `MediaProtocolTest`'s `a server error frame decodes into its code and message`.
+  The delay and the pathological repeat rate are
+  both server-side, and the repeat rate is the cheaper of the two to fix: at a sane
+  25/s the same 350 ms hiccup would cost ~3 stray characters instead of 30. Note
+  the daemon under test shared a host with this workspace's builds, which may
+  inflate the stall; the repeat setting is wrong regardless.
+
 - **A sticky modifier chords exactly one character.** An IME edit is not one
   key: a paste, or a keyboard that commits a whole word, arrives as one
   `onValueChange` carrying several characters, and `imeTextDelta` used to wrap
@@ -3286,7 +3326,7 @@ the guest paints (`crates/navetted/src/bridge.rs`, `encode_frame`). Plan:
   despite living in `foundation.text.input.internal`: its constructor takes
   `TextFieldValue`/`LegacyTextFieldState`/`OffsetMapping`/`ImeOptions`,
   `CoreTextFieldKt` instantiates it, and `BasicTextFieldKt` routes the
-  `TextFieldValue` overload — the one `SessionScreen` calls — into `CoreTextField`;
+  `TextFieldValue` overload — the one this screen calls, `ImeLayer.kt:90` — into `CoreTextField`;
   BTF2 uses `TextFieldDecoratorModifierNode` instead. With
   `ComposeUiFlags.isSemanticAutofillEnabled` defaulting true, the hidden field was
   therefore advertised with `AUTOFILL_HINT_PASSWORD` **and** an `onFillData`
@@ -3295,13 +3335,31 @@ the guest paints (`crates/navetted/src/bridge.rs`, `encode_frame`). Plan:
   `setVisibleToUser(false)` and `INVISIBLE` in the `ViewStructure`, so the
   accessibility channel (a manager like Bitwarden) likely never saw it, and no
   on-device fill was ever reproduced — the advertisement is proven, the end-to-end
-  fill is not. The fix would be correct even if the mapping had not held, because
-  the view-level flag drops the whole subtree regardless of hints: `SessionScreen` sets
+  fill is not. **And the first fix for it did not work** — measured on a Pixel 9 Pro
+  Fold (API 37) with Bitwarden installed, on 2026-09-22. `SessionScreen` set
   `importantForAutofill = IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS` on
-  `LocalView.current` in a `DisposableEffect` and restores the previous value on
-  the way out, so the Connect screen's own fields keep autofill; the field also
-  carries `contentDataType = ContentDataType.None` and `hideFromAccessibility()`
-  as belt and braces. **Keep `KeyboardType.Password`** — no other type sets
+  `LocalView.current`, and the platform still rendered
+  `android:id/autofill_dataset_picker` (window "Autofill UI", Bitwarden, "Vault is
+  locked") over the stream every time the hidden field took focus — on a
+  force-stopped, freshly launched app whose only focused editable was that field.
+  The reason is the mechanism: that flag gates the platform's *own* walk of the
+  view tree (`onProvideAutofillVirtualStructure`), but Compose 1.10.6 does not wait
+  to be walked — with `isSemanticAutofillEnabled` true it calls
+  `notifyViewEntered` for the focused semantics node itself, and the platform
+  honours an app's explicit notification. `FocusOwnerImpl` and `AndroidComposeView`
+  read that flag at focus time, so `SessionScreen` now also sets
+  `ComposeUiFlags.isSemanticAutofillEnabled = false` for the life of the session
+  screen and restores it on the way out (`@OptIn(ExperimentalComposeUiApi::class)`;
+  it is a public mutable static). The view flag and the field's
+  `contentDataType = ContentDataType.None` + `hideFromAccessibility()` stay as
+  defence in depth. **The replacement is not yet device-verified**: the check was
+  abandoned mid-run because the borrowed phone kept surfacing unrelated personal
+  apps under scripted taps, so it is confirmed only at the bytecode level plus one
+  inconclusive run. Verify it the way the failure was found — force-stop, launch,
+  attach, raise the keyboard, then
+  `adb shell uiautomator dump` and grep for `autofill_dataset_picker`. A useful
+  positive control: the Connect screen's own token field *should* still raise the
+  picker, since only the session screen disables the mechanism. **Keep `KeyboardType.Password`** — no other type sets
   `NO_SUGGESTIONS` in 1.10.6, and it also stops Gboard learning what is typed at
   a sudo prompt. If a future Compose gains a way to clear the content type, the
   view-level flag is still the one that is not advisory.

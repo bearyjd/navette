@@ -38,6 +38,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.ComposeUiFlags
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.autofill.ContentDataType
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.focus.FocusRequester
@@ -119,6 +121,7 @@ internal fun claimClipboardImageBeforeMime(
  * and later values reach it through `setViewScale`; [onViewScaleChange] is
  * how the Scale menu asks the caller to persist a pick.
  */
+@OptIn(ExperimentalComposeUiApi::class)
 @Composable
 fun SessionScreen(
     sessionName: String,
@@ -223,9 +226,14 @@ fun SessionScreen(
     // leaving the Connect screen's own fields alone.
     val hostView = LocalView.current
     DisposableEffect(hostView) {
-        val previous = hostView.importantForAutofill
+        val previousImportance = hostView.importantForAutofill
+        val previousSemanticAutofill = ComposeUiFlags.isSemanticAutofillEnabled
         hostView.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
-        onDispose { hostView.importantForAutofill = previous }
+        ComposeUiFlags.isSemanticAutofillEnabled = false
+        onDispose {
+            hostView.importantForAutofill = previousImportance
+            ComposeUiFlags.isSemanticAutofillEnabled = previousSemanticAutofill
+        }
     }
 
     // Clipboard listener and lifecycle observer registered and torn down here,
