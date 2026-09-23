@@ -3352,14 +3352,23 @@ the guest paints (`crates/navetted/src/bridge.rs`, `encode_frame`). Plan:
   screen and restores it on the way out (`@OptIn(ExperimentalComposeUiApi::class)`;
   it is a public mutable static). The view flag and the field's
   `contentDataType = ContentDataType.None` + `hideFromAccessibility()` stay as
-  defence in depth. **The replacement is not yet device-verified**: the check was
-  abandoned mid-run because the borrowed phone kept surfacing unrelated personal
-  apps under scripted taps, so it is confirmed only at the bytecode level plus one
-  inconclusive run. Verify it the way the failure was found — force-stop, launch,
-  attach, raise the keyboard, then
-  `adb shell uiautomator dump` and grep for `autofill_dataset_picker`. A useful
-  positive control: the Connect screen's own token field *should* still raise the
-  picker, since only the session screen disables the mechanism. **Keep `KeyboardType.Password`** — no other type sets
+  defence in depth. **The exposure is confirmed on device; the replacement fix is
+  not.** On 2026-09-23 the positive control was run to completion on the Pixel 9
+  Pro Fold (the only phone here with `settings get secure autofill_service` set —
+  `com.x8bit.bitwarden/…AutofillService`; the Pixel 10 returns empty and therefore
+  *cannot* reproduce this at all, which is why an earlier attempt there found
+  nothing and proved nothing). Focusing the Connect screen's token field gave
+  `mCurrentFocus=Window{… Autofill UI}` with `autofill_dataset_picker` and
+  `Bitwarden` in the `uiautomator` tree. So the finding is real on hardware, not
+  merely advertised in the semantics tree, and the detection method works. The
+  session-screen half — that the same focus produces *no* picker with the fix in —
+  was one tap away when both phones dropped off adb (one vanished, the other went
+  `unauthorized`), and remains unverified. Finish it the same way: force-stop,
+  launch, open the session, tap Keyboard, `adb shell uiautomator dump`, grep for
+  `autofill_dataset_picker`; expect nothing on the session screen and the picker
+  still present on the Connect screen. Drive it with taps whose coordinates come
+  from a fresh dump and a frontmost check before each one — blind scripted tapping
+  on a personal phone is how the earlier run wandered into unrelated apps. **Keep `KeyboardType.Password`** — no other type sets
   `NO_SUGGESTIONS` in 1.10.6, and it also stops Gboard learning what is typed at
   a sudo prompt. If a future Compose gains a way to clear the content type, the
   view-level flag is still the one that is not advisory.
