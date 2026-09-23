@@ -35,6 +35,9 @@ interface PairingStore {
     /** Sets or clears how [hostId] is woken; see [PairingRegistryCodec.setWake] for what is rejected. */
     fun setWake(hostId: String, wake: WakeTarget?): PairingRegistry
 
+    /** Sets or clears (`scale == null`) the logical scale used when attaching to [hostId]; see [PairingRegistryCodec.setViewScale]. */
+    fun setViewScale(hostId: String, scale: ViewScale?): PairingRegistry
+
     companion object { const val LEGACY_ID = "legacy" }
 }
 
@@ -73,14 +76,19 @@ class EncryptedPairingStore(context: Context) : PairingStore {
     override fun setWake(hostId: String, wake: WakeTarget?): PairingRegistry =
         PairingRegistryCodec.setWake(mutableSnapshot(), hostId, wake).also(::writeRegistry)
 
+    override fun setViewScale(hostId: String, scale: ViewScale?): PairingRegistry =
+        PairingRegistryCodec.setViewScale(mutableSnapshot(), hostId, scale).also(::writeRegistry)
+
     override fun clear() = prefs.edit().clear().apply()
 
     /**
      * The registry a mutation starts from. A snapshot whose `version` is newer
      * than this app's is refused rather than overwritten -- but only when the
-     * newer schema added no keys: `ignoreUnknownKeys = false` turns a v3 payload
+     * newer schema added no keys: `ignoreUnknownKeys = false` turns a v4 payload
      * with new fields into Corrupt, not Future, and Corrupt is what
      * [loadRegistry] maps to an empty registry that the next write replaces.
+     * (A v3 blob read by a v2 build already goes this way: `viewScale` is an
+     * unknown key there, so an APK downgrade loses the registry.)
      */
     // TODO: lenient version pre-parse before the strict decode, so a newer
     // payload with unknown keys is recognised as Future rather than Corrupt.
@@ -99,7 +107,7 @@ class EncryptedPairingStore(context: Context) : PairingStore {
             prefs.getString(LEGACY_TOKEN_KEY, null) ?: return RegistryDecode.Valid(PairingRegistry()),
         ) ?: return RegistryDecode.Valid(PairingRegistry())
         val registry = PairingRegistryCodec.upsert(PairingRegistry(), legacy)
-        // The current-schema snapshot (v2 today) and removal of the pre-registry
+        // The current-schema snapshot (v3 today) and removal of the pre-registry
         // legacy fields are one preference edit.
         writeRegistry(registry)
         return RegistryDecode.Valid(registry)
@@ -115,8 +123,9 @@ class EncryptedPairingStore(context: Context) : PairingStore {
 
         // A storage slot, not the schema version: the payload's own `version`
         // field is what the codec gates on, and this key has held schema v2
-        // since wake targets landed. Renaming it would make every existing
-        // install read an empty slot and lose its registry.
+        // since wake targets landed and v3 since view scales did. Renaming it
+        // would make every existing install read an empty slot and lose its
+        // registry.
         private const val REGISTRY_KEY = "registry_v1"
         private const val LEGACY_HOST_KEY = "host"
         private const val LEGACY_PORT_KEY = "port"

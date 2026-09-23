@@ -3185,3 +3185,186 @@ Still true after all four: `api.rs` (~2.9k) and `bridge.rs` (~2.7k) are well ove
 800-line rule and should be split (`api/images.rs`, `api/wake.rs` are the obvious
 first extractions); the phone-side flows for wake and thumbnails are unit-tested
 only, not run on the Pixel.
+
+## Mobile keyboard + logical scale presets (2026-09-21)
+
+The phone became a client you can *work in* rather than a mirror: a key bar with
+sticky Ctrl/Alt above Gboard, a deterministic IME field, the stream shrinking above
+the keyboard, and 1×/1.5×/2×/3× scale presets remembered per host. Zero Rust
+changes — `ViewportResize` already resizes the `wl_output` and every toplevel
+(`crates/navette-bridge/src/input.rs`), and the encoder already follows whatever size
+the guest paints (`crates/navetted/src/bridge.rs`, `encode_frame`). Plan:
+`.claude/PRPs/plans/mobile-keyboard-and-scale.plan.md`. Facts the next person needs:
+
+- **wprsd ignores `ctrl`/`alt` in `KeyboardEvent::Modifiers`.** At the pinned rev
+  (`crates/navetted/Cargo.toml:28`, `38c61fe`), `src/server/client_handlers.rs`
+  feeds every raw `KeyboardEvent::Key` into smithay's xkb state and derives the
+  modifier state from *that*; the `Modifiers` handler only sets the layout and
+  toggles caps/num lock. So `Modifiers{ctrl = true}` on its own is a silent no-op,
+  and `InputMapper.keyChord` wraps the key in a real `KEY_LEFTCTRL`/`KEY_LEFTALT`
+  press/release (ctrl outermost, alt inside, shift innermost). The hardware path
+  "worked" with Ctrl all along only because Android also delivers the physical
+  `KEYCODE_CTRL_LEFT` as a key. The bridge's `InputState` does release held keys
+  when an attachment drops — but that is **not** the same as "a chord cannot
+  leave Ctrl stuck", which an earlier draft of this section claimed.
+  `MediaClient.sendInput` returns false both for "no socket" *and* for "socket
+  declined the frame" (`MediaClient.kt:154-163`: OkHttp's `send` returns false
+  when its output queue is full, *without* closing the socket), so a delivered
+  `KEY_LEFTCTRL` press followed by a declined release holds Ctrl on the guest
+  with the socket still up — until the ping timeout tears it down and the
+  bridge's release fires. Bounded, but real: the client-side releases below
+  (partial-chord unwind, release on disarm, release on close) are what narrow
+  it, and tapping the chip off is the user's own recovery.
+
+- **A sticky modifier chords exactly one character.** An IME edit is not one
+  key: a paste, or a keyboard that commits a whole word, arrives as one
+  `onValueChange` carrying several characters, and `imeTextDelta` used to wrap
+  every one of them in the held modifier — a paste of "abc" under armed Ctrl
+  became Ctrl+A, Ctrl+B, Ctrl+C, and Ctrl+A alone is select-all in most guests.
+  Only the first character the guest receives is chorded now ("armed for the
+  next key" means one key); the rest go out plain and the modifier is spent
+  once. Reviewers split on this — one read the old behaviour as the documented
+  design, the other flagged the paste hazard — so it is pinned by
+  `only the first character of a multi-character commit is chorded` rather than
+  left to the next reader's judgement.
+
+- **Pointer motion needed no change for scale.** `SessionController.sendMotion`
+  already maps surface pixels into the decoded frame through
+  `InputMapper.rescaleToContent(..., contentSize)`, and `contentSize` comes from
+  `DecoderEvent.Configured`. At 2× the frame is `surface / 2`, so every motion is
+  divided by the scale for free. Only `sendScroll` had to gain the same rescale —
+  its old doc claimed finger deltas "need no rescaling", which was true only at 1×.
+  Pinch zoom is a surface-pixel View transform and composes with logical scale
+  without code.
+
+- **The min-viewport clamp must not break aspect.** The bridge accepts
+  `320..3840 × 240..2160`. A landscape phone with the IME up has ~450 px of surface
+  height, and `450 / 2 < 240`; clamping the height alone would leave the width at
+  `1200` and MediaCodec's scale-to-fit (never overridden — `H264Decoder` calls no
+  `setVideoScalingMode`) would stretch the picture. `InputMapper.scaledViewport`
+  divides by `min(factor, width/320, height/240)` instead, so `(2400, 450, 2×)` →
+  `(1280, 240)` with the aspect intact. Exhaustively tested against
+  `MediaInput.validate()`.
+
+- **IME insets.** `targetSdk 36` means Android 15+ enforces edge-to-edge and the
+  window no longer resizes for the keyboard; `Modifier.imePadding()` on the session
+  `Column` is what shrinks the stream box, whose `onSizeChanged` → `onSurfaceResized`
+  → debounced `ViewportResize` re-lays the guest out above Gboard. Below API 30 the
+  inset is only reported with `windowSoftInputMode="adjustResize"`, now in the
+  manifest. `enableEdgeToEdge()` was deliberately **not** added to `MainActivity`.
+  **Each IME show/hide is one encoder restart** (~0.8 s end to end, measured for the
+  viewer): the 150 ms client debounce plus the daemon's 100 ms one mean one per
+  show/hide, not one per inset animation frame.
+
+- **Why the hidden field is `KeyboardType.Password`.** Compose 1.10.6 never sets
+  `TYPE_TEXT_FLAG_NO_SUGGESTIONS`; the password variation is the lever that makes
+  Gboard drop suggestions, autocorrect and glide typing, each of which otherwise
+  arrives as a composition update the prefix diff turns into a backspace-and-retype
+  burst on the guest. `ImeAction.Default` with `singleLine = false` is what keeps
+  `IME_FLAG_NO_ENTER_ACTION`, so Enter still inserts `\n` → `KEY_ENTER`. The field
+  is now emptied (only between compositions) after a chorded character and past 64
+  chars; an empty-field Backspace arrives as `KEYCODE_DEL` through `onPreviewKeyEvent`
+  because Gboard has nothing to `deleteSurroundingText`. All of this is IME
+  behaviour Android does not guarantee — the device checklist in the plan is the
+  acceptance signal, and if Enter does not arrive as `\n` on some keyboard, the
+  `onPreviewKeyEvent` branch extends to `KEYCODE_ENTER` in one line.
+
+- **…and what the password type costs: autofill.** A security review caught it.
+  A password-typed editable is exactly what the platform's Autofill Framework
+  offers a saved credential for, and every "Keyboard" tap focuses this one, which
+  is the prompt trigger; a provider that filled it would have the field's
+  `onValueChange` diff the credential and type it into the guest as key events.
+  What was verified in the 1.10.6 bytecode: `PopulateViewStructure_androidKt` is
+  what writes `setAutofillHints`/`setDataIsSensitive`, from the semantics
+  `contentType`/`contentDataType`; `ContentType.Password` exists and the companion
+  has no `None`, while `ContentDataType` does. The mapping itself is **confirmed**
+  on the legacy path this code uses, after a first pass failed to find it: it is
+  not a member of `KeyboardOptions` but a branch inside
+  `CoreTextFieldSemanticsModifierNode.applySemantics` (offsets 128-157), which
+  reads the node's own `imeOptions.getKeyboardType()` and maps
+  `Password`/`NumberPassword` to `ContentType.Password`. That node is legacy-only
+  despite living in `foundation.text.input.internal`: its constructor takes
+  `TextFieldValue`/`LegacyTextFieldState`/`OffsetMapping`/`ImeOptions`,
+  `CoreTextFieldKt` instantiates it, and `BasicTextFieldKt` routes the
+  `TextFieldValue` overload — the one `SessionScreen` calls — into `CoreTextField`;
+  BTF2 uses `TextFieldDecoratorModifierNode` instead. With
+  `ComposeUiFlags.isSemanticAutofillEnabled` defaulting true, the hidden field was
+  therefore advertised with `AUTOFILL_HINT_PASSWORD` **and** an `onFillData`
+  action, so a provider offers saved credentials on the hint rather than on its own
+  heuristics. Two caveats stay true and are worth keeping: `alpha(0f)` yields
+  `setVisibleToUser(false)` and `INVISIBLE` in the `ViewStructure`, so the
+  accessibility channel (a manager like Bitwarden) likely never saw it, and no
+  on-device fill was ever reproduced — the advertisement is proven, the end-to-end
+  fill is not. The fix would be correct even if the mapping had not held, because
+  the view-level flag drops the whole subtree regardless of hints: `SessionScreen` sets
+  `importantForAutofill = IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS` on
+  `LocalView.current` in a `DisposableEffect` and restores the previous value on
+  the way out, so the Connect screen's own fields keep autofill; the field also
+  carries `contentDataType = ContentDataType.None` and `hideFromAccessibility()`
+  as belt and braces. **Keep `KeyboardType.Password`** — no other type sets
+  `NO_SUGGESTIONS` in 1.10.6, and it also stops Gboard learning what is typed at
+  a sudo prompt. If a future Compose gains a way to clear the content type, the
+  view-level flag is still the one that is not advisory.
+
+- **A modifier must never be left pressed in the guest.** Two defects the reviews
+  found, both in `SessionKeyboard`: an armed Ctrl was spent even when the socket
+  refused every message of its chord (so the *next* key went out unchorded), and
+  a chord cut off after its `KEY_LEFTCTRL` press left Ctrl down for everything
+  after it. `sendWhileAccepted` now stops at the first refusal and reports how
+  many landed: nothing delivered means nothing is spent, and a partial chord is
+  unwound with releases innermost-first. Beyond that, tapping a chip off always
+  sends the release (the only recovery available when a release was accepted here
+  but dropped downstream — the client cannot see that happen), and
+  `SessionController.close()` calls `releaseHeldModifiers()` so leaving the screen
+  cannot strand one. Unconditional releases are safe because the bridge collapses
+  only a redundant *press*: `input.rs:159-198` forwards a release for a keycode it
+  never saw pressed, and logs a debug line. The server's own healing
+  (`release_keys` on attachment drop) was not enough to rely on — it travels
+  through the same bounded input queue that may have dropped the release in the
+  first place, and a 64-character flush is ~384 messages.
+
+- **Pairing registry schema v3** adds `viewScale` (a `Float` on the wire, one of the
+  four preset factors). v1/v2 blobs decode with `viewScale = null` ("device
+  default"); a v1/v2 blob that *carries* `viewScale` is `Corrupt`, an unknown factor
+  degrades to `null`. Unchanged and worth repeating: `Json { ignoreUnknownKeys =
+  false }` runs before the version check, so **a v3 blob read by a pre-v3 build is
+  `Corrupt`, not `Future`, and the store maps that to an empty registry that the next
+  write overwrites** — an APK downgrade re-pairs every host, exactly as v2→v1 did.
+  The lenient version pre-parse stays a `PairingStore.kt` TODO.
+
+- **The controller's key path is now JVM-testable.** The plan recorded it as
+  untestable (the packet loop that sets `gate.primary` runs on `Dispatchers.Default`
+  and the fake never delivers a `StreamConfig`). Instead of living on the controller,
+  the hardware/IME/bar key paths and the sticky state moved into
+  `SessionKeyboard(primary = { gate.primary }, send = client::sendInput)`, and
+  `SessionKeyboardTest` drives chords, spending and locking directly. Still not
+  testable: anything that needs a real `KeyEvent` or `MotionEvent` (the android.jar
+  stubs return zeros). Also learned the hard way: **`advanceUntilIdle()` never returns
+  in a controller test** — the HUD loop re-arms its one-second `delay` forever while
+  the fake reports `Connected`; use `advanceTimeBy(151)` + `runCurrent()`.
+
+- **File sizes.** `SessionController.kt` was already 880 lines before this work;
+  `MediaSessionClient` + `OkHttpMediaSessionClient` + `launchHudWhileConnected`
+  (verified as a pure move by the sorted-multiset check from #35), `SessionUiState`,
+  and the `MotionEvent → TouchEvent` reduction (`TouchEvents.kt`) were moved out to
+  land it at ~776. The clipboard surface (~120 lines, shares `lock` with the decoder
+  path) is the next candidate if it grows again.
+
+Not built, on purpose: true HiDPI (`wl_output` scale / `buffer_scale`), Unicode text
+commit (`asciiCharToEvdev` stays US-only), sticky modifiers on hardware keys,
+momentum scroll, keyboard layouts, and syncing `imeRaised` with the system dismissing
+the IME (`isImeVisible` is still `@ExperimentalLayoutApi`). Not yet run on the Pixel —
+the on-device checklist in the plan is the acceptance gate, plus these four, which the
+review rounds added and the plan's checklist does not cover:
+
+- **Type a 70-character line continuously** (e.g. `echo aaaa…` past 64 chars) and check
+  no character is duplicated or dropped at the 65th. Nothing else in the checklist ever
+  crosses the hidden field's reset boundary — the longest item is `echo test`.
+- **Autofill probe**: with a password manager installed and a credential saved, tap
+  **Keyboard** repeatedly and confirm no fill prompt or dropdown ever appears over the
+  stream, and that the Connect screen still offers autofill after leaving the session.
+- **Keys button with the keyboard up**: it must hide the bar and leave Gboard up (and
+  bring it back on the next tap), never flip its own label while the screen is unchanged.
+- **Stuck-modifier recovery**: long-press Ctrl (locked), leave the session mid-chord,
+  re-attach, and confirm the guest is not still holding Ctrl (`showkey` or a shell where
+  a plain `a` types `a`).

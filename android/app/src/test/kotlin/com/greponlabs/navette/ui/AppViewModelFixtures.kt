@@ -6,6 +6,7 @@ import com.greponlabs.navette.net.Pairing
 import com.greponlabs.navette.net.PairingRegistry
 import com.greponlabs.navette.net.PairingStore
 import com.greponlabs.navette.net.SavedPairing
+import com.greponlabs.navette.net.ViewScale
 import com.greponlabs.navette.net.WakeResult
 import com.greponlabs.navette.net.WakeTarget
 import com.greponlabs.navette.net.WakeTransport
@@ -90,8 +91,8 @@ internal class FakePairingStore(initial: Pairing? = null) : PairingStore {
     override fun upsert(pairing: Pairing): PairingRegistry {
         if (failOnSave) throw IllegalStateException("keystore unavailable")
         val existing = registry.hosts.firstOrNull { it.pairing.host == pairing.host && it.pairing.port == pairing.port }
-        // Like the real codec: re-pairing rotates the token and keeps the wake target.
-        val saved = SavedPairing(existing?.id ?: "host-${registry.hosts.size + 1}", pairing, existing?.wake)
+        // Like the real codec: re-pairing rotates the token and keeps the wake target and view scale.
+        val saved = SavedPairing(existing?.id ?: "host-${registry.hosts.size + 1}", pairing, existing?.wake, existing?.viewScale)
         registry = PairingRegistry(registry.hosts.filterNot { it.id == saved.id } + saved, saved.id)
         stored = pairing
         return registry
@@ -114,6 +115,13 @@ internal class FakePairingStore(initial: Pairing? = null) : PairingStore {
         if (failOnSave) throw IllegalStateException("keystore unavailable")
         require(registry.hosts.any { it.id == hostId }) { "unknown host" }
         registry = registry.copy(hosts = registry.hosts.map { if (it.id == hostId) it.copy(wake = wake) else it })
+        return registry
+    }
+
+    override fun setViewScale(hostId: String, scale: ViewScale?): PairingRegistry {
+        if (failOnSave) throw IllegalStateException("keystore unavailable")
+        require(registry.hosts.any { it.id == hostId }) { "unknown host" }
+        registry = registry.copy(hosts = registry.hosts.map { if (it.id == hostId) it.copy(viewScale = scale) else it })
         return registry
     }
 

@@ -12,6 +12,7 @@ import com.greponlabs.navette.net.MediaInput
 import com.greponlabs.navette.net.mediaJson
 import com.greponlabs.navette.net.validate
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -497,5 +498,266 @@ class InputMapperTest {
     fun `a degenerate surface reports no viewport at all`() {
         assertNull(InputMapper.clampViewport(0, 720))
         assertNull(InputMapper.clampViewport(1280, -1))
+    }
+
+    @Test
+    fun `a scaled viewport divides the surface and rounds down to even`() {
+        assertEquals(1200 to 540, InputMapper.scaledViewport(2400, 1080, 2f))
+        assertEquals(1600 to 720, InputMapper.scaledViewport(2400, 1080, 1.5f))
+        // 2402 / 2 = 1201, which is odd; H.264 wants even, so 1200.
+        assertEquals(1200 to 540, InputMapper.scaledViewport(2402, 1080, 2f))
+    }
+
+    /**
+     * The aspect rule: a landscape phone with the IME up has ~450 px of
+     * surface height, and 450 / 2 = 225 < 240. Clamping the height alone
+     * would leave the width at 1200 and MediaCodec's scale-to-fit would
+     * stretch the picture, so the divisor drops to what the height allows.
+     */
+    @Test
+    fun `a scaled viewport keeps the aspect ratio when the minimum height is reached`() {
+        // fit = min(2, 2400/320 = 7.5, 450/240 = 1.875) = 1.875
+        assertEquals(1280 to 240, InputMapper.scaledViewport(2400, 450, 2f))
+        // Landing exactly on the floor: fit = min(3, 4, 3) = 3; 1280/3 = 426.67 -> 426.
+        assertEquals(426 to 240, InputMapper.scaledViewport(1280, 720, 3f))
+    }
+
+    @Test
+    fun `a scaled viewport at 1x is exactly the clamped viewport`() {
+        for (width in listOf(1, 319, 320, 321, 1080, 2400, 3840, 3841, 100_000)) {
+            for (height in listOf(1, 239, 240, 241, 450, 1080, 2160, 2161, 100_000)) {
+                assertEquals(
+                    "${width}x$height at 1x",
+                    InputMapper.clampViewport(width, height),
+                    InputMapper.scaledViewport(width, height, 1f),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `a scaled viewport is never one the bridge would reject`() {
+        for (width in listOf(320, 321, 1080, 2400, 3840)) {
+            for (height in listOf(240, 241, 450, 1080, 2160)) {
+                for (factor in listOf(1f, 1.5f, 2f, 3f)) {
+                    val scaled = InputMapper.scaledViewport(width, height, factor)
+                    assertTrue("${width}x$height at $factor produced nothing", scaled != null)
+                    scaled ?: continue
+                    assertNull(
+                        "${width}x$height at $factor scaled to $scaled, which the bridge rejects",
+                        MediaInput.ViewportResize(scaled.first, scaled.second).validate(),
+                    )
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `a degenerate surface or factor scales to no viewport at all`() {
+        assertNull(InputMapper.scaledViewport(0, 720, 2f))
+        assertNull(InputMapper.scaledViewport(1280, 0, 2f))
+        assertNull(InputMapper.scaledViewport(1280, 720, 0.5f))
+        assertNull(InputMapper.scaledViewport(1280, 720, Float.NaN))
+        assertNull(InputMapper.scaledViewport(1280, 720, Float.POSITIVE_INFINITY))
+    }
+
+    private fun held(ctrl: Boolean = false, alt: Boolean = false) = HeldModifiers(ctrl = ctrl, alt = alt)
+
+    private fun modifiers(ctrl: Boolean = false, alt: Boolean = false) =
+        InputMapper.heldModifiers(CLIENT_ID, SURFACE_ID, held(ctrl, alt))
+
+    @Test
+    fun `a plain chord is one press and one release`() {
+        assertEquals(
+            listOf(press(1), release(1)),
+            InputMapper.keyChord(CLIENT_ID, SURFACE_ID, 1, needsShift = false, held = HeldModifiers.NONE),
+        )
+    }
+
+    /**
+     * The raw KEY_LEFTCTRL press is the load-bearing part: wprsd derives
+     * ctrl/alt from raw key presses through xkb and ignores those flags in
+     * `KeyboardEvent::Modifiers`. The Modifiers pair is sent as well so the
+     * wire matches what a hardware Ctrl produces.
+     */
+    @Test
+    fun `a ctrl chord wraps the key in a raw ctrl press and the modifiers pair`() {
+        assertEquals(
+            listOf(press(29), modifiers(ctrl = true), press(46), release(46), modifiers(), release(29)),
+            InputMapper.keyChord(CLIENT_ID, SURFACE_ID, 46, needsShift = false, held = held(ctrl = true)),
+        )
+    }
+
+    @Test
+    fun `ctrl is outermost, alt inside it, shift innermost, and releases mirror the presses`() {
+        assertEquals(
+            listOf(
+                press(29),
+                press(56),
+                modifiers(ctrl = true, alt = true),
+                press(42),
+                press(2),
+                release(2),
+                release(42),
+                modifiers(),
+                release(56),
+                release(29),
+            ),
+            InputMapper.keyChord(CLIENT_ID, SURFACE_ID, 2, needsShift = true, held = held(ctrl = true, alt = true)),
+        )
+    }
+
+    @Test
+    fun `held modifiers carry only ctrl and alt`() {
+        val ctrlAlt = modifiers(ctrl = true, alt = true)
+        assertTrue(ctrlAlt.ctrl)
+        assertTrue(ctrlAlt.alt)
+        assertTrue(!ctrlAlt.shift)
+        assertTrue(!ctrlAlt.capsLock)
+        assertTrue(!ctrlAlt.logo)
+        assertTrue(!ctrlAlt.numLock)
+        assertEquals(0, ctrlAlt.layoutIndex)
+        assertNull(ctrlAlt.validate())
+        assertEquals(InputMapper.keyboardModifiers(CLIENT_ID, SURFACE_ID, 0), modifiers())
+    }
+
+    @Test
+    fun `every event a chord produces is in range`() {
+        val barKeys = listOf(1, 15, 103, 108, 105, 106, 102, 107, 104, 109, 111, 14, 41, 43)
+        val combos = listOf(held(), held(ctrl = true), held(alt = true), held(ctrl = true, alt = true))
+        for (code in barKeys) {
+            for (combo in combos) {
+                for (shift in listOf(false, true)) {
+                    for (event in InputMapper.keyChord(CLIENT_ID, SURFACE_ID, code, shift, combo)) {
+                        assertNull("$event should be valid", event.validate())
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `a chorded IME character is the chord for that key`() {
+        assertEquals(
+            listOf(press(29), modifiers(ctrl = true), press(46), release(46), modifiers(), release(29)),
+            InputMapper.imeTextDelta(CLIENT_ID, SURFACE_ID, "", "c", held(ctrl = true)),
+        )
+        // A shifted character keeps its shift wrap inside the chord.
+        assertEquals(
+            listOf(press(56), modifiers(alt = true), press(42), press(30), release(30), release(42), modifiers(), release(56)),
+            InputMapper.imeTextDelta(CLIENT_ID, SURFACE_ID, "", "A", held(alt = true)),
+        )
+    }
+
+    /**
+     * "Armed for the next key" means one key. A single edit can carry several
+     * characters -- a paste, or a keyboard that commits a whole word -- and
+     * chording each of them turned a paste of "abc" under armed Ctrl into
+     * Ctrl+A, Ctrl+B, Ctrl+C, where Ctrl+A alone is select-all in most guests.
+     */
+    @Test
+    fun `only the first character of a multi-character commit is chorded`() {
+        assertEquals(
+            listOf(press(29), modifiers(ctrl = true), press(30), release(30), modifiers(), release(29)) +
+                listOf(press(48), release(48)) +
+                listOf(press(46), release(46)),
+            InputMapper.imeTextDelta(CLIENT_ID, SURFACE_ID, "", "abc", held(ctrl = true)),
+        )
+    }
+
+    @Test
+    fun `the first character of a multi-character commit keeps its own shift`() {
+        // "Ab" under armed Alt: Alt wraps the shifted A, and b goes out plain.
+        assertEquals(
+            listOf(press(56), modifiers(alt = true), press(42), press(30), release(30), release(42), modifiers(), release(56)) +
+                listOf(press(48), release(48)),
+            InputMapper.imeTextDelta(CLIENT_ID, SURFACE_ID, "", "Ab", held(alt = true)),
+        )
+    }
+
+    /**
+     * The characters after a replacement are a continuation of the same edit,
+     * not new keys: only the first one the guest receives is chorded.
+     */
+    @Test
+    fun `a replacement under an armed modifier chords only its first retyped character`() {
+        val events = InputMapper.imeTextDelta(CLIENT_ID, SURFACE_ID, "teh", "the", held(ctrl = true))
+
+        assertEquals("one chord for the whole edit", 1, events.count { it == press(29) })
+        assertEquals(1, events.count { it == release(29) })
+        // The backspaces still lead, unchorded.
+        assertEquals(listOf(press(14), release(14), press(14), release(14)), events.take(4))
+        assertEquals("the chord opens on the first retyped character", press(29), events[4])
+    }
+
+    /** A deletion is the IME reconciling its own buffer, not a user chord. */
+    @Test
+    fun `a chorded delta still deletes unchorded`() {
+        assertEquals(
+            listOf(press(14), release(14)),
+            InputMapper.imeTextDelta(CLIENT_ID, SURFACE_ID, "ab", "a", held(ctrl = true)),
+        )
+    }
+
+    @Test
+    fun `the default held argument produces the unchorded delta`() {
+        assertEquals(delta("teh", "the"), InputMapper.imeTextDelta(CLIENT_ID, SURFACE_ID, "teh", "the", HeldModifiers.NONE))
+    }
+
+    @Test
+    fun `the hidden field is emptied once its buffer passes the limit`() {
+        val atLimit = "a".repeat(IME_BUFFER_LIMIT)
+
+        assertFalse(InputMapper.shouldResetImeBuffer(atLimit, hasComposition = false, chorded = false))
+        assertTrue(InputMapper.shouldResetImeBuffer(atLimit + "a", hasComposition = false, chorded = false))
+        assertFalse(InputMapper.shouldResetImeBuffer("echo test", hasComposition = false, chorded = false))
+        assertFalse(InputMapper.shouldResetImeBuffer("", hasComposition = false, chorded = false))
+    }
+
+    /**
+     * Only what the guest received counts toward the limit: a field full of
+     * untypable characters has sent nothing, so emptying it would diff to
+     * nothing anyway -- and the reset restarts the IME's input session.
+     */
+    @Test
+    fun `characters the guest never received do not count toward the limit`() {
+        assertFalse(
+            InputMapper.shouldResetImeBuffer("é".repeat(IME_BUFFER_LIMIT * 2), hasComposition = false, chorded = false),
+        )
+    }
+
+    /**
+     * A reset mid-composition restarts the IME's input session and drops the
+     * composition in flight, so the buffer is allowed to run past the limit
+     * until the composition ends.
+     */
+    @Test
+    fun `a pending composition defers every reset`() {
+        val overLimit = "a".repeat(IME_BUFFER_LIMIT + 1)
+
+        assertFalse(InputMapper.shouldResetImeBuffer(overLimit, hasComposition = true, chorded = false))
+        assertFalse(InputMapper.shouldResetImeBuffer("c", hasComposition = true, chorded = true))
+    }
+
+    /**
+     * Gboard committed "c" for Ctrl+C; the guest got a chord, not text, so a
+     * later Backspace must not be diffed against a character it never
+     * received as text.
+     */
+    @Test
+    fun `a chorded character empties the field whatever its length`() {
+        assertTrue(InputMapper.shouldResetImeBuffer("c", hasComposition = false, chorded = true))
+        assertTrue(InputMapper.shouldResetImeBuffer("", hasComposition = false, chorded = true))
+    }
+
+    @Test
+    fun `typedChars counts what the delta types, not what it deletes`() {
+        assertEquals(1, InputMapper.typedChars("", "c"))
+        assertEquals(2, InputMapper.typedChars("teh", "the"))
+        assertEquals(0, InputMapper.typedChars("ab", "a"))
+        assertEquals(0, InputMapper.typedChars("", ""))
+        // An untypable character is not typed, so it is not counted.
+        assertEquals(0, InputMapper.typedChars("", "é"))
+        assertEquals(1, InputMapper.typedChars("it’", "it’s"))
     }
 }
