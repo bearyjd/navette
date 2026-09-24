@@ -3220,6 +3220,44 @@ apps, one an account-recovery screen with a destructive button. When dispatching
 work, name the device serial and require every tap to come from a fresh `uiautomator
 dump` with a frontmost-app check immediately before it.
 
+**Gates re-run independently (2026-09-23, later).** The numbers above were prior-session
+claims; they now have fresh evidence behind them. Android **482 tests / 0 failures /
+0 errors / 0 skipped** across 38 classes — note the first run reported `BUILD SUCCESSFUL`
+with `testDebugUnitTest UP-TO-DATE`, i.e. **no test actually ran**; the figure above is
+from `./gradlew testDebugUnitTest --rerun-tasks` (24 tasks executed) tallied out of the
+JUnit XML, not from Gradle's exit code. `lintDebug` did execute in that first run and
+reports 0 errors. Rust **396 passed / 0 failed /
+1 ignored**, `cargo clippy --workspace --all-targets -- -D warnings` clean and
+`cargo fmt --all --check` clean on rustc/clippy 1.95.0 — the branch touches no Rust at
+all (the diff is 30 Kotlin/doc files, 4069+/341-). `git diff --check master...HEAD`
+clean. Largest source file changed is `SessionController.kt` at 781 lines, under the 800
+rule; `FileTransferCoordinatorTest.kt` is 980 but is pre-existing and untouched here.
+
+**The autofill verification is blocked on hardware that is not here, and the leftover
+debug build is not on the phone that is.** The attached device is
+`57211FDCG0023C`, a **Pixel 10 Pro Fold**, API 37 — and
+`settings get secure autofill_service` on it returns **empty**, so no autofill provider
+is configured. That is the discriminator: this is not the phone the entry above calls
+"the only phone here with an autofill provider configured", whatever the model names
+were written as. With no provider there can be no fill prompt, so running the probe on
+this device would be vacuous rather than reassuring — and configuring a password manager
+on it to create the condition would mean changing a personal phone's security settings,
+which is not a thing to do for a test. Item (1) stays open until the other phone is
+attached.
+
+Item (2) does **not** apply to this device either. `com.greponlabs.navette` here is
+`versionName=0.1.0`, flags `[ DEBUGGABLE … ]`, `installerPackageName=null`, first
+installed 2026-09-22 20:06 — a sideloaded debug build on the phone that *did* the
+verified hardware testing, which is expected and not the stray. The stray is on the
+absent phone. **Nothing was uninstalled.**
+
+Still genuinely unverified and runnable on the attached phone once someone wants to
+drive it: the **70-character continuous-typing** check and **stuck-modifier recovery**
+from the four below. Neither appears anywhere in this file as done. Worth knowing before
+running the first one: the guest's 200/s auto-repeat (see the duplication entry) will
+confound it — a burst there is the *guest* repeating, not the hidden field's 64-character
+reset boundary, and only per-keycode client logging tells the two apart.
+
 The phone became a client you can *work in* rather than a mirror: a key bar with
 sticky Ctrl/Alt above Gboard, a deterministic IME field, the stream shrinking above
 the keyboard, and 1×/1.5×/2×/3× scale presets remembered per host. Zero Rust
