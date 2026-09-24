@@ -3188,6 +3188,38 @@ only, not run on the Pixel.
 
 ## Mobile keyboard + logical scale presets (2026-09-21)
 
+**State of play (2026-09-23).** Branch `feat/mobile-keyboard-and-scale`, **three
+commits, not pushed, no PR**: `d3f9ef5` the feature, `ee9586a` the autofill fix,
+`ffa7b8f` this file. Gates green — Android **482 tests / 0 failures**, lint 0 errors,
+Rust untouched at 396/0, `git diff --check` clean, every source file under the
+800-line rule. Two independent reviews (code + security) closed at WARN with every
+pre-merge item fixed; 10 planned tasks and 9 review items done.
+
+*Verified on hardware* (Pixel 10, real daemon over the tailnet, real Gboard taps):
+Scale 2× makes a `foot` session genuinely readable where 1× was unusable; the key bar
+renders between stream and keyboard; **armed Ctrl + Gboard `c` produces a real `^C` in
+the guest**; `imePadding()` keeps the prompt visible while typing; the Keys/Hide-keys
+labels match the screen.
+
+*Not verified, and why*: the autofill fix (`ee9586a`). The **exposure** is confirmed on
+device — see the autofill entry below — but that the fix *stops* it is not. It needs
+the Pixel 9 Pro Fold, the only phone here with an autofill provider configured; both
+phones dropped off adb one tap short. Also unverified: anything on API 30–34, where
+`adjustResize` plus `imePadding()` might double-apply the inset. Both phones are
+API 37 and no emulator could be stood up (`avdmanager` needs a JDK that is not
+installed), so this ships untested on Android 11–14 with `minSdk = 26`.
+
+*Open decisions for the owner*: (1) finish the autofill verification on the Pixel 9;
+(2) uninstall the debug build left on that phone, which is paired to a throwaway test
+daemon; (3) the guest key-repeat rate — see the duplication entry below — is a one-line
+change in the wprs fork, not this repo, and wants its own PR; (4) push and open the PR.
+
+*Do not repeat this mistake*: a subagent reproducing the duplication bug drove that
+Pixel 9 with blind scripted coordinate taps and twice landed in unrelated personal
+apps, one an account-recovery screen with a destructive button. When dispatching device
+work, name the device serial and require every tap to come from a fresh `uiautomator
+dump` with a frontmost-app check immediately before it.
+
 The phone became a client you can *work in* rather than a mirror: a key bar with
 sticky Ctrl/Alt above Gboard, a deterministic IME field, the stream shrinking above
 the keyboard, and 1×/1.5×/2×/3× scale presets remembered per host. Zero Rust
