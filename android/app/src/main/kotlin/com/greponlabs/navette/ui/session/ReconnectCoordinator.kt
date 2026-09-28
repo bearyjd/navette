@@ -1,6 +1,5 @@
 package com.greponlabs.navette.ui.session
 
-import com.greponlabs.navette.net.ConnectionState
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
@@ -28,7 +27,7 @@ internal suspend fun awaitReconnectRebuild(
             attemptsUsed,
             dropped.streamEnded,
             dropped.decodeError,
-            dropped.connection is ConnectionState.Unauthorized,
+            ReconnectPolicy.isRejected(dropped.connection),
         )
     ) {
         return false

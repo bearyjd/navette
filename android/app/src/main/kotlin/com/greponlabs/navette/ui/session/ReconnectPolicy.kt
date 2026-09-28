@@ -43,6 +43,14 @@ object ReconnectPolicy {
         }
 
     /**
+     * Whether the daemon refused the token. Retrying cannot help, so
+     * [shouldRetry] must be told; asked of the phase rather than of one
+     * variant, so any state classified as [ConnectionPhase.Rejected] is never
+     * retried into a silent loop.
+     */
+    fun isRejected(connection: ConnectionState): Boolean = connection.phase == ConnectionPhase.Rejected
+
+    /**
      * Whether a drop should be retried automatically after [attempt]
      * retries have already been spent on it.
      *

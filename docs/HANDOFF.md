@@ -2848,8 +2848,12 @@ a screenshot is the fastest way to communicate that.
 ## Project hazard: `ConnectionState` has no compiler-enforced exhaustiveness (2026-09-12)
 
 **Resolved (2026-09-27):** `ConnectionPhase.kt` classifies every `ConnectionState` in one
-`when (this)` with no `else`; `ReconnectPolicy.isDropped`, `SessionOverlay` and `NavetteApp`
-now switch on the phase (the overlay exhaustively). Adding a throwaway variant fails to
+`when (this)` with no `else`; `ReconnectPolicy.isDropped`/`isRejected` (which the retry
+coordinator and the session screen now use instead of `is Unauthorized`), `SessionOverlay` and
+`NavetteApp` switch on the phase, the overlay exhaustively; `ConnectScreen` matches the sealed
+type itself with no `else` (there `Disconnected` and `Failed` differ, though both are Dropped).
+Still single-state checks by design: `AppViewModel`'s `Connected`/`Failed` handlers and
+`SessionController`'s "socket is live" checks. Adding a throwaway variant fails to
 compile at `ConnectionPhase.kt` — checked. The original note follows.
 
 Found during Task 7 (Android 401 handling), and the plan's own prediction about it

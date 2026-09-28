@@ -30,6 +30,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
+import com.greponlabs.navette.net.ConnectionPhase
 import com.greponlabs.navette.net.ConnectionState
 import com.greponlabs.navette.net.DEFAULT_NAVETTE_PORT
 import com.greponlabs.navette.net.Pairing
@@ -37,6 +38,7 @@ import com.greponlabs.navette.net.canonicalHost
 import com.greponlabs.navette.net.canonicalPort
 import com.greponlabs.navette.net.normalizePairingToken
 import com.greponlabs.navette.net.parsePairingUri
+import com.greponlabs.navette.net.phase
 import com.greponlabs.navette.net.validatedPairing
 import com.greponlabs.navette.ui.WakeUiState
 
@@ -121,7 +123,7 @@ fun ConnectScreen(
     // connect time looking exactly like an auth bug.
     var tokenVisible by rememberSaveable { mutableStateOf(false) }
 
-    val connecting = connection is ConnectionState.Connecting
+    val connecting = connection.phase == ConnectionPhase.Connecting
 
     Column(
         modifier = modifier.fillMaxSize().padding(32.dp),
@@ -158,18 +160,24 @@ fun ConnectScreen(
         if (scanError != null) {
             Text(text = scanError.orEmpty(), color = MaterialTheme.colorScheme.error)
         }
-        if (connection is ConnectionState.Failed) {
-            Text(text = connection.reason, color = MaterialTheme.colorScheme.error)
-            FailedActions(wake = wake, wakeViaLabel = wakeViaLabel, onRetry = onRetry, onWake = onWake)
-        }
-        // Terminal: the daemon rejected the stored token, and retrying it
-        // would just fail the same way. Only a fresh pairing -- scanned or
-        // typed -- can recover from here.
-        if (connection is ConnectionState.Unauthorized) {
-            Text(
-                text = "Pairing rejected. Scan a new code or enter one manually.",
-                color = MaterialTheme.colorScheme.error,
-            )
+        // Over the sealed type, not ConnectionPhase: here Disconnected means
+        // "nothing tried yet" while Failed has a reason and a Retry, and both
+        // are Dropped. No `else`, so a new state must be placed before this
+        // compiles.
+        when (connection) {
+            is ConnectionState.Failed -> {
+                Text(text = connection.reason, color = MaterialTheme.colorScheme.error)
+                FailedActions(wake = wake, wakeViaLabel = wakeViaLabel, onRetry = onRetry, onWake = onWake)
+            }
+            // Terminal: the daemon rejected the stored token, and retrying it
+            // would just fail the same way. Only a fresh pairing -- scanned or
+            // typed -- can recover from here.
+            ConnectionState.Unauthorized ->
+                Text(
+                    text = "Pairing rejected. Scan a new code or enter one manually.",
+                    color = MaterialTheme.colorScheme.error,
+                )
+            ConnectionState.Connecting, ConnectionState.Connected, ConnectionState.Disconnected -> Unit
         }
 
         TextButton(onClick = { manualEntryShown = !manualEntryShown }) {

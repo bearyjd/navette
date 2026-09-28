@@ -45,7 +45,6 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
 import androidx.core.content.FileProvider
-import com.greponlabs.navette.net.ConnectionState
 import com.greponlabs.navette.net.MAX_BLOB_BYTES
 import com.greponlabs.navette.net.Pairing
 import com.greponlabs.navette.net.mediaWebSocketUrl
@@ -318,7 +317,7 @@ fun SessionScreen(
                 reconnectAttempt,
                 state.streamEnded,
                 state.decodeError,
-                state.connection is ConnectionState.Unauthorized,
+                ReconnectPolicy.isRejected(state.connection),
             )
     val onReconnect = {
         reconnectAttempt = 0
