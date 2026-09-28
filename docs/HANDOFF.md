@@ -3329,6 +3329,9 @@ two settings predict. The fork's own `add_keyboard(…, 200, 200)` stays as is; 
 wprsd helpers in `input.rs` and `bridge.rs` skip the new preamble event. Harness:
 `hold.py`-style — wait for a `StreamConfig` frame (kind byte 6 == 1, ids at payload
 1..9 / 9..17 after the 44-byte header), then send `keyboard_key` press, sleep, release.
+X11 apps get the same rate and do not double-repeat: an `xterm` session (built with the
+per-session X display fix, PR #45) gave 100 ms → 1, 400 ms → 1, 1000 ms → 11, identical to
+`foot` — the xwayland proxy forwards `repeat_info` into its own seat and nothing repeats twice.
 
 **Android 8 / 11 / 14 verified on emulators (2026-09-27): no double inset.** The last
 untested range (API 30–34, plus `minSdk` 26) was run on google_apis x86_64 AVDs with
