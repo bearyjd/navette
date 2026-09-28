@@ -56,10 +56,13 @@ pub async fn authenticate(
 /// The credentials of an `Authorization: Bearer <token>` header value.
 ///
 /// RFC 7235 makes the auth-scheme a case-insensitive token, so `bearer` and
-/// `BEARER` are the same scheme; one or more spaces separate it from the token
-/// (RFC 7235's `1*SP`). Anything else -- another scheme, no separator, no
-/// token -- is `None`, which the caller turns into the same bare 401 as a wrong
-/// token.
+/// `BEARER` are the same scheme. Another scheme, no separator, or no token is
+/// `None`, which the caller turns into the same bare 401 as a wrong token.
+///
+/// This only picks the credentials out; it is not the gate. `AuthToken::parse`
+/// already ignores spaces and hyphens anywhere and is case-insensitive, so the
+/// leading-space trim below (RFC 7235's `1*SP`) accepts nothing new -- the
+/// token's decoded bytes, compared in constant time, decide.
 fn bearer_credentials(value: &str) -> Option<&str> {
     let (scheme, rest) = value.split_once(' ')?;
     if !scheme.eq_ignore_ascii_case("Bearer") {
@@ -196,6 +199,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_lowercase_scheme_does_not_relax_the_token_check() {
+        let router = test_router();
+        let wrong = navette_auth::AuthToken::generate().render();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .header("Authorization", format!("bearer {wrong}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
