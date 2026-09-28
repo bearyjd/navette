@@ -3330,6 +3330,23 @@ wprsd helpers in `input.rs` and `bridge.rs` skip the new preamble event. Harness
 `hold.py`-style — wait for a `StreamConfig` frame (kind byte 6 == 1, ids at payload
 1..9 / 9..17 after the 44-byte header), then send `keyboard_key` press, sleep, release.
 
+**Android 8 / 11 / 14 verified on emulators (2026-09-27): no double inset.** The last
+untested range (API 30–34, plus `minSdk` 26) was run on google_apis x86_64 AVDs with
+Gboard, paired to a loopback daemon at `10.0.2.2`. On API 26, 30 and 34 alike, with the
+keyboard up the key bar sits flush on the IME (API 34: bar bottom ≈ 380, IME touchable
+from 394; API 30 and 26: `Esc` at 420–473, IME from 520) and the stream shrinks into
+the band above it; hidden, the stream fills the screen. The same layout as the Pixel 10
+on API 37 — nothing is pushed off-screen by a doubled inset. Typing through Gboard reached
+the guest exactly on all three, as did armed Ctrl + `c` → `0x03`, locked Ctrl + `a` →
+`0x01`, and a plain key after release. The chip now reports `checkable=true`, `checked`
+tracking off → armed → locked → off (Compose maps `semantics { selected }` to
+checkable/checked, not `selected`, for anything that is not a Tab).
+Emulator gotchas: only `-gpu host` works here — swiftshader and lavapipe SEGV in the
+emulator's RenderThread (it looked like a KVM crash; it is not); `avdmanager` writes to
+`~/.config/.android/avd`, so set `ANDROID_AVD_HOME`; API 26's `uiautomator` cannot dump
+the IME window. An idle guest shows "Waiting for the first frame…" after attach until it
+repaints, on every API level — the known idle-`foot` single-access-unit behaviour.
+
 Capture recipe (container root lacks `CAP_NET_RAW`, the host's sudo does not):
 `host-spawn sudo -n tcpdump -i tailscale0 -n -U -w ~/cap.pcap "tcp port 9517 and src
 host <phone-tailnet-ip>"`, then pair consecutive 123/124-byte segments.
