@@ -14,6 +14,9 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.dp
 
 /**
@@ -138,9 +141,33 @@ private fun StickyKeyChip(
             Modifier
                 .padding(horizontal = 4.dp, vertical = 6.dp)
                 .then(ground)
-                .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+                .semantics {
+                    stateDescription = state.spoken
+                    selected = state.engaged
+                }.combinedClickable(
+                    onClickLabel = if (state == StickyState.Off) "arm for the next key" else "release",
+                    onClick = onClick,
+                    onLongClickLabel = "lock",
+                    onLongClick = onLongClick,
+                )
                 .padding(horizontal = 12.dp, vertical = 8.dp),
     ) {
         Text(label, color = if (state == StickyState.Off) Color.White else ARMED_TINT)
     }
 }
+
+/**
+ * What TalkBack reads after a chip's label. The tint and the filled ground are
+ * the only other signal, so without this an armed or locked Ctrl sounds the
+ * same as an idle one.
+ */
+internal val StickyState.spoken: String
+    get() =
+        when (this) {
+            StickyState.Off -> "Off"
+            StickyState.Armed -> "Armed for the next key"
+            StickyState.Locked -> "Locked"
+        }
+
+/** Whether the chip reads as selected: armed and locked both hold the modifier. */
+internal val StickyState.engaged: Boolean get() = this != StickyState.Off
