@@ -484,13 +484,17 @@ Ctrl+Backspace, which deletes a word in most shells. Intended, but it
 surprises people. A multi-character commit (a paste) chords only its first
 character.
 
-**Android: characters repeat when typing quickly** (`echo` arrives as `eeeecho`).
-Not the phone: the client sends one press and one release per character
-(confirmed with per-keycode logging). The guest auto-repeats because `wprsd`
-configures `repeat_delay = 200 ms` with `repeat_rate = 200` characters per
-second (`add_keyboard(Default::default(), 200, 200)`), so a release delayed past
-200 ms yields a character every 5 ms until it lands. Typing more slowly avoids
-it; the real fix is a sane repeat rate in the wprs fork.
+**Android: characters repeat in the guest** (`echo` arrives as `eeeecho`).
+The client sends one press and one release per character (confirmed with
+per-keycode logging). The guest auto-repeats because `wprsd` configures
+`repeat_delay = 200 ms` with `repeat_rate = 200` characters per second
+(`add_keyboard(Default::default(), 200, 200)`), so a release that reaches the
+guest more than 200 ms after its press yields a character every 5 ms until it
+lands. Builds before the `TCP_NODELAY` fix made that likely: Nagle held every
+release for the press's ACK (33 ms median on the tailnet, far more on a busy
+host). On a current build a burst means a real stall between phone and guest —
+check the host's load first. The remaining fix is a sane repeat rate in the
+wprs fork.
 
 **Android: the guest behaves as if Ctrl (or Alt) is stuck down.**
 Tap that chip on the **Keys** bar: turning a modifier off always sends its

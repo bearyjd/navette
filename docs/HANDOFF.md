@@ -3271,6 +3271,57 @@ changes items (1) and (2) above from "wait for the other phone" to:
   review alone (`ee9586a` turns off Compose semantic autofill for the session screen;
   the exposure itself was confirmed on the Pixel 9 before it broke).
 
+**On-device checklist closed on the Pixel 10 (2026-09-27), and a real transport bug
+found and fixed.** Throwaway `navetted` on the tailnet (`100.111.143.67:9517`, scratch
+state and token), one session running a raw-mode byte logger in `foot`, so every check
+reads the exact bytes the guest received rather than a screenshot. Every keystroke was a
+real Gboard key tap, each located from a fresh `uiautomator dump --windows` (Gboard's
+keys are accessibility nodes with one-character `content-desc`s) behind a frontmost-app
+check and a heads-up-notification guard — this phone is now the owner's daily driver and
+personal notifications arrived mid-run.
+
+- **Autofill: verified, with a control.** The phone now has **Bitwarden** as its autofill
+  service (it was empty on 09-23; nothing here configured it). HEAD: four keyboard raises
+  in a session, zero navette autofill requests in `dumpsys autofill`'s history, no
+  sessions, no autofill windows; the Connect screen still raises its request and offers
+  to save, as it should. **Pre-fix build (`d3f9ef5`) on the same phone:** the first raise
+  logged a request for the hidden field (`b=Rect(0, 0 - 2, 2)`) and Bitwarden answered
+  `SUCCESS, NUM_DATASETS=1` — a credential ready to fill the invisible field. So the probe
+  is sensitive and `ee9586a` is what stops it. The save prompt for the throwaway token was
+  declined; nothing went into the vault.
+- **70 characters across the 64-char reset: passes.** Chars 61-70 arrived once each; 8
+  Backspaces after the reset arrived as 8 `0x7f`; a trailing `z` landed.
+- **Stuck-modifier recovery: passes.** Locked Ctrl + `a` gave `0x01`; left the session
+  with Ctrl still locked; re-attached; `a`,`b` arrived plain. Minor finding: the chip's
+  armed/locked state is not exposed to accessibility (`checked`/`selected` false, no
+  description), so TalkBack cannot tell it is on.
+- **Keys button with the keyboard up**: labels tracked the screen across all toggles
+  (`Keys`↔`Hide keys`, `Keyboard`↔`Hide keyboard`); not separately probed beyond that.
+
+**The repeat bursts were not only the guest's repeat rate: Nagle held every key release
+for an ACK.** Even at ~6 s between taps, the 70-character run produced `g`×25 and `h`×70.
+A host capture of phone→daemon traffic on `tailscale0` showed each key as a 123-byte
+segment (press) and a 124-byte segment (release) leaving the phone a **median 33.6 ms,
+max 100 ms apart** on a 15 ms RTT, although the client writes them microseconds apart:
+the release waited for the press's ACK (server delayed-ACK). With wprsd repeating after
+200 ms, any late ACK becomes a burst; the bursts in that run clustered while a Gradle
+build was loading the host, and clean runs on an idle host still carried the 33 ms tax.
+Fix: `NoDelaySocketFactory` sets `TCP_NODELAY` on the media socket (`MediaClient`).
+Re-captured: press→release gap **0.01 ms** (max 0.03, 20 pairs), all in the same
+millisecond; 30 keys typed under a (lighter) concurrent build arrived exactly once each.
+`MediaClientTest` pins it through OkHttp's own connect path. Gotchas for whoever touches
+that test: OkHttp 4.12's WebSocket connect replaces the `EventListener` with
+`EventListener.NONE` *and* skips network interceptors (`forWebSocket = true`), so the
+probe is a plain HTTP call on a client derived from `MediaClient.httpClient` — same
+factory, same `connectSocket`. A SOCKS proxy bypasses the factory (OkHttp builds
+`Socket(proxy)` itself). The wprs repeat rate (200/s) is still worth fixing in the fork:
+it is what turns any remaining downstream stall into 5 ms-per-character bursts.
+`NavetteClient` was deliberately left with Nagle on — one request frame per call.
+
+Capture recipe (container root lacks `CAP_NET_RAW`, the host's sudo does not):
+`host-spawn sudo -n tcpdump -i tailscale0 -n -U -w ~/cap.pcap "tcp port 9517 and src
+host <phone-tailnet-ip>"`, then pair consecutive 123/124-byte segments.
+
 The phone became a client you can *work in* rather than a mirror: a key bar with
 sticky Ctrl/Alt above Gboard, a deterministic IME field, the stream shrinking above
 the keyboard, and 1×/1.5×/2×/3× scale presets remembered per host. Zero Rust
