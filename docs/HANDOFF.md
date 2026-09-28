@@ -2847,6 +2847,11 @@ a screenshot is the fastest way to communicate that.
 
 ## Project hazard: `ConnectionState` has no compiler-enforced exhaustiveness (2026-09-12)
 
+**Resolved (2026-09-27):** `ConnectionPhase.kt` classifies every `ConnectionState` in one
+`when (this)` with no `else`; `ReconnectPolicy.isDropped`, `SessionOverlay` and `NavetteApp`
+now switch on the phase (the overlay exhaustively). Adding a throwaway variant fails to
+compile at `ConnectionPhase.kt` — checked. The original note follows.
+
 Found during Task 7 (Android 401 handling), and the plan's own prediction about it
 was wrong, in the dangerous direction — worth recording as a standing hazard rather
 than only a footnote on a fixed bug.

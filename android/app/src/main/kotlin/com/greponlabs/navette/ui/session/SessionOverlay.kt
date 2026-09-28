@@ -16,7 +16,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
+import com.greponlabs.navette.net.ConnectionPhase
 import com.greponlabs.navette.net.ConnectionState
+import com.greponlabs.navette.net.phase
 
 /**
  * Connection and error states drawn over the video.
@@ -46,7 +48,7 @@ internal fun SessionOverlay(
 
     // Nothing to draw once the stream is live: connected, a frame decoded, and
     // no terminal error. Everything else needs an overlay of some kind.
-    if (terminal == null && state.connection is ConnectionState.Connected && state.contentSize != null) return
+    if (terminal == null && state.connection.phase == ConnectionPhase.Live && state.contentSize != null) return
 
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(
@@ -61,42 +63,57 @@ internal fun SessionOverlay(
                     if (state.decodeError != null) Button(onClick = onReconnect) { Text("Reconnect") }
                     TextButton(onClick = onLeave) { Text("Back to sessions", color = Color.White) }
                 }
-                // Checked ahead of `reconnecting` and the generic dropped
-                // branch below: the daemon refused our token, so retrying is
-                // not merely unhelpful here, it is the exact silent-loop
-                // failure mode this state exists to prevent (see
-                // ReconnectPolicy.shouldRetry). The only way out is pairing
-                // again, not a reconnect button that would just be refused
-                // the same way.
-                state.connection is ConnectionState.Unauthorized -> {
-                    OverlayText("Pairing rejected -- scan the QR code again", MaterialTheme.typography.bodyLarge)
-                    TextButton(onClick = onLeave) { Text("Back to sessions", color = Color.White) }
-                }
-                reconnecting -> {
-                    CircularProgressIndicator()
-                    OverlayText("Connection lost -- reconnecting...", MaterialTheme.typography.bodyMedium)
-                    TextButton(onClick = onLeave) { Text("Back to sessions", color = Color.White) }
-                }
-                ReconnectPolicy.isDropped(state.connection) -> {
-                    val reason = (state.connection as? ConnectionState.Failed)?.reason ?: "connection lost"
-                    OverlayText("Disconnected: $reason", MaterialTheme.typography.bodyLarge)
-                    Button(onClick = onReconnect) { Text("Reconnect") }
-                    TextButton(onClick = onLeave) { Text("Back to sessions", color = Color.White) }
-                }
-                else -> {
-                    CircularProgressIndicator()
-                    val label =
-                        when {
-                            state.connection is ConnectionState.Connecting && reconnectAttempt > 0 ->
-                                "Reconnecting... ($reconnectAttempt/$maxAttempts)"
-                            state.connection is ConnectionState.Connecting -> "Connecting..."
-                            else -> "Waiting for the first frame..."
+                // Exhaustive over the phase, no `else`: a new ConnectionState
+                // must be given a phase before this compiles, and then lands in
+                // a branch someone chose (see ConnectionPhase).
+                else ->
+                    when (state.connection.phase) {
+                        // Ahead of `reconnecting`: the daemon refused our token,
+                        // so retrying is not merely unhelpful here, it is the
+                        // exact silent-loop failure mode this state exists to
+                        // prevent (see ReconnectPolicy.shouldRetry). The only way
+                        // out is pairing again, not a reconnect button that would
+                        // just be refused the same way.
+                        ConnectionPhase.Rejected -> {
+                            OverlayText("Pairing rejected -- scan the QR code again", MaterialTheme.typography.bodyLarge)
+                            TextButton(onClick = onLeave) { Text("Back to sessions", color = Color.White) }
                         }
-                    OverlayText(label, MaterialTheme.typography.bodyMedium)
-                }
+                        ConnectionPhase.Dropped ->
+                            if (reconnecting) {
+                                ReconnectingOverlay(onLeave)
+                            } else {
+                                val reason = (state.connection as? ConnectionState.Failed)?.reason ?: "connection lost"
+                                OverlayText("Disconnected: $reason", MaterialTheme.typography.bodyLarge)
+                                Button(onClick = onReconnect) { Text("Reconnect") }
+                                TextButton(onClick = onLeave) { Text("Back to sessions", color = Color.White) }
+                            }
+                        ConnectionPhase.Connecting ->
+                            if (reconnecting) {
+                                ReconnectingOverlay(onLeave)
+                            } else {
+                                val label =
+                                    if (reconnectAttempt > 0) "Reconnecting... ($reconnectAttempt/$maxAttempts)" else "Connecting..."
+                                SpinnerOverlay(label)
+                            }
+                        ConnectionPhase.Live ->
+                            if (reconnecting) ReconnectingOverlay(onLeave) else SpinnerOverlay("Waiting for the first frame...")
+                    }
             }
         }
     }
+}
+
+@Composable
+private fun ReconnectingOverlay(onLeave: () -> Unit) {
+    CircularProgressIndicator()
+    OverlayText("Connection lost -- reconnecting...", MaterialTheme.typography.bodyMedium)
+    TextButton(onClick = onLeave) { Text("Back to sessions", color = Color.White) }
+}
+
+@Composable
+private fun SpinnerOverlay(label: String) {
+    CircularProgressIndicator()
+    OverlayText(label, MaterialTheme.typography.bodyMedium)
 }
 
 @Composable
