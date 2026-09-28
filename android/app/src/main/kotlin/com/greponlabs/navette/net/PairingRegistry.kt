@@ -2,6 +2,9 @@ package com.greponlabs.navette.net
 
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.intOrNull
 import java.util.UUID
 
 /**
@@ -82,6 +85,11 @@ internal object PairingRegistryCodec {
      * "no preference" ([ViewScale.fromFactor]).
      */
     fun decode(raw: String): RegistryDecode {
+        // Before the strict decode: a newer schema that added keys would fail it
+        // (ignoreUnknownKeys = false) and read as Corrupt, which the store maps to
+        // an empty registry the next write replaces -- losing every pairing on an
+        // APK downgrade. Reading only `version` first keeps that newer payload Future.
+        if ((wireVersion(raw) ?: 0) > VERSION) return RegistryDecode.Future
         val wire = runCatching { json.decodeFromString(RegistryWire.serializer(), raw) }.getOrNull() ?: return RegistryDecode.Corrupt
         if (wire.version > VERSION) return RegistryDecode.Future
         val ids = wire.hosts.map { it.id }.toSet()
@@ -98,6 +106,13 @@ internal object PairingRegistryCodec {
         if (wire.activeId != null && wire.activeId !in ids) return RegistryDecode.Corrupt
         return RegistryDecode.Valid(PairingRegistry(hosts, wire.activeId))
     }
+
+    /** The payload's `version` if it is a JSON object whose `version` is an integer number. */
+    private fun wireVersion(raw: String): Int? =
+        runCatching {
+            val version = (Json.parseToJsonElement(raw) as? JsonObject)?.get("version") as? JsonPrimitive
+            version?.takeUnless { it.isString }?.intOrNull
+        }.getOrNull()
 
     /**
      * Re-pairing an endpoint rotates its token; the wake target and the view
