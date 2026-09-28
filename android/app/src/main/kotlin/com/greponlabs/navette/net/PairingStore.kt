@@ -91,7 +91,7 @@ class EncryptedPairingStore(context: Context) : PairingStore {
      */
     private fun mutableSnapshot(): PairingRegistry {
         val decoded = registryFromPreferences()
-        if (decoded is RegistryDecode.Future) throw IllegalStateException("pairing registry was created by a newer app")
+        if (decoded is RegistryDecode.Future) throw RegistryFromNewerAppException()
         return (decoded as? RegistryDecode.Valid)?.registry ?: PairingRegistry()
     }
 

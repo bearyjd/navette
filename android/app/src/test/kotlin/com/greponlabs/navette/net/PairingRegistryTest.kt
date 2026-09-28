@@ -54,6 +54,20 @@ class PairingRegistryTest {
     }
 
     @Test
+    fun `a quoted version is read the way the strict decoder reads it`() {
+        // The strict decoder coerces "4" to 4; the pre-parse must agree, or a
+        // quoted newer version with new keys would still be wiped as Corrupt.
+        assertEquals(RegistryDecode.Future, PairingRegistryCodec.decode("""{"version":"4","hosts":[],"alsoNew":1}"""))
+        assertEquals(RegistryDecode.Future, PairingRegistryCodec.decode("""{"version":"4","hosts":[]}"""))
+    }
+
+    @Test
+    fun `a duplicated version key is read as its last value by both parsers`() {
+        assertEquals(RegistryDecode.Future, PairingRegistryCodec.decode("""{"version":3,"version":4,"hosts":[]}"""))
+        assertEquals(RegistryDecode.Valid(PairingRegistry()), PairingRegistryCodec.decode("""{"version":4,"version":3,"hosts":[]}"""))
+    }
+
+    @Test
     fun `an unknown key at a known version is still corrupt`() {
         assertEquals(RegistryDecode.Corrupt, PairingRegistryCodec.decode("""{"version":3,"hosts":[],"alsoNew":true}"""))
         assertEquals(RegistryDecode.Corrupt, PairingRegistryCodec.decode("""{"version":2,"hosts":[],"alsoNew":true}"""))
