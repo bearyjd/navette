@@ -3185,3 +3185,27 @@ Still true after all four: `api.rs` (~2.9k) and `bridge.rs` (~2.7k) are well ove
 800-line rule and should be split (`api/images.rs`, `api/wake.rs` are the obvious
 first extractions); the phone-side flows for wake and thumbnails are unit-tested
 only, not run on the Pixel.
+
+## X11 apps escaped their session: fixed (2026-09-27)
+
+Found while testing key repeat with an X11 app. Two bugs, both confirmed live before
+the fix:
+
+- **The guest inherited navetted's `DISPLAY`.** `Supervisor::start` set
+  `XDG_RUNTIME_DIR`, `WAYLAND_DISPLAY` and `NAVETTE_DROP_DIR` for the app but never
+  `DISPLAY`, so with navetted started from a desktop terminal (`DISPLAY=:0`) an X11 app
+  launched from the phone — xterm, Electron without Ozone, Wine/Bottles, Java — opened
+  **on the host's own screen**, and the phone saw nothing (`hold.py` timed out waiting
+  for a stream). A probe app recorded `DISPLAY=:0 WAYLAND_DISPLAY=navette-three`.
+- **Only the first session could run Xwayland at all.** wprsd starts
+  `xwayland-xdg-shell` with its defaults — display `:100`, Wayland socket
+  `xwayland-xdg-shell-0` — for every session, so the second session's shell panicked:
+  `failed to start xwayland.: AddrInUse "Could not find a free socket for the XServer."`
+
+Fix: `xdisplay.rs` claims the lowest display from `:100` with no `/tmp/.X11-unix/X<n>`,
+no `/tmp/.X<n>-lock` and no recent claim (a claim only has to cover startup; once
+Xwayland runs, its lock file protects the number). The supervisor passes
+`--xwayland-xdg-shell-args=--display,<n>,--wayland-display,<session>-xwayland` to wprsd
+and always sets the app's `DISPLAY=:<n>`. Live after the fix: two sessions got `:100` and
+`:101`, both Xwayland servers up, no panic; an xterm session had `DISPLAY=:100`, streamed,
+and took a key.

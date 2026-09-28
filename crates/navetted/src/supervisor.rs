@@ -16,6 +16,7 @@ use nix::unistd::Pid;
 use thiserror::Error;
 
 use crate::registry::{Registry, RegistryError, default_session_name, validate_session_name};
+use crate::xdisplay::XDisplays;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessSpec {
@@ -101,6 +102,8 @@ pub enum SupervisorError {
     Clock,
     #[error("session registry lock is poisoned")]
     RegistryLock,
+    #[error("no free X11 display number for the session's Xwayland")]
+    NoFreeXDisplay,
 }
 
 #[derive(Debug)]
@@ -111,6 +114,7 @@ pub struct Supervisor<R: ProcessRunner> {
     runtime_root: PathBuf,
     drop_root: PathBuf,
     wprsd_program: String,
+    x_displays: XDisplays,
     readiness_timeout: Duration,
     shutdown_timeout: Duration,
     poll_interval: Duration,
@@ -132,6 +136,7 @@ impl<R: ProcessRunner> Supervisor<R> {
             runtime_root,
             drop_root,
             wprsd_program: wprsd_program.into(),
+            x_displays: XDisplays::default(),
             readiness_timeout: Duration::from_secs(5),
             shutdown_timeout: Duration::from_secs(2),
             poll_interval: Duration::from_millis(25),
@@ -157,6 +162,12 @@ impl<R: ProcessRunner> Supervisor<R> {
     #[cfg(test)]
     pub(crate) fn with_drop_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.drop_root = root.into();
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_x_displays(mut self, x_displays: XDisplays) -> Self {
+        self.x_displays = x_displays;
         self
     }
 
@@ -210,11 +221,23 @@ impl<R: ProcessRunner> Supervisor<R> {
             "XDG_RUNTIME_DIR".to_string(),
             self.xdg_runtime_dir.to_string_lossy().into_owned(),
         );
+        // The session's own Xwayland: a display number no other X server
+        // holds, and a Wayland socket name no other session's shell uses --
+        // xwayland-xdg-shell's defaults (`:100`, `xwayland-xdg-shell-0`) are
+        // the same for every session, so all but the first failed to start.
+        let x_display = self
+            .x_displays
+            .claim()
+            .ok_or(SupervisorError::NoFreeXDisplay)?;
         let daemon_spec = ProcessSpec {
             program: self.wprsd_program.clone(),
             args: vec![
                 format!("--wayland-display={}", resources.wayland_display),
                 format!("--socket={}", resources.socket_path.display()),
+                format!(
+                    "--xwayland-xdg-shell-args=--display,{x_display},--wayland-display,{}-xwayland",
+                    resources.wayland_display
+                ),
             ],
             env: BTreeMap::from([runtime_env.clone()]),
         };
@@ -234,6 +257,9 @@ impl<R: ProcessRunner> Supervisor<R> {
                     "WAYLAND_DISPLAY".to_string(),
                     resources.wayland_display.clone(),
                 ),
+                // Always set: an X11 app that inherited navetted's DISPLAY
+                // would open on the host's own screen instead of the session.
+                ("DISPLAY".to_string(), format!(":{x_display}")),
                 (
                     "NAVETTE_DROP_DIR".to_string(),
                     drop_dir.to_string_lossy().into_owned(),
@@ -570,6 +596,11 @@ mod tests {
             Duration::from_millis(1),
         )
         .with_drop_root(temp.path().join("drops"))
+        .with_x_displays({
+            let sockets = temp.path().join(".X11-unix");
+            fs::create_dir_all(&sockets).unwrap();
+            XDisplays::with_dirs(sockets, temp.path())
+        })
     }
 
     #[tokio::test]
@@ -589,10 +620,19 @@ mod tests {
 
         let state = runner.state.lock().unwrap();
         assert_eq!(state.spawned[0].program, "wprsd-test");
+        assert!(
+            state.spawned[0].args.contains(
+                &"--xwayland-xdg-shell-args=--display,100,--wayland-display,navette-work-xwayland"
+                    .to_string()
+            ),
+            "{:?}",
+            state.spawned[0].args
+        );
         assert_eq!(state.spawned[1].program, "firefox");
         assert_eq!(
             state.spawned[1].env,
             BTreeMap::from([
+                ("DISPLAY".into(), ":100".into()),
                 (
                     "NAVETTE_DROP_DIR".into(),
                     temp.path()
@@ -603,6 +643,47 @@ mod tests {
                 ("WAYLAND_DISPLAY".into(), "navette-work".into()),
                 ("XDG_RUNTIME_DIR".into(), runtime_env.clone()),
             ])
+        );
+    }
+
+    #[tokio::test]
+    async fn each_session_gets_its_own_x_display_and_never_the_hosts() {
+        let temp = TempDir::new().unwrap();
+        let runtime = temp.path().join("runtime");
+        fs::create_dir_all(&runtime).unwrap();
+        let runner = Arc::new(FakeRunner::new(runtime));
+        let supervisor = harness(runner.clone(), &temp);
+        // Display 100 is already some other X server's.
+        fs::write(temp.path().join(".X11-unix/X100"), b"").unwrap();
+
+        supervisor.start(&app(), Some("one")).await.unwrap();
+        supervisor.start(&app(), Some("two")).await.unwrap();
+
+        let state = runner.state.lock().unwrap();
+        let x_arg = |i: usize| {
+            state.spawned[i]
+                .args
+                .iter()
+                .find(|arg| arg.starts_with("--xwayland-xdg-shell-args="))
+                .cloned()
+        };
+        assert_eq!(
+            x_arg(0).as_deref(),
+            Some("--xwayland-xdg-shell-args=--display,101,--wayland-display,navette-one-xwayland")
+        );
+        assert_eq!(
+            x_arg(2).as_deref(),
+            Some("--xwayland-xdg-shell-args=--display,102,--wayland-display,navette-two-xwayland")
+        );
+        // The guest is always told its display explicitly: an inherited
+        // DISPLAY would be the host's own screen.
+        assert_eq!(
+            state.spawned[1].env.get("DISPLAY").map(String::as_str),
+            Some(":101")
+        );
+        assert_eq!(
+            state.spawned[3].env.get("DISPLAY").map(String::as_str),
+            Some(":102")
         );
     }
 

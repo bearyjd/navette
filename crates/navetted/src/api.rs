@@ -1269,7 +1269,9 @@ impl From<SupervisorError> for ApiFailure {
             SupervisorError::Registry(RegistryError::InvalidName(_)) => ErrorCode::InvalidName,
             SupervisorError::Registry(RegistryError::AlreadyExists(_)) => ErrorCode::AlreadyExists,
             SupervisorError::Registry(RegistryError::NotFound(_)) => ErrorCode::NotFound,
-            SupervisorError::InvalidApp(_) => ErrorCode::Unavailable,
+            SupervisorError::InvalidApp(_) | SupervisorError::NoFreeXDisplay => {
+                ErrorCode::Unavailable
+            }
             SupervisorError::Spawn { .. }
             | SupervisorError::ReadinessTimeout
             | SupervisorError::Terminate { .. } => ErrorCode::ProcessFailed,
