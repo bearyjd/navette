@@ -3258,6 +3258,19 @@ running the first one: the guest's 200/s auto-repeat (see the duplication entry)
 confound it — a burst there is the *guest* repeating, not the hidden field's 64-character
 reset boundary, and only per-keycode client logging tells the two apart.
 
+**The Pixel 9 Pro Fold is gone (2026-09-27, owner report): it broke and will not be
+back.** The Pixel 10 Pro Fold (`57211FDCG0023C`) is now the only test phone. That
+changes items (1) and (2) above from "wait for the other phone" to:
+
+- **(2) is moot.** The stray debug build paired to the throwaway daemon went with the
+  phone. Nothing to uninstall anywhere.
+- **(1) can only ever be verified on the Pixel 10**, which has no autofill provider
+  (`autofill_service` empty). Verifying `ee9586a` now means either configuring a
+  provider on that phone for the test and removing it afterwards — an owner decision,
+  since it is a personal phone's security setting — or accepting the fix on code
+  review alone (`ee9586a` turns off Compose semantic autofill for the session screen;
+  the exposure itself was confirmed on the Pixel 9 before it broke).
+
 The phone became a client you can *work in* rather than a mirror: a key bar with
 sticky Ctrl/Alt above Gboard, a deterministic IME field, the stream shrinking above
 the keyboard, and 1×/1.5×/2×/3× scale presets remembered per host. Zero Rust
