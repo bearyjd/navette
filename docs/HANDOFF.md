@@ -3318,6 +3318,18 @@ factory, same `connectSocket`. A SOCKS proxy bypasses the factory (OkHttp builds
 it is what turns any remaining downstream stall into 5 ms-per-character bursts.
 `NavetteClient` was deliberately left with Nagle on — one request frame per call.
 
+**The repeat rate is fixed without touching the fork (2026-09-27).** wprsd applies a
+client's `KeyboardEvent::RepeatInfo` to its seat (`src/server/client_handlers.rs:419`,
+`change_repeat_info`), so `WprsTransport` now sends `Repeat { rate: 25, delay: 600 }`
+(sway/weston defaults) as the third preamble message on every connection, after
+`WprsClientConnect` and `Output::New`. Measured end to end on a real wprsd + `foot`,
+holding KEY_A through the media socket and counting bytes in the guest — old binary vs
+new: 100 ms hold 1 vs 1, **400 ms 41 vs 1, 1000 ms 162 vs 11**, each exactly what the
+two settings predict. The fork's own `add_keyboard(…, 200, 200)` stays as is; the fake
+wprsd helpers in `input.rs` and `bridge.rs` skip the new preamble event. Harness:
+`hold.py`-style — wait for a `StreamConfig` frame (kind byte 6 == 1, ids at payload
+1..9 / 9..17 after the 44-byte header), then send `keyboard_key` press, sleep, release.
+
 Capture recipe (container root lacks `CAP_NET_RAW`, the host's sudo does not):
 `host-spawn sudo -n tcpdump -i tailscale0 -n -U -w ~/cap.pcap "tcp port 9517 and src
 host <phone-tailnet-ip>"`, then pair consecutive 123/124-byte segments.

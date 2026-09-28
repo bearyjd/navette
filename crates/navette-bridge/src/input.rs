@@ -571,7 +571,11 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 match self.events.try_recv() {
-                    Ok(RecvType::Object(Event::WprsClientConnect | Event::Output(_))) => continue,
+                    Ok(RecvType::Object(
+                        Event::WprsClientConnect
+                        | Event::Output(_)
+                        | Event::KeyboardEvent(KeyboardEvent::RepeatInfo(_)),
+                    )) => continue,
                     Ok(RecvType::Object(event)) => return event,
                     Ok(RecvType::RawBuffer(_)) => continue,
                     Err(TryRecvError::Empty) => {
@@ -592,7 +596,11 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
             match self.events.try_recv() {
                 Err(TryRecvError::Empty) => {}
-                Ok(RecvType::Object(Event::WprsClientConnect | Event::Output(_))) => {}
+                Ok(RecvType::Object(
+                    Event::WprsClientConnect
+                    | Event::Output(_)
+                    | Event::KeyboardEvent(KeyboardEvent::RepeatInfo(_)),
+                )) => {}
                 Ok(RecvType::Object(event)) => {
                     panic!("expected no further events, got {event:?}")
                 }

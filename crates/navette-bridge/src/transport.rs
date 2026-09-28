@@ -1,9 +1,12 @@
+use std::num::NonZeroU32;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use calloop::channel::Channel;
 use wprs::serialization::geometry::{Point, Size};
-use wprs::serialization::wayland::{Mode, OutputEvent, OutputInfo, Subpixel, Transform};
+use wprs::serialization::wayland::{
+    KeyboardEvent, Mode, OutputEvent, OutputInfo, RepeatInfo, Subpixel, Transform,
+};
 use wprs::serialization::{Event, RecvType, Request, SendType, Serializer};
 
 /// Recoverable, headless connection to one stock `wprsd` session.
@@ -24,14 +27,9 @@ impl WprsTransport {
         let receiver = serializer
             .reader()
             .context("wprs transport receiver is unavailable")?;
-        serializer
-            .writer()
-            .send(SendType::Object(Event::WprsClientConnect));
-        serializer
-            .writer()
-            .send(SendType::Object(Event::Output(OutputEvent::New(
-                output_info(width, height),
-            ))));
+        for event in connect_preamble(width, height) {
+            serializer.writer().send(SendType::Object(event));
+        }
         Ok(Self {
             serializer,
             receiver: Some(receiver),
@@ -55,6 +53,31 @@ impl WprsTransport {
     pub fn is_connected(&self) -> bool {
         self.serializer.other_end_connected()
     }
+}
+
+/// Key repeat for the guest: sway's and weston's defaults (600 ms, 25 keys/s).
+///
+/// wprsd's own seat is created with a 200 ms delay at 200 keys/s -- tuned for a
+/// local keyboard, and hostile to a remote one: any release that reaches the
+/// guest more than 200 ms after its press becomes one character every 5 ms
+/// until it lands, so a single network or host stall turned one tap into
+/// dozens of copies. wprsd applies a client's `RepeatInfo` to its seat, so the
+/// bridge sets its own on every connection rather than patching the fork.
+const KEY_REPEAT_DELAY_MS: u32 = 600;
+const KEY_REPEAT_RATE_PER_SEC: NonZeroU32 = NonZeroU32::new(25).expect("non-zero");
+
+/// Everything sent on a fresh connection, in order: the client handshake, the
+/// virtual output, then the key repeat (which wprsd would otherwise leave at
+/// its own default).
+fn connect_preamble(width: u32, height: u32) -> [Event; 3] {
+    [
+        Event::WprsClientConnect,
+        Event::Output(OutputEvent::New(output_info(width, height))),
+        Event::KeyboardEvent(KeyboardEvent::RepeatInfo(RepeatInfo::Repeat {
+            rate: KEY_REPEAT_RATE_PER_SEC,
+            delay: KEY_REPEAT_DELAY_MS,
+        })),
+    ]
 }
 
 fn output_info(width: u32, height: u32) -> OutputInfo {
@@ -87,6 +110,20 @@ fn output_info(width: u32, height: u32) -> OutputInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_preamble_sets_a_desktop_key_repeat_after_connecting_the_output() {
+        let preamble = connect_preamble(1280, 720);
+        assert!(matches!(preamble[0], Event::WprsClientConnect));
+        assert!(matches!(preamble[1], Event::Output(OutputEvent::New(_))));
+        match &preamble[2] {
+            Event::KeyboardEvent(KeyboardEvent::RepeatInfo(RepeatInfo::Repeat { rate, delay })) => {
+                assert_eq!((rate.get(), *delay), (25, 600));
+            }
+            other => panic!("expected repeat info, got {other:?}"),
+        }
+        assert_eq!(preamble.len(), 3);
+    }
 
     #[test]
     fn virtual_output_uses_requested_logical_size() {

@@ -1179,8 +1179,9 @@ mod tests {
     use navette_protocol::SessionStatus;
     use wprs::serialization::geometry::Point;
     use wprs::serialization::wayland::{
-        Buffer, BufferAssignment, BufferData, BufferFormat, BufferMetadata, Role, SubSurfaceState,
-        SubsurfacePosition, SurfaceRequest, SurfaceRequestPayload, SurfaceState, WlSurfaceId,
+        Buffer, BufferAssignment, BufferData, BufferFormat, BufferMetadata, KeyboardEvent, Role,
+        SubSurfaceState, SubsurfacePosition, SurfaceRequest, SurfaceRequestPayload, SurfaceState,
+        WlSurfaceId,
     };
     use wprs::serialization::xdg_shell::{XdgToplevelId, XdgToplevelState};
     use wprs::serialization::{ClientId, Serializer};
@@ -2059,7 +2060,11 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 match self.events.try_recv() {
-                    Ok(RecvType::Object(Event::WprsClientConnect | Event::Output(_)))
+                    Ok(RecvType::Object(
+                        Event::WprsClientConnect
+                        | Event::Output(_)
+                        | Event::KeyboardEvent(KeyboardEvent::RepeatInfo(_)),
+                    ))
                     | Ok(RecvType::RawBuffer(_)) => continue,
                     Ok(RecvType::Object(event)) => return event,
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -2087,7 +2092,11 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
             loop {
                 match self.events.try_recv() {
-                    Ok(RecvType::Object(Event::WprsClientConnect | Event::Output(_)))
+                    Ok(RecvType::Object(
+                        Event::WprsClientConnect
+                        | Event::Output(_)
+                        | Event::KeyboardEvent(KeyboardEvent::RepeatInfo(_)),
+                    ))
                     | Ok(RecvType::RawBuffer(_)) => continue,
                     Ok(RecvType::Object(event)) => {
                         // Names the variant only: an event carrying clipboard

@@ -486,15 +486,13 @@ character.
 
 **Android: characters repeat in the guest** (`echo` arrives as `eeeecho`).
 The client sends one press and one release per character (confirmed with
-per-keycode logging). The guest auto-repeats because `wprsd` configures
-`repeat_delay = 200 ms` with `repeat_rate = 200` characters per second
-(`add_keyboard(Default::default(), 200, 200)`), so a release that reaches the
-guest more than 200 ms after its press yields a character every 5 ms until it
-lands. Builds before the `TCP_NODELAY` fix made that likely: Nagle held every
-release for the press's ACK (33 ms median on the tailnet, far more on a busy
-host). On a current build a burst means a real stall between phone and guest —
-check the host's load first. The remaining fix is a sane repeat rate in the
-wprs fork.
+per-keycode logging); the guest repeats a key whose release arrives late.
+`wprsd` creates its seat at 200 ms / 200 keys/s, so builds before the fixes
+below repeated after any 200 ms stall, at one character per 5 ms. The bridge
+now sets 600 ms / 25 keys/s on every connection (`transport.rs`,
+`connect_preamble`) and the phone sends with `TCP_NODELAY`, so a repeat now
+needs a stall of over 600 ms and costs ~25 characters a second. If it still
+happens, look for that stall -- host load first.
 
 **Android: the guest behaves as if Ctrl (or Alt) is stuck down.**
 Tap that chip on the **Keys** bar: turning a modifier off always sends its
