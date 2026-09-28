@@ -3321,7 +3321,7 @@ it is what turns any remaining downstream stall into 5 ms-per-character bursts.
 **The repeat rate is fixed without touching the fork (2026-09-27).** wprsd applies a
 client's `KeyboardEvent::RepeatInfo` to its seat (`src/server/client_handlers.rs:419`,
 `change_repeat_info`), so `WprsTransport` now sends `Repeat { rate: 25, delay: 600 }`
-(sway/weston defaults) as the third preamble message on every connection, after
+(sway's and KDE's defaults) as the third preamble message on every connection, after
 `WprsClientConnect` and `Output::New`. Measured end to end on a real wprsd + `foot`,
 holding KEY_A through the media socket and counting bytes in the guest — old binary vs
 new: 100 ms hold 1 vs 1, **400 ms 41 vs 1, 1000 ms 162 vs 11**, each exactly what the

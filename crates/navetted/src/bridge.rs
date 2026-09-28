@@ -1179,9 +1179,9 @@ mod tests {
     use navette_protocol::SessionStatus;
     use wprs::serialization::geometry::Point;
     use wprs::serialization::wayland::{
-        Buffer, BufferAssignment, BufferData, BufferFormat, BufferMetadata, KeyboardEvent, Role,
-        SubSurfaceState, SubsurfacePosition, SurfaceRequest, SurfaceRequestPayload, SurfaceState,
-        WlSurfaceId,
+        Buffer, BufferAssignment, BufferData, BufferFormat, BufferMetadata, KeyboardEvent,
+        OutputEvent, RepeatInfo, Role, SubSurfaceState, SubsurfacePosition, SurfaceRequest,
+        SurfaceRequestPayload, SurfaceState, WlSurfaceId,
     };
     use wprs::serialization::xdg_shell::{XdgToplevelId, XdgToplevelState};
     use wprs::serialization::{ClientId, Serializer};
@@ -2021,6 +2021,51 @@ mod tests {
     /// streams together. wprs is designed to run over an SSH-forwarded
     /// socket and so passes no file descriptors, only framed bytes, which is
     /// what makes a byte relay a faithful stand-in for the real link.
+    /// Consumes the connection preamble `WprsTransport::connect` sends and
+    /// asserts it exactly: the handshake, the new output, then the key repeat.
+    /// Consuming it here -- rather than skipping those variants wherever they
+    /// appear -- is what lets `recv` and `assert_no_further_events` catch a
+    /// stray one mid-session.
+    fn expect_connect_preamble(events: &calloop::channel::Channel<RecvType<Event>>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut preamble = Vec::new();
+        while preamble.len() < 3 {
+            match events.try_recv() {
+                Ok(RecvType::Object(event)) => preamble.push(event),
+                Ok(RecvType::RawBuffer(_)) => panic!("raw buffer inside the connect preamble"),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for the preamble"
+                    );
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("fake wprsd channel disconnected")
+                }
+            }
+        }
+        assert!(
+            matches!(preamble[0], Event::WprsClientConnect),
+            "{:?}",
+            preamble[0]
+        );
+        assert!(
+            matches!(preamble[1], Event::Output(OutputEvent::New(_))),
+            "{:?}",
+            preamble[1]
+        );
+        assert!(
+            matches!(
+                &preamble[2],
+                Event::KeyboardEvent(KeyboardEvent::RepeatInfo(RepeatInfo::Repeat { rate, delay: 600 }))
+                    if rate.get() == 25
+            ),
+            "{:?}",
+            preamble[2]
+        );
+    }
+
     struct FakeWprsd {
         events: calloop::channel::Channel<RecvType<Event>>,
         _server: Serializer<Request, Event>,
@@ -2043,6 +2088,7 @@ mod tests {
             splice(&one, &other);
             splice(&other, &one);
             let events = server.reader().expect("fake wprsd reader already taken");
+            expect_connect_preamble(&events);
             (
                 transport,
                 Self {
@@ -2053,19 +2099,13 @@ mod tests {
             )
         }
 
-        /// The next event the transport sent, skipping the connection
-        /// preamble (`WprsClientConnect`, `Output`) `WprsTransport::connect`
-        /// emits on its own.
+        /// The next event the transport sent. `connect` has already consumed
+        /// the preamble; `Output` is still skipped for `Output::Update`.
         fn recv(&self) -> Event {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 match self.events.try_recv() {
-                    Ok(RecvType::Object(
-                        Event::WprsClientConnect
-                        | Event::Output(_)
-                        | Event::KeyboardEvent(KeyboardEvent::RepeatInfo(_)),
-                    ))
-                    | Ok(RecvType::RawBuffer(_)) => continue,
+                    Ok(RecvType::Object(Event::Output(_))) | Ok(RecvType::RawBuffer(_)) => continue,
                     Ok(RecvType::Object(event)) => return event,
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
                         assert!(
@@ -2084,20 +2124,13 @@ mod tests {
         /// Asserts nothing further arrives -- used to prove a would-be event
         /// was never sent rather than merely delayed.
         ///
-        /// Drains to empty rather than inspecting one event. `connect` leaves
-        /// two preamble events queued ahead of anything a test provokes, so a
-        /// single `try_recv` would consume one of those, report success, and
-        /// never look at the event it exists to catch.
+        /// Drains to empty rather than inspecting one event, so an `Output`
+        /// queued ahead of the event it exists to catch cannot hide it.
         fn assert_no_further_events(&self) {
             thread::sleep(Duration::from_millis(20));
             loop {
                 match self.events.try_recv() {
-                    Ok(RecvType::Object(
-                        Event::WprsClientConnect
-                        | Event::Output(_)
-                        | Event::KeyboardEvent(KeyboardEvent::RepeatInfo(_)),
-                    ))
-                    | Ok(RecvType::RawBuffer(_)) => continue,
+                    Ok(RecvType::Object(Event::Output(_))) | Ok(RecvType::RawBuffer(_)) => continue,
                     Ok(RecvType::Object(event)) => {
                         // Names the variant only: an event carrying clipboard
                         // text must not be rendered into a panic message

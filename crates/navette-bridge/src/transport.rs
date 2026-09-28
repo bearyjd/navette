@@ -55,7 +55,7 @@ impl WprsTransport {
     }
 }
 
-/// Key repeat for the guest: sway's and weston's defaults (600 ms, 25 keys/s).
+/// Key repeat for the guest: sway's and KDE's defaults (600 ms, 25 keys/s).
 ///
 /// wprsd's own seat is created with a 200 ms delay at 200 keys/s -- tuned for a
 /// local keyboard, and hostile to a remote one: any release that reaches the
@@ -122,7 +122,6 @@ mod tests {
             }
             other => panic!("expected repeat info, got {other:?}"),
         }
-        assert_eq!(preamble.len(), 3);
     }
 
     #[test]
