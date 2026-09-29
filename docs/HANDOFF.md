@@ -3601,3 +3601,31 @@ review rounds added and the plan's checklist does not cover:
 - **Stuck-modifier recovery**: long-press Ctrl (locked), leave the session mid-chord,
   re-attach, and confirm the guest is not still holding Ctrl (`showkey` or a shell where
   a plain `a` types `a`).
+
+## Open-items sweep: five PRs, all reviewed (2026-09-27 → 09-29)
+
+State of play, newest first. Nothing merged; every PR had an independent review and
+the follow-ups it asked for are pushed.
+
+| PR | Branch | Base | What | Review |
+|---|---|---|---|---|
+| #45 | `fix/session-x11-display` | master | X11 guests got the host's `DISPLAY` (opened on the host screen); every session after the first had no Xwayland (`:100` collision). Per-session display, owned-before-named, recorded for the session's life | security: MEDIUMs fixed in `3f8d1f8` |
+| #44 | `refactor/exhaustive-connection-state` | master | `ConnectionPhase`: one exhaustive classification; retry "rejected" by phase; `ConnectScreen` exhaustive | code: follow-ups in `896ed3c` |
+| #43 | `fix/registry-future-with-new-keys` | **#41** (stacked) | newer registry with new keys is `Future` (kept), not `Corrupt` (wiped); explicit "update the app" message | code: approve; follow-ups in `08ed6b9` |
+| #42 | `fix/bearer-scheme-case-insensitive` | master | `bearer <token>` accepted per RFC 7235 | security: approve |
+| #41 | `feat/mobile-keyboard-and-scale` | master | the keyboard feature + Nagle off + guest key repeat 600 ms/25/s + accessible chips; verified on Pixel 10 and API 26/30/34 emulators | code + security |
+
+Merge order: #41 before #43 (GitHub retargets #43 to master); #42, #44, #45 are independent.
+Worktrees for each branch live beside the repo (`../navette-wt-*`); all are pushed.
+
+Left open, deliberately:
+- **Phone:** the Pixel 10's debug build is paired to a stopped throwaway daemon — re-pair
+  it to the real one. `xterm` was installed in the dev distrobox for the X11 tests
+  (`sudo dnf remove xterm` to undo).
+- **Reconnect wiring end to end** (`SessionScreen`'s retry composition) still has no
+  automated test — there is no Compose/instrumented test harness in the project.
+- **Same-user isolation between sessions** is a convention, not a boundary: guests run as
+  the navette user and can reach each other's displays on purpose (security review of #45).
+- The xwayland-xdg-shell `--wayland-display` socket never appears as a file; harmless (the
+  collision was the X socket), noted so nobody chases it.
+
