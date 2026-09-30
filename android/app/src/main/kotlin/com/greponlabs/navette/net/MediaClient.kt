@@ -68,8 +68,11 @@ internal fun packetBudgetKib(packet: MediaPacket, budgetKib: Int): Int {
  * must itself be safe to run there.
  */
 class MediaClient(private val webSocketUrl: String, private val token: String) {
-    private val httpClient =
+    internal val httpClient =
         OkHttpClient.Builder()
+            // Input is two small frames per key; Nagle would hold the release
+            // for the press's ACK. See [NoDelaySocketFactory].
+            .socketFactory(NoDelaySocketFactory())
             // OkHttp fails the socket if a ping goes unanswered for a whole
             // interval, so this doubles as how fast a silently-dropped link is
             // noticed -- a dead tailnet route stops delivering frames but does

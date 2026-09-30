@@ -1,6 +1,5 @@
 package com.greponlabs.navette.ui.session
 
-import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.Surface
 import android.view.SurfaceHolder
@@ -14,9 +13,9 @@ import com.greponlabs.navette.net.BTN_LEFT
 import com.greponlabs.navette.net.BTN_RIGHT
 import com.greponlabs.navette.net.ConnectionState
 import com.greponlabs.navette.net.BlobDescriptor
-import com.greponlabs.navette.net.MediaClient
 import com.greponlabs.navette.net.MediaInput
 import com.greponlabs.navette.net.MediaPacket
+import com.greponlabs.navette.net.ViewScale
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -26,7 +25,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -40,93 +38,6 @@ private const val RESIZE_DEBOUNCE_MS = 150L
 
 /** How often the HUD pings and republishes. One second, matching [HUD_WINDOW_MS]. */
 private const val HUD_SAMPLE_INTERVAL_MS: Long = 1000L
-
-/**
- * The media-socket contract the session lifecycle needs.
- *
- * Keeping this boundary here lets the controller be driven by a JVM fake
- * without constructing an OkHttp socket, MediaCodec, or Surface.
- */
-internal interface MediaSessionClient {
-    val connectionState: StateFlow<ConnectionState>
-    var onPong: ((ULong) -> Unit)?
-    var onClipboard: ((String) -> Unit)?
-    var onClipboardBlob: ((BlobDescriptor) -> Unit)?
-
-    fun connect()
-    fun close()
-    suspend fun nextPacket(): MediaPacket?
-    fun sendInput(input: MediaInput): Boolean
-    fun requestKeyframe()
-    fun sendPing(nonce: ULong): Boolean
-}
-
-private class OkHttpMediaSessionClient(
-    mediaUrl: String,
-    token: String,
-) : MediaSessionClient {
-    private val delegate = MediaClient(mediaUrl, token)
-
-    override val connectionState: StateFlow<ConnectionState>
-        get() = delegate.connectionState
-    override var onPong: ((ULong) -> Unit)?
-        get() = delegate.onPong
-        set(value) {
-            delegate.onPong = value
-        }
-    override var onClipboard: ((String) -> Unit)?
-        get() = delegate.onClipboard
-        set(value) {
-            delegate.onClipboard = value
-        }
-    override var onClipboardBlob: ((BlobDescriptor) -> Unit)?
-        get() = delegate.onClipboardBlob
-        set(value) {
-            delegate.onClipboardBlob = value
-        }
-
-    override fun connect() = delegate.connect()
-    override fun close() = delegate.close()
-    override suspend fun nextPacket(): MediaPacket? = delegate.nextPacket()
-    override fun sendInput(input: MediaInput): Boolean = delegate.sendInput(input)
-    override fun requestKeyframe() = delegate.requestKeyframe()
-    override fun sendPing(nonce: ULong): Boolean = delegate.sendPing(nonce)
-}
-
-/**
- * Runs [work] only while the media socket is live.
- *
- * A controller survives its final failed reconnect so the screen can offer a
- * manual retry. Its HUD worker must not survive that socket: it would keep
- * waking once per second to ping a dead WebSocket and republish a changing
- * frame-age sample beneath the terminal overlay. `collectLatest` is
- * essential: [work] is an intentionally long-running loop, so an ordinary
- * `collect` would never observe the later failed/disconnected state.
- */
-internal fun CoroutineScope.launchHudWhileConnected(
-    connection: StateFlow<ConnectionState>,
-    work: suspend () -> Unit,
-): Job =
-    launch {
-        connection.collectLatest { state ->
-            if (state is ConnectionState.Connected) work()
-        }
-    }
-
-/** What the screen renders. */
-internal data class SessionUiState(
-    // Connecting, not Disconnected: the controller opens the socket from a
-    // DisposableEffect, which runs after the first composition, so a
-    // Disconnected default would flash a "Disconnected" overlay on entry
-    // every time.
-    val connection: ConnectionState = ConnectionState.Connecting,
-    val streamEnded: Boolean = false,
-    val decodeError: String? = null,
-    /** The size of the frame currently on the surface, or `null` before the first one. */
-    val contentSize: Pair<Int, Int>? = null,
-    /** The latest metrics sample, or `null` before the first one. */
-    val hud: HudSample? = null,
-)
 
 /**
  * Owns everything about this screen that outlives a recomposition: the media
@@ -151,6 +62,11 @@ internal class SessionController(
     private val client: MediaSessionClient = OkHttpMediaSessionClient(mediaUrl, token),
     private val blobTransport: BlobTransport = HttpBlobTransport(mediaUrl, token),
     private val pendingBlobAnnouncement: PendingClipboardBlobAnnouncement = PendingClipboardBlobAnnouncement(),
+    // Known at construction, not applied afterwards: the first
+    // onSurfaceResized must already send the scaled viewport, or the guest
+    // lays out at 1x and then again at the preset -- two encoder restarts on
+    // every attach. Later changes arrive through setViewScale.
+    initialViewScale: ViewScale = ViewScale.X1,
 ) {
     private val gate = StreamGate()
     private val scope = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
@@ -215,6 +131,9 @@ internal class SessionController(
     private var gestureState: GestureState = GestureState.Idle
     private var pressJob: Job? = null
     private var leftPressed = false
+    // Main-thread only like the gesture state; the resize coroutine that
+    // reads it runs on `scope` (Main.immediate).
+    private var viewScale: ViewScale = initialViewScale
 
     /** Set by the screen, which owns whether the HUD is showing. */
     var onToggleHud: (() -> Unit)? = null
@@ -245,8 +164,15 @@ internal class SessionController(
      */
     private var motionSentTo: Long? = null
 
-    private val _state = MutableStateFlow(SessionUiState())
+    private val _state = MutableStateFlow(SessionUiState(viewScale = initialViewScale))
     val state: StateFlow<SessionUiState> = _state.asStateFlow()
+
+    /**
+     * Hardware keys, IME text and the key bar. The stream is read fresh per
+     * event for the same reason [sendMotion] reads it: a `Reconfigure` can
+     * hand the session a new `surface_id`.
+     */
+    val keyboard = SessionKeyboard(primary = { gate.primary }, send = client::sendInput)
 
     /** The view zoom and pan are applied to; see the `AndroidView` factory for why it is held directly. */
     fun bindView(target: View) {
@@ -344,6 +270,11 @@ internal class SessionController(
         pressJob?.cancel()
         if (leftPressed) sendButton(BTN_LEFT, pressed = false)
         leftPressed = false
+        // Nor a held modifier: a sticky Ctrl, or a chord whose release was
+        // dropped, would otherwise stay down in the guest after the phone has
+        // gone. Sent before the socket is closed below, and unconditionally --
+        // see SessionKeyboard.releaseHeldModifiers.
+        keyboard.releaseHeldModifiers()
         gestureState = GestureState.Idle
         view = null
         resizeJob?.cancel()
@@ -568,58 +499,52 @@ internal class SessionController(
         resizeJob =
             scope.launch {
                 delay(RESIZE_DEBOUNCE_MS)
-                val (clampedWidth, clampedHeight) = InputMapper.clampViewport(width, height) ?: return@launch
-                client.sendInput(MediaInput.ViewportResize(clampedWidth, clampedHeight))
+                sendViewport(width, height)
             }
+    }
+
+    /**
+     * Reports `surface / scale` as the viewport. The guest lays out for that
+     * smaller screen and MediaCodec's scale-to-fit stretches the decoded
+     * frame back over the surface; see [InputMapper.scaledViewport] for the
+     * even-rounding and the aspect rule at the bridge's minimum size.
+     */
+    private fun sendViewport(width: Int, height: Int) {
+        val (viewportWidth, viewportHeight) = InputMapper.scaledViewport(width, height, viewScale.factor) ?: return
+        client.sendInput(MediaInput.ViewportResize(viewportWidth, viewportHeight))
+    }
+
+    /**
+     * Re-sends the viewport at once: the user asked for it, so there is no
+     * burst to debounce, and a resize still parked in the debounce would
+     * only send the old scale, so it is cancelled. The same preset twice is
+     * a no-op -- each change is an encoder restart on the daemon.
+     */
+    fun setViewScale(scale: ViewScale) {
+        if (scale == viewScale) return
+        viewScale = scale
+        _state.update { it.copy(viewScale = scale) }
+        val (width, height) = synchronized(lock) { surfaceSize } ?: return
+        resizeJob?.cancel()
+        sendViewport(width, height)
     }
 
     /**
      * A raw `View.OnTouchListener` callback, not a Compose gesture -- see
      * the comment on the `AndroidView` call site for why. Reduces the
-     * `MotionEvent` to a [TouchEvent], steps [GestureInterpreter], and
-     * applies whatever it asks for. Returns `true` (event consumed) for every
-     * action the interpreter knows, so the View system does not also try its
-     * own default touch handling on it.
-     *
-     * Pointers are lifted into screen space first. The framework has already
-     * inverse-mapped them through the view's transform, so while a pinch is
-     * changing that transform, the local coordinates of a finger that has not
-     * moved would change under it -- a feedback loop. Screen space is where
-     * the fingers physically are, and stays put.
+     * `MotionEvent` to a [TouchEvent] (see [toTouchEvent] for the
+     * screen-space lift), steps [GestureInterpreter], and applies whatever
+     * it asks for. Returns `true` (event consumed) for every action the
+     * interpreter knows, so the View system does not also try its own
+     * default touch handling on it.
      */
     fun onTouchEvent(event: MotionEvent): Boolean {
-        val action = touchAction(event.actionMasked) ?: return false
-        val pointers =
-            List(event.pointerCount) { index ->
-                val (x, y) = transform.localToScreen(event.getX(index), event.getY(index))
-                TouchPointer(event.getPointerId(index), x.toFloat(), y.toFloat())
-            }
-        val step =
-            GestureInterpreter.step(
-                gestureState,
-                TouchEvent(
-                    action = action,
-                    actionPointerId = event.getPointerId(event.actionIndex),
-                    pointers = pointers,
-                    eventTimeMs = event.eventTime,
-                    zoomed = transform.isZoomed,
-                ),
-            )
+        val touch = event.toTouchEvent(transform) ?: return false
+        val step = GestureInterpreter.step(gestureState, touch)
         gestureState = step.state
         for (effect in step.effects) applyEffect(effect)
         return true
     }
-
-    private fun touchAction(actionMasked: Int): TouchAction? =
-        when (actionMasked) {
-            MotionEvent.ACTION_DOWN -> TouchAction.Down
-            MotionEvent.ACTION_MOVE -> TouchAction.Move
-            MotionEvent.ACTION_UP -> TouchAction.Up
-            MotionEvent.ACTION_POINTER_DOWN -> TouchAction.PointerDown
-            MotionEvent.ACTION_POINTER_UP -> TouchAction.PointerUp
-            MotionEvent.ACTION_CANCEL -> TouchAction.Cancel
-            else -> null
-        }
 
     private fun applyEffect(effect: GestureEffect) {
         when (effect) {
@@ -676,37 +601,6 @@ internal class SessionController(
             }
             is GestureEffect.Scroll -> sendScroll(effect.dx, effect.dy)
             GestureEffect.ToggleHud -> onToggleHud?.invoke()
-        }
-    }
-
-    /** Returns whether the key was consumed; an unmapped one is left to the system. */
-    fun onKeyEvent(event: KeyEvent): Boolean {
-        val stream = gate.primary ?: return false
-        val evdevCode = KeycodeMap.androidKeycodeToEvdev(event.keyCode) ?: return false
-        when (event.action) {
-            KeyEvent.ACTION_DOWN -> {
-                // Auto-repeat is the guest's own responsibility, driven off a
-                // single press. A repeated down is the duplicate
-                // navette-bridge's InputState collapses to a no-op anyway
-                // (crates/navette-bridge/src/input.rs:157-167) -- better not
-                // to be the client that sends it.
-                if (event.repeatCount > 0) return true
-                client.sendInput(InputMapper.keyboardModifiers(stream.clientId, stream.surfaceId, event.metaState))
-                client.sendInput(InputMapper.keyboardKey(stream.clientId, stream.surfaceId, evdevCode, true))
-            }
-            KeyEvent.ACTION_UP -> {
-                client.sendInput(InputMapper.keyboardKey(stream.clientId, stream.surfaceId, evdevCode, false))
-                client.sendInput(InputMapper.keyboardModifiers(stream.clientId, stream.surfaceId, event.metaState))
-            }
-            else -> return false
-        }
-        return true
-    }
-
-    fun onImeText(previous: String, current: String) {
-        val stream = gate.primary ?: return
-        for (input in InputMapper.imeTextDelta(stream.clientId, stream.surfaceId, previous, current)) {
-            client.sendInput(input)
         }
     }
 
@@ -860,20 +754,27 @@ internal class SessionController(
 
     /**
      * Reached for a two-finger drag at 1:1, or for the unconsumed part of a
-     * zoomed pan at a content edge. Both are already screen-space pixel
-     * deltas, so they need no rescaling before they become guest scroll
-     * deltas. Gated like [sendButton]: an axis is delivered at the pointer's
+     * zoomed pan at a content edge. Both are surface-pixel deltas, and the
+     * guest's frame is only the surface's size at a logical scale of 1x: at
+     * 2x it is half as wide, so the delta is rescaled through the same
+     * content/surface ratio [sendMotion] uses before it becomes a guest
+     * scroll delta -- otherwise the content would run at twice the finger.
+     * Gated like [sendButton]: an axis is delivered at the pointer's
      * position too.
      */
     private fun sendScroll(dx: Float, dy: Float) {
         val stream = gate.primary ?: return
         if (motionSentTo != stream.surfaceId) return
+        val (surfaceWidth, surfaceHeight) = synchronized(lock) { surfaceSize } ?: return
+        val (contentWidth, contentHeight) = _state.value.contentSize ?: (surfaceWidth to surfaceHeight)
+        val (guestDx, guestDy) =
+            InputMapper.rescaleToContent(dx, dy, surfaceWidth, surfaceHeight, contentWidth, contentHeight) ?: return
         client.sendInput(
             InputMapper.pointerAxis(
                 stream.clientId,
                 stream.surfaceId,
-                InputMapper.scrollUnits(dx),
-                InputMapper.scrollUnits(dy),
+                InputMapper.scrollUnits(guestDx.toFloat()),
+                InputMapper.scrollUnits(guestDy.toFloat()),
             ),
         )
     }

@@ -2895,6 +2895,10 @@ Recorded here as the number to plan memory budgets against, not 128 MB.
 
 ## Deferred minor: `Bearer` prefix match is case-sensitive (2026-09-12)
 
+**Resolved (2026-09-27):** `guard.rs` now parses the header with `bearer_credentials`,
+which matches the scheme case-insensitively and accepts `1*SP` before the token; any
+other shape is still the same bare 401. The original note follows.
+
 `crates/navetted`'s auth middleware checks the `Authorization` header with
 `strip_prefix("Bearer ")`, which is case-sensitive. RFC 7235 treats the
 auth-scheme token as case-insensitive, so a client sending `bearer <token>` is
@@ -3185,6 +3189,452 @@ Still true after all four: `api.rs` (~2.9k) and `bridge.rs` (~2.7k) are well ove
 800-line rule and should be split (`api/images.rs`, `api/wake.rs` are the obvious
 first extractions); the phone-side flows for wake and thumbnails are unit-tested
 only, not run on the Pixel.
+
+## Mobile keyboard + logical scale presets (2026-09-21)
+
+**State of play (2026-09-23).** Branch `feat/mobile-keyboard-and-scale`, **three
+commits, not pushed, no PR**: `d3f9ef5` the feature, `ee9586a` the autofill fix,
+`ffa7b8f` this file. Gates green — Android **482 tests / 0 failures**, lint 0 errors,
+Rust untouched at 396/0, `git diff --check` clean, every source file under the
+800-line rule. Two independent reviews (code + security) closed at WARN with every
+pre-merge item fixed; 10 planned tasks and 9 review items done.
+
+*Verified on hardware* (Pixel 10, real daemon over the tailnet, real Gboard taps):
+Scale 2× makes a `foot` session genuinely readable where 1× was unusable; the key bar
+renders between stream and keyboard; **armed Ctrl + Gboard `c` produces a real `^C` in
+the guest**; `imePadding()` keeps the prompt visible while typing; the Keys/Hide-keys
+labels match the screen.
+
+*Not verified, and why*: the autofill fix (`ee9586a`). The **exposure** is confirmed on
+device — see the autofill entry below — but that the fix *stops* it is not. It needs
+the Pixel 9 Pro Fold, the only phone here with an autofill provider configured; both
+phones dropped off adb one tap short. Also unverified: anything on API 30–34, where
+`adjustResize` plus `imePadding()` might double-apply the inset. Both phones are
+API 37 and no emulator could be stood up (`avdmanager` needs a JDK that is not
+installed), so this ships untested on Android 11–14 with `minSdk = 26`.
+
+*Open decisions for the owner*: (1) finish the autofill verification on the Pixel 9;
+(2) uninstall the debug build left on that phone, which is paired to a throwaway test
+daemon; (3) the guest key-repeat rate — see the duplication entry below — is a one-line
+change in the wprs fork, not this repo, and wants its own PR; (4) push and open the PR.
+
+*Do not repeat this mistake*: a subagent reproducing the duplication bug drove that
+Pixel 9 with blind scripted coordinate taps and twice landed in unrelated personal
+apps, one an account-recovery screen with a destructive button. When dispatching device
+work, name the device serial and require every tap to come from a fresh `uiautomator
+dump` with a frontmost-app check immediately before it.
+
+**Gates re-run independently (2026-09-23, later).** The numbers above were prior-session
+claims; they now have fresh evidence behind them. Android **482 tests / 0 failures /
+0 errors / 0 skipped** across 38 classes — note the first run reported `BUILD SUCCESSFUL`
+with `testDebugUnitTest UP-TO-DATE`, i.e. **no test actually ran**; the figure above is
+from `./gradlew testDebugUnitTest --rerun-tasks` (24 tasks executed) tallied out of the
+JUnit XML, not from Gradle's exit code. `lintDebug` did execute in that first run and
+reports 0 errors. Rust **396 passed / 0 failed /
+1 ignored**, `cargo clippy --workspace --all-targets -- -D warnings` clean and
+`cargo fmt --all --check` clean on rustc/clippy 1.95.0 — the branch touches no Rust at
+all (the diff is 30 Kotlin/doc files, 4069+/341-). `git diff --check master...HEAD`
+clean. Largest source file changed is `SessionController.kt` at 781 lines, under the 800
+rule; `FileTransferCoordinatorTest.kt` is 980 but is pre-existing and untouched here.
+
+**The autofill verification is blocked on hardware that is not here, and the leftover
+debug build is not on the phone that is.** The attached device is
+`57211FDCG0023C`, a **Pixel 10 Pro Fold**, API 37 — and
+`settings get secure autofill_service` on it returns **empty**, so no autofill provider
+is configured. That is the discriminator: this is not the phone the entry above calls
+"the only phone here with an autofill provider configured", whatever the model names
+were written as. With no provider there can be no fill prompt, so running the probe on
+this device would be vacuous rather than reassuring — and configuring a password manager
+on it to create the condition would mean changing a personal phone's security settings,
+which is not a thing to do for a test. Item (1) stays open until the other phone is
+attached.
+
+Item (2) does **not** apply to this device either. `com.greponlabs.navette` here is
+`versionName=0.1.0`, flags `[ DEBUGGABLE … ]`, `installerPackageName=null`, first
+installed 2026-09-22 20:06 — a sideloaded debug build on the phone that *did* the
+verified hardware testing, which is expected and not the stray. The stray is on the
+absent phone. **Nothing was uninstalled.**
+
+Still genuinely unverified and runnable on the attached phone once someone wants to
+drive it: the **70-character continuous-typing** check and **stuck-modifier recovery**
+from the four below. Neither appears anywhere in this file as done. Worth knowing before
+running the first one: the guest's 200/s auto-repeat (see the duplication entry) will
+confound it — a burst there is the *guest* repeating, not the hidden field's 64-character
+reset boundary, and only per-keycode client logging tells the two apart.
+
+**The Pixel 9 Pro Fold is gone (2026-09-27, owner report): it broke and will not be
+back.** The Pixel 10 Pro Fold (`57211FDCG0023C`) is now the only test phone. That
+changes items (1) and (2) above from "wait for the other phone" to:
+
+- **(2) is moot.** The stray debug build paired to the throwaway daemon went with the
+  phone. Nothing to uninstall anywhere.
+- **(1) can only ever be verified on the Pixel 10**, which has no autofill provider
+  (`autofill_service` empty). Verifying `ee9586a` now means either configuring a
+  provider on that phone for the test and removing it afterwards — an owner decision,
+  since it is a personal phone's security setting — or accepting the fix on code
+  review alone (`ee9586a` turns off Compose semantic autofill for the session screen;
+  the exposure itself was confirmed on the Pixel 9 before it broke).
+
+**On-device checklist closed on the Pixel 10 (2026-09-27), and a real transport bug
+found and fixed.** Throwaway `navetted` on the tailnet (`100.111.143.67:9517`, scratch
+state and token), one session running a raw-mode byte logger in `foot`, so every check
+reads the exact bytes the guest received rather than a screenshot. Every keystroke was a
+real Gboard key tap, each located from a fresh `uiautomator dump --windows` (Gboard's
+keys are accessibility nodes with one-character `content-desc`s) behind a frontmost-app
+check and a heads-up-notification guard — this phone is now the owner's daily driver and
+personal notifications arrived mid-run.
+
+- **Autofill: verified, with a control.** The phone now has **Bitwarden** as its autofill
+  service (it was empty on 09-23; nothing here configured it). HEAD: four keyboard raises
+  in a session, zero navette autofill requests in `dumpsys autofill`'s history, no
+  sessions, no autofill windows; the Connect screen still raises its request and offers
+  to save, as it should. **Pre-fix build (`d3f9ef5`) on the same phone:** the first raise
+  logged a request for the hidden field (`b=Rect(0, 0 - 2, 2)`) and Bitwarden answered
+  `SUCCESS, NUM_DATASETS=1` — a credential ready to fill the invisible field. So the probe
+  is sensitive and `ee9586a` is what stops it. The save prompt for the throwaway token was
+  declined; nothing went into the vault.
+- **70 characters across the 64-char reset: passes.** Chars 61-70 arrived once each; 8
+  Backspaces after the reset arrived as 8 `0x7f`; a trailing `z` landed.
+- **Stuck-modifier recovery: passes.** Locked Ctrl + `a` gave `0x01`; left the session
+  with Ctrl still locked; re-attached; `a`,`b` arrived plain. Minor finding: the chip's
+  armed/locked state is not exposed to accessibility (`checked`/`selected` false, no
+  description), so TalkBack cannot tell it is on.
+- **Keys button with the keyboard up**: labels tracked the screen across all toggles
+  (`Keys`↔`Hide keys`, `Keyboard`↔`Hide keyboard`); not separately probed beyond that.
+
+**The repeat bursts were not only the guest's repeat rate: Nagle held every key release
+for an ACK.** Even at ~6 s between taps, the 70-character run produced `g`×25 and `h`×70.
+A host capture of phone→daemon traffic on `tailscale0` showed each key as a 123-byte
+segment (press) and a 124-byte segment (release) leaving the phone a **median 33.6 ms,
+max 100 ms apart** on a 15 ms RTT, although the client writes them microseconds apart:
+the release waited for the press's ACK (server delayed-ACK). With wprsd repeating after
+200 ms, any late ACK becomes a burst; the bursts in that run clustered while a Gradle
+build was loading the host, and clean runs on an idle host still carried the 33 ms tax.
+Fix: `NoDelaySocketFactory` sets `TCP_NODELAY` on the media socket (`MediaClient`).
+Re-captured: press→release gap **0.01 ms** (max 0.03, 20 pairs), all in the same
+millisecond; 30 keys typed under a (lighter) concurrent build arrived exactly once each.
+`MediaClientTest` pins it through OkHttp's own connect path. Gotchas for whoever touches
+that test: OkHttp 4.12's WebSocket connect replaces the `EventListener` with
+`EventListener.NONE` *and* skips network interceptors (`forWebSocket = true`), so the
+probe is a plain HTTP call on a client derived from `MediaClient.httpClient` — same
+factory, same `connectSocket`. A SOCKS proxy bypasses the factory (OkHttp builds
+`Socket(proxy)` itself). The wprs repeat rate (200/s) is still worth fixing in the fork:
+it is what turns any remaining downstream stall into 5 ms-per-character bursts.
+`NavetteClient` was deliberately left with Nagle on — one request frame per call.
+
+**The repeat rate is fixed without touching the fork (2026-09-27).** wprsd applies a
+client's `KeyboardEvent::RepeatInfo` to its seat (`src/server/client_handlers.rs:419`,
+`change_repeat_info`), so `WprsTransport` now sends `Repeat { rate: 25, delay: 600 }`
+(sway's and KDE's defaults) as the third preamble message on every connection, after
+`WprsClientConnect` and `Output::New`. Measured end to end on a real wprsd + `foot`,
+holding KEY_A through the media socket and counting bytes in the guest — old binary vs
+new: 100 ms hold 1 vs 1, **400 ms 41 vs 1, 1000 ms 162 vs 11**, each exactly what the
+two settings predict. The fork's own `add_keyboard(…, 200, 200)` stays as is; the fake
+wprsd helpers in `input.rs` and `bridge.rs` skip the new preamble event. Harness:
+`hold.py`-style — wait for a `StreamConfig` frame (kind byte 6 == 1, ids at payload
+1..9 / 9..17 after the 44-byte header), then send `keyboard_key` press, sleep, release.
+X11 apps get the same rate and do not double-repeat: an `xterm` session (built with the
+per-session X display fix, PR #45) gave 100 ms → 1, 400 ms → 1, 1000 ms → 11, identical to
+`foot` — the xwayland proxy forwards `repeat_info` into its own seat and nothing repeats twice.
+
+**Android 8 / 11 / 14 verified on emulators (2026-09-27): no double inset.** The last
+untested range (API 30–34, plus `minSdk` 26) was run on google_apis x86_64 AVDs with
+Gboard, paired to a loopback daemon at `10.0.2.2`. On API 26, 30 and 34 alike, with the
+keyboard up the key bar sits flush on the IME (API 34: bar bottom ≈ 380, IME touchable
+from 394; API 30 and 26: `Esc` at 420–473, IME from 520) and the stream shrinks into
+the band above it; hidden, the stream fills the screen. The same layout as the Pixel 10
+on API 37 — nothing is pushed off-screen by a doubled inset. Typing through Gboard reached
+the guest exactly on all three, as did armed Ctrl + `c` → `0x03`, locked Ctrl + `a` →
+`0x01`, and a plain key after release. The chip now reports `checkable=true`, `checked`
+tracking off → armed → locked → off (Compose maps `semantics { selected }` to
+checkable/checked, not `selected`, for anything that is not a Tab).
+Emulator gotchas: only `-gpu host` works here — swiftshader and lavapipe SEGV in the
+emulator's RenderThread (it looked like a KVM crash; it is not); `avdmanager` writes to
+`~/.config/.android/avd`, so set `ANDROID_AVD_HOME`; API 26's `uiautomator` cannot dump
+the IME window. An idle guest shows "Waiting for the first frame…" after attach until it
+repaints, on every API level — the known idle-`foot` single-access-unit behaviour.
+
+Capture recipe (container root lacks `CAP_NET_RAW`, the host's sudo does not):
+`host-spawn sudo -n tcpdump -i tailscale0 -n -U -w ~/cap.pcap "tcp port 9517 and src
+host <phone-tailnet-ip>"`, then pair consecutive 123/124-byte segments.
+
+The phone became a client you can *work in* rather than a mirror: a key bar with
+sticky Ctrl/Alt above Gboard, a deterministic IME field, the stream shrinking above
+the keyboard, and 1×/1.5×/2×/3× scale presets remembered per host. Zero Rust
+changes — `ViewportResize` already resizes the `wl_output` and every toplevel
+(`crates/navette-bridge/src/input.rs`), and the encoder already follows whatever size
+the guest paints (`crates/navetted/src/bridge.rs`, `encode_frame`). Plan:
+`.claude/PRPs/plans/mobile-keyboard-and-scale.plan.md`. Facts the next person needs:
+
+- **wprsd ignores `ctrl`/`alt` in `KeyboardEvent::Modifiers`.** At the pinned rev
+  (`crates/navetted/Cargo.toml:28`, `38c61fe`), `src/server/client_handlers.rs`
+  feeds every raw `KeyboardEvent::Key` into smithay's xkb state and derives the
+  modifier state from *that*; the `Modifiers` handler only sets the layout and
+  toggles caps/num lock. So `Modifiers{ctrl = true}` on its own is a silent no-op,
+  and `InputMapper.keyChord` wraps the key in a real `KEY_LEFTCTRL`/`KEY_LEFTALT`
+  press/release (ctrl outermost, alt inside, shift innermost). The hardware path
+  "worked" with Ctrl all along only because Android also delivers the physical
+  `KEYCODE_CTRL_LEFT` as a key. The bridge's `InputState` does release held keys
+  when an attachment drops — but that is **not** the same as "a chord cannot
+  leave Ctrl stuck", which an earlier draft of this section claimed.
+  `MediaClient.sendInput` returns false both for "no socket" *and* for "socket
+  declined the frame" (`MediaClient.kt:154-163`: OkHttp's `send` returns false
+  when its output queue is full, *without* closing the socket), so a delivered
+  `KEY_LEFTCTRL` press followed by a declined release holds Ctrl on the guest
+  with the socket still up — until the ping timeout tears it down and the
+  bridge's release fires. Bounded, but real: the client-side releases below
+  (partial-chord unwind, release on disarm, release on close) are what narrow
+  it, and tapping the chip off is the user's own recovery.
+
+- **Characters repeat in the guest when you type fast — and it is not the IME
+  diff.** Reported from the Pixel 10 as "typed `echo hi`, guest shows `eecho hi`",
+  which reads like a client double-send. It is not. Instrumenting
+  `onValueChange`/`onImeText` and logging every emitted keycode on a Pixel 9 Pro
+  Fold (2026-09-22) shows the client emitting **exactly one press/release pair per
+  character** — `""→"e"` emits `18v 18^`, `"e"→"ec"` emits `46v 46^`, and so on to
+  `"echo hi"` — with `MediaClient` reporting no dropped send at all, and the
+  hardware `onKeyEvent` path never entering. Yet the same taps typed fast produced
+  `eeeeeecho hi` (six e's) and `echo abcdefgh…` followed by ~30 `h`s in the guest.
+  The repeats are always the **last** key of a burst, and typing the identical
+  text with 1.2 s between taps never duplicates anything.
+  That is the guest's own auto-repeat: the wprs fork calls
+  `add_keyboard(Default::default(), 200, 200)`
+  (`wprs/src/bin/wprsd.rs:281`, and the same in `xwayland-xdg-shell.rs:226`), i.e.
+  **repeat_delay = 200 ms and repeat_rate = 200 characters per second** — the
+  daemon log prints both. Wayland's `repeat_info` rate is keys per second, so a
+  typical desktop is 25-33; at 200 the guest emits a character every 5 ms once a
+  key has been held 200 ms. So any hiccup that delays a *release* past 200 ms turns
+  one keystroke into a burst whose length is `(delay - 200) / 5`: the six e's imply
+  a release about 225 ms late, the h-burst about 350 ms. Client-side there is
+  nothing left to fix — the press and release leave `sendWhileAccepted` microseconds
+  apart (measured: `key 18 DOWN accepted=true at=…222`, `key 18 UP accepted=true
+  at=…223`) and the socket accepted both. **Nor did the daemon refuse anything.**
+  `MediaClient` reports a client-side refusal (`logDropped`, `Log.d`) *and* a server
+  error frame (`MediaClient.kt:401`, `Log.w` — which covers the `rate_limited` that
+  `api.rs:1005` returns for a full 256-slot input queue, and the
+  `MAX_INPUT_MESSAGES_PER_SECOND = 240` limiter at `api.rs:44`) under the same
+  `MediaClient` tag, and `logcat -s MediaClient` was empty for every reproducing
+  run. So the input was accepted at both ends and the delay is downstream of
+  acceptance. Worth knowing before anyone re-investigates: the client is **not**
+  blind to refusals — an earlier note of mine claimed it was, on the strength of
+  grepping for the string `rate_limited`, which never appears because the client
+  logs the code rather than matching on it. The decode is pinned by
+  `MediaProtocolTest`'s `a server error frame decodes into its code and message`.
+  The delay and the pathological repeat rate are
+  both server-side, and the repeat rate is the cheaper of the two to fix: at a sane
+  25/s the same 350 ms hiccup would cost ~3 stray characters instead of 30. Note
+  the daemon under test shared a host with this workspace's builds, which may
+  inflate the stall; the repeat setting is wrong regardless.
+
+- **A sticky modifier chords exactly one character.** An IME edit is not one
+  key: a paste, or a keyboard that commits a whole word, arrives as one
+  `onValueChange` carrying several characters, and `imeTextDelta` used to wrap
+  every one of them in the held modifier — a paste of "abc" under armed Ctrl
+  became Ctrl+A, Ctrl+B, Ctrl+C, and Ctrl+A alone is select-all in most guests.
+  Only the first character the guest receives is chorded now ("armed for the
+  next key" means one key); the rest go out plain and the modifier is spent
+  once. Reviewers split on this — one read the old behaviour as the documented
+  design, the other flagged the paste hazard — so it is pinned by
+  `only the first character of a multi-character commit is chorded` rather than
+  left to the next reader's judgement.
+
+- **Pointer motion needed no change for scale.** `SessionController.sendMotion`
+  already maps surface pixels into the decoded frame through
+  `InputMapper.rescaleToContent(..., contentSize)`, and `contentSize` comes from
+  `DecoderEvent.Configured`. At 2× the frame is `surface / 2`, so every motion is
+  divided by the scale for free. Only `sendScroll` had to gain the same rescale —
+  its old doc claimed finger deltas "need no rescaling", which was true only at 1×.
+  Pinch zoom is a surface-pixel View transform and composes with logical scale
+  without code.
+
+- **The min-viewport clamp must not break aspect.** The bridge accepts
+  `320..3840 × 240..2160`. A landscape phone with the IME up has ~450 px of surface
+  height, and `450 / 2 < 240`; clamping the height alone would leave the width at
+  `1200` and MediaCodec's scale-to-fit (never overridden — `H264Decoder` calls no
+  `setVideoScalingMode`) would stretch the picture. `InputMapper.scaledViewport`
+  divides by `min(factor, width/320, height/240)` instead, so `(2400, 450, 2×)` →
+  `(1280, 240)` with the aspect intact. Exhaustively tested against
+  `MediaInput.validate()`.
+
+- **IME insets.** `targetSdk 36` means Android 15+ enforces edge-to-edge and the
+  window no longer resizes for the keyboard; `Modifier.imePadding()` on the session
+  `Column` is what shrinks the stream box, whose `onSizeChanged` → `onSurfaceResized`
+  → debounced `ViewportResize` re-lays the guest out above Gboard. Below API 30 the
+  inset is only reported with `windowSoftInputMode="adjustResize"`, now in the
+  manifest. `enableEdgeToEdge()` was deliberately **not** added to `MainActivity`.
+  **Each IME show/hide is one encoder restart** (~0.8 s end to end, measured for the
+  viewer): the 150 ms client debounce plus the daemon's 100 ms one mean one per
+  show/hide, not one per inset animation frame.
+
+- **Why the hidden field is `KeyboardType.Password`.** Compose 1.10.6 never sets
+  `TYPE_TEXT_FLAG_NO_SUGGESTIONS`; the password variation is the lever that makes
+  Gboard drop suggestions, autocorrect and glide typing, each of which otherwise
+  arrives as a composition update the prefix diff turns into a backspace-and-retype
+  burst on the guest. `ImeAction.Default` with `singleLine = false` is what keeps
+  `IME_FLAG_NO_ENTER_ACTION`, so Enter still inserts `\n` → `KEY_ENTER`. The field
+  is now emptied (only between compositions) after a chorded character and past 64
+  chars; an empty-field Backspace arrives as `KEYCODE_DEL` through `onPreviewKeyEvent`
+  because Gboard has nothing to `deleteSurroundingText`. All of this is IME
+  behaviour Android does not guarantee — the device checklist in the plan is the
+  acceptance signal, and if Enter does not arrive as `\n` on some keyboard, the
+  `onPreviewKeyEvent` branch extends to `KEYCODE_ENTER` in one line.
+
+- **…and what the password type costs: autofill.** A security review caught it.
+  A password-typed editable is exactly what the platform's Autofill Framework
+  offers a saved credential for, and every "Keyboard" tap focuses this one, which
+  is the prompt trigger; a provider that filled it would have the field's
+  `onValueChange` diff the credential and type it into the guest as key events.
+  What was verified in the 1.10.6 bytecode: `PopulateViewStructure_androidKt` is
+  what writes `setAutofillHints`/`setDataIsSensitive`, from the semantics
+  `contentType`/`contentDataType`; `ContentType.Password` exists and the companion
+  has no `None`, while `ContentDataType` does. The mapping itself is **confirmed**
+  on the legacy path this code uses, after a first pass failed to find it: it is
+  not a member of `KeyboardOptions` but a branch inside
+  `CoreTextFieldSemanticsModifierNode.applySemantics` (offsets 128-157), which
+  reads the node's own `imeOptions.getKeyboardType()` and maps
+  `Password`/`NumberPassword` to `ContentType.Password`. That node is legacy-only
+  despite living in `foundation.text.input.internal`: its constructor takes
+  `TextFieldValue`/`LegacyTextFieldState`/`OffsetMapping`/`ImeOptions`,
+  `CoreTextFieldKt` instantiates it, and `BasicTextFieldKt` routes the
+  `TextFieldValue` overload — the one this screen calls, `ImeLayer.kt:90` — into `CoreTextField`;
+  BTF2 uses `TextFieldDecoratorModifierNode` instead. With
+  `ComposeUiFlags.isSemanticAutofillEnabled` defaulting true, the hidden field was
+  therefore advertised with `AUTOFILL_HINT_PASSWORD` **and** an `onFillData`
+  action, so a provider offers saved credentials on the hint rather than on its own
+  heuristics. Two caveats stay true and are worth keeping: `alpha(0f)` yields
+  `setVisibleToUser(false)` and `INVISIBLE` in the `ViewStructure`, so the
+  accessibility channel (a manager like Bitwarden) likely never saw it, and no
+  on-device fill was ever reproduced — the advertisement is proven, the end-to-end
+  fill is not. **And the first fix for it did not work** — measured on a Pixel 9 Pro
+  Fold (API 37) with Bitwarden installed, on 2026-09-22. `SessionScreen` set
+  `importantForAutofill = IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS` on
+  `LocalView.current`, and the platform still rendered
+  `android:id/autofill_dataset_picker` (window "Autofill UI", Bitwarden, "Vault is
+  locked") over the stream every time the hidden field took focus — on a
+  force-stopped, freshly launched app whose only focused editable was that field.
+  The reason is the mechanism: that flag gates the platform's *own* walk of the
+  view tree (`onProvideAutofillVirtualStructure`), but Compose 1.10.6 does not wait
+  to be walked — with `isSemanticAutofillEnabled` true it calls
+  `notifyViewEntered` for the focused semantics node itself, and the platform
+  honours an app's explicit notification. `FocusOwnerImpl` and `AndroidComposeView`
+  read that flag at focus time, so `SessionScreen` now also sets
+  `ComposeUiFlags.isSemanticAutofillEnabled = false` for the life of the session
+  screen and restores it on the way out (`@OptIn(ExperimentalComposeUiApi::class)`;
+  it is a public mutable static). The view flag and the field's
+  `contentDataType = ContentDataType.None` + `hideFromAccessibility()` stay as
+  defence in depth. **The exposure is confirmed on device; the replacement fix is
+  not.** On 2026-09-23 the positive control was run to completion on the Pixel 9
+  Pro Fold (the only phone here with `settings get secure autofill_service` set —
+  `com.x8bit.bitwarden/…AutofillService`; the Pixel 10 returns empty and therefore
+  *cannot* reproduce this at all, which is why an earlier attempt there found
+  nothing and proved nothing). Focusing the Connect screen's token field gave
+  `mCurrentFocus=Window{… Autofill UI}` with `autofill_dataset_picker` and
+  `Bitwarden` in the `uiautomator` tree. So the finding is real on hardware, not
+  merely advertised in the semantics tree, and the detection method works. The
+  session-screen half — that the same focus produces *no* picker with the fix in —
+  was one tap away when both phones dropped off adb (one vanished, the other went
+  `unauthorized`), and remains unverified. Finish it the same way: force-stop,
+  launch, open the session, tap Keyboard, `adb shell uiautomator dump`, grep for
+  `autofill_dataset_picker`; expect nothing on the session screen and the picker
+  still present on the Connect screen. Drive it with taps whose coordinates come
+  from a fresh dump and a frontmost check before each one — blind scripted tapping
+  on a personal phone is how the earlier run wandered into unrelated apps. **Keep `KeyboardType.Password`** — no other type sets
+  `NO_SUGGESTIONS` in 1.10.6, and it also stops Gboard learning what is typed at
+  a sudo prompt. If a future Compose gains a way to clear the content type, the
+  view-level flag is still the one that is not advisory.
+
+- **A modifier must never be left pressed in the guest.** Two defects the reviews
+  found, both in `SessionKeyboard`: an armed Ctrl was spent even when the socket
+  refused every message of its chord (so the *next* key went out unchorded), and
+  a chord cut off after its `KEY_LEFTCTRL` press left Ctrl down for everything
+  after it. `sendWhileAccepted` now stops at the first refusal and reports how
+  many landed: nothing delivered means nothing is spent, and a partial chord is
+  unwound with releases innermost-first. Beyond that, tapping a chip off always
+  sends the release (the only recovery available when a release was accepted here
+  but dropped downstream — the client cannot see that happen), and
+  `SessionController.close()` calls `releaseHeldModifiers()` so leaving the screen
+  cannot strand one. Unconditional releases are safe because the bridge collapses
+  only a redundant *press*: `input.rs:159-198` forwards a release for a keycode it
+  never saw pressed, and logs a debug line. The server's own healing
+  (`release_keys` on attachment drop) was not enough to rely on — it travels
+  through the same bounded input queue that may have dropped the release in the
+  first place, and a 64-character flush is ~384 messages.
+
+- **Pairing registry schema v3** adds `viewScale` (a `Float` on the wire, one of the
+  four preset factors). v1/v2 blobs decode with `viewScale = null` ("device
+  default"); a v1/v2 blob that *carries* `viewScale` is `Corrupt`, an unknown factor
+  degrades to `null`. Unchanged and worth repeating: `Json { ignoreUnknownKeys =
+  false }` runs before the version check, so **a v3 blob read by a pre-v3 build is
+  `Corrupt`, not `Future`, and the store maps that to an empty registry that the next
+  write overwrites** — an APK downgrade re-pairs every host, exactly as v2→v1 did.
+  **Resolved for future bumps (2026-09-27):** `PairingRegistryCodec.decode` now reads
+  `version` before the strict decode, so a newer schema with new keys is `Future`
+  (writes refused, registry kept) rather than `Corrupt` (wiped). Builds that predate it
+  still wipe on downgrade.
+
+- **The controller's key path is now JVM-testable.** The plan recorded it as
+  untestable (the packet loop that sets `gate.primary` runs on `Dispatchers.Default`
+  and the fake never delivers a `StreamConfig`). Instead of living on the controller,
+  the hardware/IME/bar key paths and the sticky state moved into
+  `SessionKeyboard(primary = { gate.primary }, send = client::sendInput)`, and
+  `SessionKeyboardTest` drives chords, spending and locking directly. Still not
+  testable: anything that needs a real `KeyEvent` or `MotionEvent` (the android.jar
+  stubs return zeros). Also learned the hard way: **`advanceUntilIdle()` never returns
+  in a controller test** — the HUD loop re-arms its one-second `delay` forever while
+  the fake reports `Connected`; use `advanceTimeBy(151)` + `runCurrent()`.
+
+- **File sizes.** `SessionController.kt` was already 880 lines before this work;
+  `MediaSessionClient` + `OkHttpMediaSessionClient` + `launchHudWhileConnected`
+  (verified as a pure move by the sorted-multiset check from #35), `SessionUiState`,
+  and the `MotionEvent → TouchEvent` reduction (`TouchEvents.kt`) were moved out to
+  land it at ~776. The clipboard surface (~120 lines, shares `lock` with the decoder
+  path) is the next candidate if it grows again.
+
+Not built, on purpose: true HiDPI (`wl_output` scale / `buffer_scale`), Unicode text
+commit (`asciiCharToEvdev` stays US-only), sticky modifiers on hardware keys,
+momentum scroll, keyboard layouts, and syncing `imeRaised` with the system dismissing
+the IME (`isImeVisible` is still `@ExperimentalLayoutApi`). Not yet run on the Pixel —
+the on-device checklist in the plan is the acceptance gate, plus these four, which the
+review rounds added and the plan's checklist does not cover:
+
+- **Type a 70-character line continuously** (e.g. `echo aaaa…` past 64 chars) and check
+  no character is duplicated or dropped at the 65th. Nothing else in the checklist ever
+  crosses the hidden field's reset boundary — the longest item is `echo test`.
+- **Autofill probe**: with a password manager installed and a credential saved, tap
+  **Keyboard** repeatedly and confirm no fill prompt or dropdown ever appears over the
+  stream, and that the Connect screen still offers autofill after leaving the session.
+- **Keys button with the keyboard up**: it must hide the bar and leave Gboard up (and
+  bring it back on the next tap), never flip its own label while the screen is unchanged.
+- **Stuck-modifier recovery**: long-press Ctrl (locked), leave the session mid-chord,
+  re-attach, and confirm the guest is not still holding Ctrl (`showkey` or a shell where
+  a plain `a` types `a`).
+
+## Open-items sweep: five PRs, all reviewed (2026-09-27 → 09-29)
+
+State of play, newest first. Nothing merged; every PR had an independent review and
+the follow-ups it asked for are pushed.
+
+| PR | Branch | Base | What | Review |
+|---|---|---|---|---|
+| #45 | `fix/session-x11-display` | master | X11 guests got the host's `DISPLAY` (opened on the host screen); every session after the first had no Xwayland (`:100` collision). Per-session display, owned-before-named, recorded for the session's life | security: MEDIUMs fixed in `3f8d1f8` |
+| #44 | `refactor/exhaustive-connection-state` | master | `ConnectionPhase`: one exhaustive classification; retry "rejected" by phase; `ConnectScreen` exhaustive | code: follow-ups in `896ed3c` |
+| #43 | `fix/registry-future-with-new-keys` | **#41** (stacked) | newer registry with new keys is `Future` (kept), not `Corrupt` (wiped); explicit "update the app" message | code: approve; follow-ups in `08ed6b9` |
+| #42 | `fix/bearer-scheme-case-insensitive` | master | `bearer <token>` accepted per RFC 7235 | security: approve |
+| #41 | `feat/mobile-keyboard-and-scale` | master | the keyboard feature + Nagle off + guest key repeat 600 ms/25/s + accessible chips; verified on Pixel 10 and API 26/30/34 emulators | code + security |
+
+Merge order: #41 before #43 (GitHub retargets #43 to master); #42, #44, #45 are independent.
+Worktrees for each branch live beside the repo (`../navette-wt-*`); all are pushed.
+
+Left open, deliberately:
+- **Phone:** the Pixel 10's debug build is paired to a stopped throwaway daemon — re-pair
+  it to the real one. `xterm` was installed in the dev distrobox for the X11 tests
+  (`sudo dnf remove xterm` to undo).
+- **Reconnect wiring end to end** (`SessionScreen`'s retry composition) still has no
+  automated test — there is no Compose/instrumented test harness in the project.
+- **Same-user isolation between sessions** is a convention, not a boundary: guests run as
+  the navette user and can reach each other's displays on purpose (security review of #45).
+- The xwayland-xdg-shell `--wayland-display` socket never appears as a file; harmless (the
+  collision was the X socket), noted so nobody chases it.
 
 ## X11 apps escaped their session: fixed (2026-09-27)
 

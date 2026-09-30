@@ -4,12 +4,15 @@ import com.greponlabs.navette.net.ConnectionState
 import com.greponlabs.navette.net.BlobDescriptor
 import com.greponlabs.navette.net.MediaInput
 import com.greponlabs.navette.net.MediaPacket
+import com.greponlabs.navette.net.ViewScale
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -85,6 +88,169 @@ class SessionControllerTest {
 
             controller.close()
             assertEquals(1, client.closeCalls)
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    private fun viewportsSent(client: FakeMediaSessionClient) = client.sentInputs.filterIsInstance<MediaInput.ViewportResize>()
+
+    /**
+     * Past the controller's 150 ms resize debounce, and no further:
+     * `advanceUntilIdle` never returns here because the HUD loop re-arms its
+     * one-second delay forever while the fake reports Connected.
+     */
+    private fun TestScope.settleResize() {
+        advanceTimeBy(151)
+        runCurrent()
+    }
+
+    @Test
+    fun `the viewport is reported at the logical scale once the surface has held still`() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        try {
+            val client = FakeMediaSessionClient()
+            val controller =
+                SessionController(
+                    mediaUrl = "ws://unused/v1/sessions/demo/media",
+                    token = "unused",
+                    transformHolder = ViewTransformHolder(),
+                    bridge = ClipboardBridge(),
+                    client = client,
+                    initialViewScale = ViewScale.X2,
+                )
+            controller.open()
+            runCurrent()
+            assertEquals(ViewScale.X2, controller.state.value.viewScale)
+
+            controller.onSurfaceResized(2400, 1080)
+            runCurrent()
+            assertEquals("nothing goes out before the debounce", emptyList<MediaInput.ViewportResize>(), viewportsSent(client))
+
+            settleResize()
+            assertEquals(listOf(MediaInput.ViewportResize(1200, 540)), viewportsSent(client))
+
+            // The IME-up size on a landscape phone: 450 / 2 < 240, so the
+            // divisor drops to 1.875 and the aspect is preserved.
+            controller.onSurfaceResized(2400, 450)
+            settleResize()
+            assertEquals(MediaInput.ViewportResize(1280, 240), viewportsSent(client).last())
+
+            controller.close()
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
+    fun `changing the scale re-sends the viewport at once and publishes it`() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        try {
+            val client = FakeMediaSessionClient()
+            val controller =
+                SessionController(
+                    mediaUrl = "ws://unused/v1/sessions/demo/media",
+                    token = "unused",
+                    transformHolder = ViewTransformHolder(),
+                    bridge = ClipboardBridge(),
+                    client = client,
+                    initialViewScale = ViewScale.X2,
+                )
+            controller.open()
+            controller.onSurfaceResized(2400, 1080)
+            settleResize()
+            assertEquals(1, viewportsSent(client).size)
+
+            controller.setViewScale(ViewScale.X1)
+            // runCurrent only: no virtual time passes, so a debounced send
+            // would still be parked.
+            runCurrent()
+
+            assertEquals(ViewScale.X1, controller.state.value.viewScale)
+            assertEquals(listOf(MediaInput.ViewportResize(1200, 540), MediaInput.ViewportResize(2400, 1080)), viewportsSent(client))
+
+            controller.close()
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
+    fun `re-selecting the current scale sends nothing`() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        try {
+            val client = FakeMediaSessionClient()
+            val controller =
+                SessionController(
+                    mediaUrl = "ws://unused/v1/sessions/demo/media",
+                    token = "unused",
+                    transformHolder = ViewTransformHolder(),
+                    bridge = ClipboardBridge(),
+                    client = client,
+                    initialViewScale = ViewScale.X2,
+                )
+            controller.open()
+            controller.onSurfaceResized(2400, 1080)
+            settleResize()
+
+            controller.setViewScale(ViewScale.X2)
+            controller.setViewScale(ViewScale.X2)
+            settleResize()
+
+            assertEquals("no spurious encoder restart", 1, viewportsSent(client).size)
+            controller.close()
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
+    fun `a scale change cancels a pending debounced resize rather than sending twice`() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        try {
+            val client = FakeMediaSessionClient()
+            val controller =
+                SessionController(
+                    mediaUrl = "ws://unused/v1/sessions/demo/media",
+                    token = "unused",
+                    transformHolder = ViewTransformHolder(),
+                    bridge = ClipboardBridge(),
+                    client = client,
+                )
+            controller.open()
+            controller.onSurfaceResized(2400, 1080)
+            runCurrent()
+
+            controller.setViewScale(ViewScale.X3)
+            settleResize()
+
+            assertEquals(listOf(MediaInput.ViewportResize(800, 360)), viewportsSent(client))
+            controller.close()
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
+    fun `a scale change before any surface size sends nothing`() = runTest {
+        Dispatchers.setMain(StandardTestDispatcher(testScheduler))
+        try {
+            val client = FakeMediaSessionClient()
+            val controller =
+                SessionController(
+                    mediaUrl = "ws://unused/v1/sessions/demo/media",
+                    token = "unused",
+                    transformHolder = ViewTransformHolder(),
+                    bridge = ClipboardBridge(),
+                    client = client,
+                )
+            controller.open()
+            controller.setViewScale(ViewScale.X2)
+            settleResize()
+
+            assertEquals(emptyList<MediaInput.ViewportResize>(), viewportsSent(client))
+            assertEquals("the choice still takes effect for the first surface size", ViewScale.X2, controller.state.value.viewScale)
+            controller.close()
         } finally {
             Dispatchers.resetMain()
         }

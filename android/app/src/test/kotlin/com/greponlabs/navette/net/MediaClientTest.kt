@@ -6,6 +6,7 @@ import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
@@ -127,6 +128,35 @@ class MediaClientTest {
             ),
             payload,
         )
+
+    /**
+     * Pins the socket OkHttp actually connects, not just the configuration: a
+     * key's press and release are two small frames, and with Nagle on the
+     * release waits for the press's ACK (see [NoDelaySocketFactory]). An OkHttp
+     * upgrade that stopped calling the factory, or reset the option, fails here.
+     *
+     * The probe is a plain HTTP call on a client derived from
+     * [MediaClient.httpClient], not a WebSocket: OkHttp's WebSocket connect drops
+     * both the EventListener and the network interceptors, so neither can see
+     * that socket. The socket itself comes from the same `connectSocket` path
+     * and the same factory either way.
+     */
+    @Test
+    fun `the socket OkHttp connects for media has Nagle off`() {
+        val noDelay = LinkedBlockingQueue<Boolean>()
+        val probe =
+            client.httpClient
+                .newBuilder()
+                .addNetworkInterceptor { chain ->
+                    chain.connection()?.let { noDelay.put(it.socket().tcpNoDelay) }
+                    chain.proceed(chain.request())
+                }.build()
+        MockWebServer().use { plain ->
+            plain.enqueue(MockResponse())
+            probe.newCall(Request.Builder().url(plain.url("/")).build()).execute().close()
+        }
+        assertEquals(true, noDelay.poll(5, TimeUnit.SECONDS))
+    }
 
     @Test
     fun `connect negotiates the media subprotocol`() {

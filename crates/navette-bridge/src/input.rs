@@ -418,8 +418,8 @@ mod tests {
     use calloop::channel::Channel;
     use tempfile::TempDir;
     use wprs::serialization::wayland::{
-        Buffer, BufferAssignment, BufferData, BufferFormat, BufferMetadata, Role, SubSurfaceState,
-        SurfaceRequest, SurfaceRequestPayload, SurfaceState,
+        Buffer, BufferAssignment, BufferData, BufferFormat, BufferMetadata, OutputEvent,
+        RepeatInfo, Role, SubSurfaceState, SurfaceRequest, SurfaceRequestPayload, SurfaceState,
     };
     use wprs::serialization::xdg_shell::{XdgToplevelId, XdgToplevelState};
     use wprs::serialization::{ClientId, RecvType, Request, Serializer};
@@ -536,6 +536,49 @@ mod tests {
     /// `WprsTransport` connect to it, and hands back the raw `Event`s the
     /// transport sends so tests can assert on them without a mocking
     /// framework.
+    /// Consumes the connection preamble `WprsTransport::connect` sends and
+    /// asserts it exactly: the handshake, the new output, then the key repeat.
+    /// Consuming it here -- rather than skipping those variants wherever they
+    /// appear -- is what lets `recv` and `assert_no_further_events` catch a
+    /// stray one mid-session.
+    fn expect_connect_preamble(events: &Channel<RecvType<Event>>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut preamble = Vec::new();
+        while preamble.len() < 3 {
+            match events.try_recv() {
+                Ok(RecvType::Object(event)) => preamble.push(event),
+                Ok(RecvType::RawBuffer(_)) => panic!("raw buffer inside the connect preamble"),
+                Err(TryRecvError::Empty) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for the preamble"
+                    );
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(TryRecvError::Disconnected) => panic!("fake wprsd channel disconnected"),
+            }
+        }
+        assert!(
+            matches!(preamble[0], Event::WprsClientConnect),
+            "{:?}",
+            preamble[0]
+        );
+        assert!(
+            matches!(preamble[1], Event::Output(OutputEvent::New(_))),
+            "{:?}",
+            preamble[1]
+        );
+        assert!(
+            matches!(
+                &preamble[2],
+                Event::KeyboardEvent(KeyboardEvent::RepeatInfo(RepeatInfo::Repeat { rate, delay: 600 }))
+                    if rate.get() == 25
+            ),
+            "{:?}",
+            preamble[2]
+        );
+    }
+
     struct FakeWprsd {
         events: Channel<RecvType<Event>>,
         _server: Serializer<Request, Event>,
@@ -554,6 +597,7 @@ mod tests {
             drop(guard);
             let events = server.reader().expect("fake wprsd reader already taken");
             let transport = WprsTransport::connect(&socket).expect("connect to fake wprsd");
+            expect_connect_preamble(&events);
             (
                 transport,
                 Self {
@@ -564,14 +608,14 @@ mod tests {
             )
         }
 
-        /// Returns the next event the transport sent, skipping the
-        /// connection preamble (`WprsClientConnect`, `Output`) that
-        /// `WprsTransport::connect` emits automatically.
+        /// Returns the next event the transport sent. The connect preamble is
+        /// already consumed by `connect`; `Output` events are still skipped
+        /// because a viewport resize sends `Output::Update`.
         fn recv(&self) -> Event {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 match self.events.try_recv() {
-                    Ok(RecvType::Object(Event::WprsClientConnect | Event::Output(_))) => continue,
+                    Ok(RecvType::Object(Event::Output(_))) => continue,
                     Ok(RecvType::Object(event)) => return event,
                     Ok(RecvType::RawBuffer(_)) => continue,
                     Err(TryRecvError::Empty) => {
@@ -592,7 +636,7 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
             match self.events.try_recv() {
                 Err(TryRecvError::Empty) => {}
-                Ok(RecvType::Object(Event::WprsClientConnect | Event::Output(_))) => {}
+                Ok(RecvType::Object(Event::Output(_))) => {}
                 Ok(RecvType::Object(event)) => {
                     panic!("expected no further events, got {event:?}")
                 }
