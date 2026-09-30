@@ -1,6 +1,8 @@
 package com.greponlabs.navette.ui.session
 
+import com.greponlabs.navette.net.ConnectionPhase
 import com.greponlabs.navette.net.ConnectionState
+import com.greponlabs.navette.net.phase
 
 /**
  * How many rebuilds a dropped media socket gets before the screen stops
@@ -35,9 +37,18 @@ object ReconnectPolicy {
      * on a drop that never satisfies its predicate.
      */
     fun isDropped(connection: ConnectionState): Boolean =
-        connection is ConnectionState.Failed ||
-            connection is ConnectionState.Disconnected ||
-            connection is ConnectionState.Unauthorized
+        when (connection.phase) {
+            ConnectionPhase.Dropped, ConnectionPhase.Rejected -> true
+            ConnectionPhase.Connecting, ConnectionPhase.Live -> false
+        }
+
+    /**
+     * Whether the daemon refused the token. Retrying cannot help, so
+     * [shouldRetry] must be told; asked of the phase rather than of one
+     * variant, so any state classified as [ConnectionPhase.Rejected] is never
+     * retried into a silent loop.
+     */
+    fun isRejected(connection: ConnectionState): Boolean = connection.phase == ConnectionPhase.Rejected
 
     /**
      * Whether a drop should be retried automatically after [attempt]

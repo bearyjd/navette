@@ -7,8 +7,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.greponlabs.navette.net.ConnectionState
+import com.greponlabs.navette.net.ConnectionPhase
 import com.greponlabs.navette.net.ViewScale
+import com.greponlabs.navette.net.phase
 import com.greponlabs.navette.ui.connect.ConnectScreen
 import com.greponlabs.navette.ui.drawer.DrawerScreen
 import com.greponlabs.navette.ui.hosts.HostListScreen
@@ -74,7 +75,7 @@ fun NavetteApp(
                 onBack = { viewModel.onEvent(AppEvent.HideHosts) },
                 onSnackbarDismissed = { shown -> viewModel.onEvent(AppEvent.DismissSnackbar(shown)) },
             )
-        state.connection is ConnectionState.Connected && !state.addingHost ->
+        state.connection.phase == ConnectionPhase.Live && !state.addingHost ->
             DrawerScreen(
                 sessions = state.sessions,
                 apps = state.apps,

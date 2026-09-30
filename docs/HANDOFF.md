@@ -2847,6 +2847,15 @@ a screenshot is the fastest way to communicate that.
 
 ## Project hazard: `ConnectionState` has no compiler-enforced exhaustiveness (2026-09-12)
 
+**Resolved (2026-09-27):** `ConnectionPhase.kt` classifies every `ConnectionState` in one
+`when (this)` with no `else`; `ReconnectPolicy.isDropped`/`isRejected` (which the retry
+coordinator and the session screen now use instead of `is Unauthorized`), `SessionOverlay` and
+`NavetteApp` switch on the phase, the overlay exhaustively; `ConnectScreen` matches the sealed
+type itself with no `else` (there `Disconnected` and `Failed` differ, though both are Dropped).
+Still single-state checks by design: `AppViewModel`'s `Connected`/`Failed` handlers and
+`SessionController`'s "socket is live" checks. Adding a throwaway variant fails to
+compile at `ConnectionPhase.kt` — checked. The original note follows.
+
 Found during Task 7 (Android 401 handling), and the plan's own prediction about it
 was wrong, in the dangerous direction — worth recording as a standing hazard rather
 than only a footnote on a fixed bug.
@@ -3629,8 +3638,10 @@ Left open, deliberately:
 - **Phone:** the Pixel 10's debug build is paired to a stopped throwaway daemon — re-pair
   it to the real one. `xterm` was installed in the dev distrobox for the X11 tests
   (`sudo dnf remove xterm` to undo).
-- **Reconnect wiring end to end** (`SessionScreen`'s retry composition) still has no
-  automated test — there is no Compose/instrumented test harness in the project.
+- **Reconnect wiring** is covered: `7362ed4` moved the retry loop into
+  `ReconnectCoordinator.kt` with its own tests (one rebuild after the policy delay; none for
+  a rejected token). Only the `reconnectNonce` bump in `SessionScreen.kt` is untested glue,
+  and the API 26 emulator exercised it live (drop → reconnecting → Disconnected; rejected).
 - **Same-user isolation between sessions** is a convention, not a boundary: guests run as
   the navette user and can reach each other's displays on purpose (security review of #45).
 - The xwayland-xdg-shell `--wayland-display` socket never appears as a file; harmless (the

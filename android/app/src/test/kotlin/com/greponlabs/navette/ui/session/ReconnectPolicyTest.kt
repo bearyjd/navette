@@ -78,4 +78,12 @@ class ReconnectPolicyTest {
         assertEquals(RECONNECT_BASE_DELAY_MS, ReconnectPolicy.delayMs(0))
         assertEquals(RECONNECT_BASE_DELAY_MS, ReconnectPolicy.delayMs(-4))
     }
+
+    @Test
+    fun `only a rejected connection is rejected`() {
+        assertTrue(ReconnectPolicy.isRejected(ConnectionState.Unauthorized))
+        for (state in listOf(ConnectionState.Connecting, ConnectionState.Connected, ConnectionState.Disconnected, ConnectionState.Failed("x"))) {
+            assertFalse(state.toString(), ReconnectPolicy.isRejected(state))
+        }
+    }
 }
