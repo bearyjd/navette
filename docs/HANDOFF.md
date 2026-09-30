@@ -2895,6 +2895,10 @@ Recorded here as the number to plan memory budgets against, not 128 MB.
 
 ## Deferred minor: `Bearer` prefix match is case-sensitive (2026-09-12)
 
+**Resolved (2026-09-27):** `guard.rs` now parses the header with `bearer_credentials`,
+which matches the scheme case-insensitively and accepts `1*SP` before the token; any
+other shape is still the same bare 401. The original note follows.
+
 `crates/navetted`'s auth middleware checks the `Authorization` header with
 `strip_prefix("Bearer ")`, which is case-sensitive. RFC 7235 treats the
 auth-scheme token as case-insensitive, so a client sending `bearer <token>` is
