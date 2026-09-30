@@ -42,6 +42,46 @@ class PairingRegistryTest {
         assertEquals(RegistryDecode.Valid(PairingRegistry()), PairingRegistryCodec.decode("""{"version":3,"hosts":[]}"""))
     }
 
+    @Test
+    fun `a newer schema that added keys is Future, not Corrupt`() {
+        // A downgraded APK reading a registry written by a newer build must refuse
+        // to overwrite it. Corrupt maps to an empty registry that the next write
+        // replaces -- which, with ignoreUnknownKeys = false, is what used to happen
+        // to any newer schema that added a field.
+        val newer = """{"version":4,"hosts":[{"id":"a","host":"tower","port":9417,"token":"$token","fromTheFuture":1}],"alsoNew":true}"""
+        assertEquals(RegistryDecode.Future, PairingRegistryCodec.decode(newer))
+        assertEquals(RegistryDecode.Future, PairingRegistryCodec.decode("""{"version":99,"somethingElse":[1,2]}"""))
+    }
+
+    @Test
+    fun `a quoted version is read the way the strict decoder reads it`() {
+        // The strict decoder coerces "4" to 4; the pre-parse must agree, or a
+        // quoted newer version with new keys would still be wiped as Corrupt.
+        assertEquals(RegistryDecode.Future, PairingRegistryCodec.decode("""{"version":"4","hosts":[],"alsoNew":1}"""))
+        assertEquals(RegistryDecode.Future, PairingRegistryCodec.decode("""{"version":"4","hosts":[]}"""))
+    }
+
+    @Test
+    fun `a duplicated version key is read as its last value by both parsers`() {
+        assertEquals(RegistryDecode.Future, PairingRegistryCodec.decode("""{"version":3,"version":4,"hosts":[]}"""))
+        assertEquals(RegistryDecode.Valid(PairingRegistry()), PairingRegistryCodec.decode("""{"version":4,"version":3,"hosts":[]}"""))
+    }
+
+    @Test
+    fun `an unknown key at a known version is still corrupt`() {
+        assertEquals(RegistryDecode.Corrupt, PairingRegistryCodec.decode("""{"version":3,"hosts":[],"alsoNew":true}"""))
+        assertEquals(RegistryDecode.Corrupt, PairingRegistryCodec.decode("""{"version":2,"hosts":[],"alsoNew":true}"""))
+    }
+
+    @Test
+    fun `a version that is not a whole number is corrupt, not future`() {
+        for (version in listOf("4.5", "null", "true", "99999999999", "[4]")) {
+            assertEquals(version, RegistryDecode.Corrupt, PairingRegistryCodec.decode("""{"version":$version,"hosts":[]}"""))
+        }
+        assertEquals(RegistryDecode.Corrupt, PairingRegistryCodec.decode("""[{"version":4}]"""))
+        assertEquals(RegistryDecode.Corrupt, PairingRegistryCodec.decode("""{"hosts":[]}"""))
+    }
+
     // -- schema v2: wake targets --------------------------------------------
 
     private fun hostJson(id: String, host: String, extra: String = "") =

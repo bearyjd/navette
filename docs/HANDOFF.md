@@ -3567,7 +3567,10 @@ the guest paints (`crates/navetted/src/bridge.rs`, `encode_frame`). Plan:
   false }` runs before the version check, so **a v3 blob read by a pre-v3 build is
   `Corrupt`, not `Future`, and the store maps that to an empty registry that the next
   write overwrites** — an APK downgrade re-pairs every host, exactly as v2→v1 did.
-  The lenient version pre-parse stays a `PairingStore.kt` TODO.
+  **Resolved for future bumps (2026-09-27):** `PairingRegistryCodec.decode` now reads
+  `version` before the strict decode, so a newer schema with new keys is `Future`
+  (writes refused, registry kept) rather than `Corrupt` (wiped). Builds that predate it
+  still wipe on downgrade.
 
 - **The controller's key path is now JVM-testable.** The plan recorded it as
   untestable (the packet loop that sets `gate.primary` runs on `Dispatchers.Default`

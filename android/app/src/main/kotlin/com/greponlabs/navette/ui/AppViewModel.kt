@@ -19,6 +19,7 @@ import com.greponlabs.navette.net.NavetteClient
 import com.greponlabs.navette.net.Pairing
 import com.greponlabs.navette.net.PairingRegistry
 import com.greponlabs.navette.net.PairingStore
+import com.greponlabs.navette.net.RegistryFromNewerAppException
 import com.greponlabs.navette.net.SavedPairing
 import com.greponlabs.navette.net.ViewScale
 import com.greponlabs.navette.net.WakeResult
@@ -294,18 +295,22 @@ class AppViewModel(
      * message says and all it says.
      */
     private fun pair(pairing: Pairing) {
-        val registry =
+        val saved =
             runCatching { pairingStore.upsert(pairing) }
                 .onFailure { Log.w(TAG, "failed to save the pairing: ${it.message}") }
-                .getOrNull()
+        val registry = saved.getOrNull()
         connectWithPairing(pairing)
         _state.update { it.copy(registry = registry ?: it.registry, showingHosts = false, addingHost = false) }
         if (registry == null) {
-            _state.update {
-                it.copy(
-                    snackbarMessage = "Pairing not saved — this device won't remember it next launch.",
-                )
-            }
+            val message =
+                if (saved.exceptionOrNull() is RegistryFromNewerAppException) {
+                    // After an APK downgrade: the saved computers are kept, not
+                    // wiped, and every save fails this way until the app is updated.
+                    "Saved computers came from a newer version of Navette. Update the app to use them — this pairing won't be remembered."
+                } else {
+                    "Pairing not saved — this device won't remember it next launch."
+                }
+            _state.update { it.copy(snackbarMessage = message) }
         }
     }
 

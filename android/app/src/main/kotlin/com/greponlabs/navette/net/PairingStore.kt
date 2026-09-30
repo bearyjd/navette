@@ -83,18 +83,15 @@ class EncryptedPairingStore(context: Context) : PairingStore {
 
     /**
      * The registry a mutation starts from. A snapshot whose `version` is newer
-     * than this app's is refused rather than overwritten -- but only when the
-     * newer schema added no keys: `ignoreUnknownKeys = false` turns a v4 payload
-     * with new fields into Corrupt, not Future, and Corrupt is what
-     * [loadRegistry] maps to an empty registry that the next write replaces.
-     * (A v3 blob read by a v2 build already goes this way: `viewScale` is an
-     * unknown key there, so an APK downgrade loses the registry.)
+     * than this app's is refused rather than overwritten, including a newer
+     * schema that added keys: the codec reads `version` before its strict
+     * decode. Builds before that pre-parse still read a newer blob with new
+     * keys as Corrupt -- a v3 blob read by a v2 build loses the registry --
+     * so the protection starts with the first build that has it.
      */
-    // TODO: lenient version pre-parse before the strict decode, so a newer
-    // payload with unknown keys is recognised as Future rather than Corrupt.
     private fun mutableSnapshot(): PairingRegistry {
         val decoded = registryFromPreferences()
-        if (decoded is RegistryDecode.Future) throw IllegalStateException("pairing registry was created by a newer app")
+        if (decoded is RegistryDecode.Future) throw RegistryFromNewerAppException()
         return (decoded as? RegistryDecode.Valid)?.registry ?: PairingRegistry()
     }
 

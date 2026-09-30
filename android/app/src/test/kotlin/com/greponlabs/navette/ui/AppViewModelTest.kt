@@ -2,6 +2,7 @@ package com.greponlabs.navette.ui
 
 import com.greponlabs.navette.net.ConnectionState
 import com.greponlabs.navette.net.Pairing
+import com.greponlabs.navette.net.RegistryFromNewerAppException
 import com.greponlabs.navette.protocol.ApiError
 import com.greponlabs.navette.protocol.AttachInfo
 import com.greponlabs.navette.protocol.ErrorCode
@@ -117,6 +118,28 @@ class AppViewModelTest {
             // reconnecting here reaches the right host.
             assertTrue("must not promise re-pairing is required, got: $message", !message.contains("will have to"))
             assertTrue("must scope the warning to the next launch, got: $message", message.contains("next launch"))
+        }
+
+    @Test
+    fun `a registry written by a newer app says so rather than blaming the keystore`() =
+        runTest {
+            // After an APK downgrade the stored registry is refused, not wiped:
+            // every save fails the same way until the app is updated. The generic
+            // "not saved" notice would read like a keystore fault and hide the fix.
+            val store =
+                FakePairingStore().apply {
+                    failOnSave = true
+                    saveFailure = RegistryFromNewerAppException()
+                }
+            val vm = AppViewModel(pairingStore = store, clientFactory = { fake })
+
+            vm.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.advanceUntilIdle()
+
+            assertEquals(testPairing, vm.state.value.pairing)
+            val message = vm.state.value.snackbarMessage.orEmpty()
+            assertTrue("must name the cause, got: $message", message.contains("newer version"))
+            assertTrue("must say how to recover, got: $message", message.contains("Update"))
         }
 
     @Test

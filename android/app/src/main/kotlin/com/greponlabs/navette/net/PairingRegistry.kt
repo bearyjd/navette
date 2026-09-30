@@ -2,6 +2,9 @@ package com.greponlabs.navette.net
 
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.intOrNull
 import java.util.UUID
 
 /**
@@ -82,7 +85,14 @@ internal object PairingRegistryCodec {
      * "no preference" ([ViewScale.fromFactor]).
      */
     fun decode(raw: String): RegistryDecode {
+        // Before the strict decode: a newer schema that added keys would fail it
+        // (ignoreUnknownKeys = false) and read as Corrupt, which the store maps to
+        // an empty registry the next write replaces -- losing every pairing on an
+        // APK downgrade. Reading only `version` first keeps that newer payload Future.
+        if ((wireVersion(raw) ?: 0) > VERSION) return RegistryDecode.Future
         val wire = runCatching { json.decodeFromString(RegistryWire.serializer(), raw) }.getOrNull() ?: return RegistryDecode.Corrupt
+        // Not redundant with the pre-parse above: this is the check the strict
+        // decode's own reading of `version` answers to.
         if (wire.version > VERSION) return RegistryDecode.Future
         val ids = wire.hosts.map { it.id }.toSet()
         if (wire.version !in 1..VERSION || ids.size != wire.hosts.size || wire.hosts.any { it.id.isBlank() }) return RegistryDecode.Corrupt
@@ -98,6 +108,17 @@ internal object PairingRegistryCodec {
         if (wire.activeId != null && wire.activeId !in ids) return RegistryDecode.Corrupt
         return RegistryDecode.Valid(PairingRegistry(hosts, wire.activeId))
     }
+
+    /**
+     * The payload's `version` if it is a JSON object whose `version` reads as an
+     * integer -- quoted or not, because the strict decoder coerces `"4"` to 4
+     * and the two must agree. Parsed with the codec's own [json] so a change to
+     * its settings cannot make them drift.
+     */
+    private fun wireVersion(raw: String): Int? =
+        runCatching {
+            ((json.parseToJsonElement(raw) as? JsonObject)?.get("version") as? JsonPrimitive)?.intOrNull
+        }.getOrNull()
 
     /**
      * Re-pairing an endpoint rotates its token; the wake target and the view
@@ -148,3 +169,10 @@ internal object PairingRegistryCodec {
         return WakeTarget(canonical, viaId)
     }
 }
+
+/**
+ * The stored registry was written by a newer build of the app, so this one
+ * refuses to overwrite it (see [RegistryDecode.Future]). Its own type so the UI
+ * can say "update the app" rather than blame the keystore.
+ */
+class RegistryFromNewerAppException : IllegalStateException("pairing registry was created by a newer app")
