@@ -8,6 +8,9 @@ Type=simple
 ExecStart=%h/.local/bin/navetted
 Restart=on-failure
 RestartSec=2
+# Sessions' Xwayland sockets in /tmp/.X11-unix and every file navetted
+# writes are for this user only; don't depend on the caller's umask.
+UMask=0077
 
 [Install]
 WantedBy=default.target

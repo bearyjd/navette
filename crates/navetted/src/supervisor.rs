@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
@@ -16,12 +16,15 @@ use nix::unistd::Pid;
 use thiserror::Error;
 
 use crate::registry::{Registry, RegistryError, default_session_name, validate_session_name};
+use crate::xdisplay::XDisplays;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessSpec {
     pub program: String,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    /// Inherited variables the child must not see.
+    pub env_remove: Vec<String>,
 }
 
 pub trait ProcessRunner: Send + Sync + 'static {
@@ -37,6 +40,9 @@ impl ProcessRunner for RealProcessRunner {
     fn spawn(&self, spec: ProcessSpec) -> io::Result<u32> {
         let mut command = Command::new(&spec.program);
         command.args(&spec.args).envs(&spec.env).process_group(0);
+        for key in &spec.env_remove {
+            command.env_remove(key);
+        }
         let mut child = command.spawn()?;
         let pid = child.id();
         thread::spawn(move || {
@@ -71,6 +77,9 @@ impl ProcessRunner for RealProcessRunner {
     }
 }
 
+/// In a session's runtime directory: the X display number it claimed.
+const X_DISPLAY_FILE: &str = "x-display";
+
 #[derive(Debug, Error)]
 pub enum SupervisorError {
     #[error(transparent)]
@@ -101,6 +110,8 @@ pub enum SupervisorError {
     Clock,
     #[error("session registry lock is poisoned")]
     RegistryLock,
+    #[error("no free X11 display number for the session's Xwayland")]
+    NoFreeXDisplay,
 }
 
 #[derive(Debug)]
@@ -111,6 +122,7 @@ pub struct Supervisor<R: ProcessRunner> {
     runtime_root: PathBuf,
     drop_root: PathBuf,
     wprsd_program: String,
+    x_displays: XDisplays,
     readiness_timeout: Duration,
     shutdown_timeout: Duration,
     poll_interval: Duration,
@@ -132,6 +144,7 @@ impl<R: ProcessRunner> Supervisor<R> {
             runtime_root,
             drop_root,
             wprsd_program: wprsd_program.into(),
+            x_displays: XDisplays::default(),
             readiness_timeout: Duration::from_secs(5),
             shutdown_timeout: Duration::from_secs(2),
             poll_interval: Duration::from_millis(25),
@@ -157,6 +170,12 @@ impl<R: ProcessRunner> Supervisor<R> {
     #[cfg(test)]
     pub(crate) fn with_drop_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.drop_root = root.into();
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_x_displays(mut self, x_displays: XDisplays) -> Self {
+        self.x_displays = x_displays;
         self
     }
 
@@ -210,13 +229,34 @@ impl<R: ProcessRunner> Supervisor<R> {
             "XDG_RUNTIME_DIR".to_string(),
             self.xdg_runtime_dir.to_string_lossy().into_owned(),
         );
+        // The session's own Xwayland: a display number no other X server
+        // holds, and a Wayland socket name no other session's shell uses --
+        // xwayland-xdg-shell's defaults (`:100`, `xwayland-xdg-shell-0`) are
+        // the same for every session, so all but the first failed to start.
+        let x_display = self
+            .x_displays
+            .claim(&self.recorded_x_displays()?)
+            .ok_or(SupervisorError::NoFreeXDisplay)?;
+        // Recorded for the session's lifetime, not a timer: `kill` removes it
+        // with the runtime directory and `reconcile` when the session stops,
+        // and it survives a navetted restart so a new session cannot be handed
+        // a number a still-running guest points at.
+        let _ = fs::write(
+            resources.runtime_dir.join(X_DISPLAY_FILE),
+            x_display.to_string(),
+        );
         let daemon_spec = ProcessSpec {
             program: self.wprsd_program.clone(),
             args: vec![
                 format!("--wayland-display={}", resources.wayland_display),
                 format!("--socket={}", resources.socket_path.display()),
+                format!(
+                    "--xwayland-xdg-shell-args=--display,{x_display},--wayland-display,{}-xwayland",
+                    resources.wayland_display
+                ),
             ],
             env: BTreeMap::from([runtime_env.clone()]),
+            env_remove: Vec::new(),
         };
         let daemon_pid = self.spawn(daemon_spec)?;
 
@@ -224,21 +264,40 @@ impl<R: ProcessRunner> Supervisor<R> {
             let _ = self.runner.terminate(daemon_pid, true);
             return Err(SupervisorError::ReadinessTimeout);
         }
+        // wprsd starts xwayland-xdg-shell only after its own sockets exist, so
+        // the display is not ours yet. Tell the guest `DISPLAY=:n` only once a
+        // server running as us holds it: until then the number could be anyone's
+        // (another local user can bind it), and an X11 app that is itself the
+        // guest would race the bind. No Xwayland in time -- none installed, or
+        // it failed -- means no DISPLAY at all, never an inherited one.
+        let x_owned = self.wait_for_x_display(x_display, daemon_pid).await;
+        let mut env_remove = vec!["XAUTHORITY".to_string()];
+        if !x_owned {
+            env_remove.push("DISPLAY".to_string());
+        }
 
         let app_spec = ProcessSpec {
             program: app.exec[0].clone(),
             args: app.exec[1..].to_vec(),
-            env: BTreeMap::from([
-                runtime_env,
-                (
-                    "WAYLAND_DISPLAY".to_string(),
-                    resources.wayland_display.clone(),
-                ),
-                (
-                    "NAVETTE_DROP_DIR".to_string(),
-                    drop_dir.to_string_lossy().into_owned(),
-                ),
-            ]),
+            env: BTreeMap::from_iter(
+                [
+                    Some(runtime_env),
+                    Some((
+                        "WAYLAND_DISPLAY".to_string(),
+                        resources.wayland_display.clone(),
+                    )),
+                    // Never inherited: navetted's own DISPLAY is the host's
+                    // screen, where an X11 guest would open unseen by the phone.
+                    x_owned.then(|| ("DISPLAY".to_string(), format!(":{x_display}"))),
+                    Some((
+                        "NAVETTE_DROP_DIR".to_string(),
+                        drop_dir.to_string_lossy().into_owned(),
+                    )),
+                ]
+                .into_iter()
+                .flatten(),
+            ),
+            env_remove,
         };
         let app_pid = match self.spawn(app_spec) {
             Ok(pid) => pid,
@@ -295,6 +354,9 @@ impl<R: ProcessRunner> Supervisor<R> {
         let _ = fs::remove_dir_all(self.drop_root().join(name));
         let _ = fs::remove_dir_all(self.drop_staging_root().join(name));
         let _ = fs::remove_file(self.xdg_runtime_dir.join(&session.wayland_display));
+        let xwayland = format!("{}-xwayland", session.wayland_display);
+        let _ = fs::remove_file(self.xdg_runtime_dir.join(&xwayland));
+        let _ = fs::remove_file(self.xdg_runtime_dir.join(format!("{xwayland}.lock")));
         Ok(removed)
     }
 
@@ -321,6 +383,7 @@ impl<R: ProcessRunner> Supervisor<R> {
             .collect();
         drop(registry);
         for name in stopped {
+            let _ = fs::remove_file(self.runtime_root.join(&name).join(X_DISPLAY_FILE));
             let _ = fs::remove_dir_all(self.blob_root().join(&name));
             let _ = fs::remove_dir_all(self.drop_root().join(&name));
             let _ = fs::remove_dir_all(self.drop_staging_root().join(name));
@@ -346,6 +409,39 @@ impl<R: ProcessRunner> Supervisor<R> {
             }
             tokio::time::sleep(self.poll_interval).await;
         }
+    }
+
+    async fn wait_for_x_display(&self, display: u32, daemon_pid: u32) -> bool {
+        let deadline = tokio::time::Instant::now() + self.readiness_timeout;
+        loop {
+            if self.x_displays.owned(display) {
+                return true;
+            }
+            if !self.runner.is_alive(daemon_pid) || tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(self.poll_interval).await;
+        }
+    }
+
+    /// The X display each running session recorded when it started.
+    fn recorded_x_displays(&self) -> Result<BTreeSet<u32>, SupervisorError> {
+        let registry = self
+            .registry
+            .lock()
+            .map_err(|_| SupervisorError::RegistryLock)?;
+        Ok(registry
+            .list()
+            .into_iter()
+            .filter(|session| session.status == SessionStatus::Running)
+            .filter_map(|session| {
+                fs::read_to_string(self.runtime_root.join(&session.name).join(X_DISPLAY_FILE))
+                    .ok()?
+                    .trim()
+                    .parse()
+                    .ok()
+            })
+            .collect())
     }
 
     async fn stop_process(&self, pid: u32) -> Result<(), SupervisorError> {
@@ -474,6 +570,9 @@ mod tests {
         state: Mutex<FakeState>,
         runtime_dir: PathBuf,
         create_sockets: bool,
+        /// Whether the spawned "wprsd" also brings up its Xwayland: a real
+        /// listening socket and a lock file in the harness's X directories.
+        start_xwayland: bool,
     }
 
     impl FakeRunner {
@@ -489,6 +588,14 @@ mod tests {
                 }),
                 runtime_dir,
                 create_sockets: true,
+                start_xwayland: true,
+            }
+        }
+
+        fn without_xwayland(runtime_dir: PathBuf) -> Self {
+            Self {
+                start_xwayland: false,
+                ..Self::new(runtime_dir)
             }
         }
 
@@ -527,6 +634,24 @@ mod tests {
                     }
                     if let Some(socket) = arg.strip_prefix("--socket=") {
                         fs::write(socket, b"").unwrap();
+                    }
+                    let x_display = arg
+                        .strip_prefix("--xwayland-xdg-shell-args=--display,")
+                        .and_then(|rest| rest.split(',').next());
+                    if let (true, Some(n)) = (self.start_xwayland, x_display) {
+                        // The harness's X directories sit beside `runtime`.
+                        let root = self.runtime_dir.parent().unwrap();
+                        drop(
+                            std::os::unix::net::UnixListener::bind(
+                                root.join(format!(".X11-unix/X{n}")),
+                            )
+                            .unwrap(),
+                        );
+                        fs::write(
+                            root.join(format!(".X{n}-lock")),
+                            format!("{:>10}\n", std::process::id()),
+                        )
+                        .unwrap();
                     }
                 }
             }
@@ -570,6 +695,11 @@ mod tests {
             Duration::from_millis(1),
         )
         .with_drop_root(temp.path().join("drops"))
+        .with_x_displays({
+            let sockets = temp.path().join(".X11-unix");
+            fs::create_dir_all(&sockets).unwrap();
+            XDisplays::with_dirs(sockets, temp.path())
+        })
     }
 
     #[tokio::test]
@@ -589,10 +719,19 @@ mod tests {
 
         let state = runner.state.lock().unwrap();
         assert_eq!(state.spawned[0].program, "wprsd-test");
+        assert!(
+            state.spawned[0].args.contains(
+                &"--xwayland-xdg-shell-args=--display,100,--wayland-display,navette-work-xwayland"
+                    .to_string()
+            ),
+            "{:?}",
+            state.spawned[0].args
+        );
         assert_eq!(state.spawned[1].program, "firefox");
         assert_eq!(
             state.spawned[1].env,
             BTreeMap::from([
+                ("DISPLAY".into(), ":100".into()),
                 (
                     "NAVETTE_DROP_DIR".into(),
                     temp.path()
@@ -604,6 +743,136 @@ mod tests {
                 ("XDG_RUNTIME_DIR".into(), runtime_env.clone()),
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn each_session_gets_its_own_x_display_and_never_the_hosts() {
+        let temp = TempDir::new().unwrap();
+        let runtime = temp.path().join("runtime");
+        fs::create_dir_all(&runtime).unwrap();
+        let runner = Arc::new(FakeRunner::new(runtime));
+        let supervisor = harness(runner.clone(), &temp);
+        // Display 100 is already some other X server's.
+        fs::write(temp.path().join(".X11-unix/X100"), b"").unwrap();
+
+        supervisor.start(&app(), Some("one")).await.unwrap();
+        supervisor.start(&app(), Some("two")).await.unwrap();
+
+        let state = runner.state.lock().unwrap();
+        let x_arg = |i: usize| {
+            state.spawned[i]
+                .args
+                .iter()
+                .find(|arg| arg.starts_with("--xwayland-xdg-shell-args="))
+                .cloned()
+        };
+        assert_eq!(
+            x_arg(0).as_deref(),
+            Some("--xwayland-xdg-shell-args=--display,101,--wayland-display,navette-one-xwayland")
+        );
+        assert_eq!(
+            x_arg(2).as_deref(),
+            Some("--xwayland-xdg-shell-args=--display,102,--wayland-display,navette-two-xwayland")
+        );
+        // The guest is always told its display explicitly: an inherited
+        // DISPLAY would be the host's own screen.
+        assert_eq!(
+            state.spawned[1].env.get("DISPLAY").map(String::as_str),
+            Some(":101")
+        );
+        assert_eq!(
+            state.spawned[3].env.get("DISPLAY").map(String::as_str),
+            Some(":102")
+        );
+    }
+
+    #[tokio::test]
+    async fn without_its_xwayland_the_guest_gets_no_display_at_all() {
+        // Xwayland missing or failed: the number is not ours, so naming it
+        // would point the guest at whoever binds it next -- and the host's
+        // DISPLAY must not leak through either.
+        let temp = TempDir::new().unwrap();
+        let runtime = temp.path().join("runtime");
+        fs::create_dir_all(&runtime).unwrap();
+        let runner = Arc::new(FakeRunner::without_xwayland(runtime));
+        let supervisor = harness(runner.clone(), &temp);
+
+        supervisor.start(&app(), Some("work")).await.unwrap();
+
+        let state = runner.state.lock().unwrap();
+        let guest = &state.spawned[1];
+        assert_eq!(guest.env.get("DISPLAY"), None);
+        assert!(
+            guest.env_remove.contains(&"DISPLAY".to_string()),
+            "{:?}",
+            guest.env_remove
+        );
+        assert!(
+            guest.env_remove.contains(&"XAUTHORITY".to_string()),
+            "{:?}",
+            guest.env_remove
+        );
+    }
+
+    #[tokio::test]
+    async fn a_running_session_keeps_its_x_display_across_a_restart() {
+        // A fresh supervisor (navetted restarted) has no in-memory claims;
+        // the session's record is what stops its number being handed out
+        // again while its guest still points at it -- even with no server up.
+        let temp = TempDir::new().unwrap();
+        let runtime = temp.path().join("runtime");
+        fs::create_dir_all(&runtime).unwrap();
+        let first = Arc::new(FakeRunner::without_xwayland(runtime.clone()));
+        harness(first.clone(), &temp)
+            .start(&app(), Some("one"))
+            .await
+            .unwrap();
+
+        let second = Arc::new(FakeRunner::new(runtime));
+        second.state.lock().unwrap().alive.extend([100, 101]);
+        let restarted = harness(second.clone(), &temp);
+        restarted.start(&app(), Some("two")).await.unwrap();
+
+        let state = second.state.lock().unwrap();
+        assert!(
+            state.spawned[0]
+                .args
+                .iter()
+                .any(|arg| arg.contains("--display,101,")),
+            "{:?}",
+            state.spawned[0].args
+        );
+    }
+
+    #[tokio::test]
+    async fn killing_a_session_releases_its_x_display() {
+        let temp = TempDir::new().unwrap();
+        let runtime = temp.path().join("runtime");
+        fs::create_dir_all(&runtime).unwrap();
+        let runner = Arc::new(FakeRunner::without_xwayland(runtime));
+        let supervisor = harness(runner.clone(), &temp).with_x_displays({
+            let sockets = temp.path().join(".X11-unix");
+            XDisplays::with_dirs(sockets, temp.path()).with_claim_ttl_for_test(Duration::ZERO)
+        });
+        supervisor.start(&app(), Some("one")).await.unwrap();
+        supervisor.kill("one").await.unwrap();
+        supervisor.start(&app(), Some("two")).await.unwrap();
+
+        let state = runner.state.lock().unwrap();
+        let displays: Vec<_> = state
+            .spawned
+            .iter()
+            .filter(|spec| spec.program == "wprsd-test")
+            .map(|spec| spec.args[2].clone())
+            .collect();
+        assert!(displays[1].contains("--display,100,"), "{displays:?}");
+    }
+
+    #[test]
+    fn a_session_name_can_never_carry_a_comma_into_the_xwayland_arguments() {
+        // wprsd splits --xwayland-xdg-shell-args on commas with no escaping.
+        assert!(validate_session_name("a,b").is_err());
+        assert!(validate_session_name("a,--display,1").is_err());
     }
 
     #[tokio::test]

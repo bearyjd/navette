@@ -12,3 +12,4 @@ pub mod media;
 pub mod registry;
 pub mod supervisor;
 pub mod thumbnails;
+pub mod xdisplay;
