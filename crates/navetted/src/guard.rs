@@ -43,7 +43,7 @@ pub async fn authenticate(
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
+        .and_then(bearer_credentials);
 
     // A bare 401 with no detail: saying *why* it failed tells an attacker
     // whether a token was recognised at all.
@@ -51,6 +51,25 @@ pub async fn authenticate(
         Some(presented) if token.matches(presented) => next.run(request).await,
         _ => (StatusCode::UNAUTHORIZED, "").into_response(),
     }
+}
+
+/// The credentials of an `Authorization: Bearer <token>` header value.
+///
+/// RFC 7235 makes the auth-scheme a case-insensitive token, so `bearer` and
+/// `BEARER` are the same scheme. Another scheme, no separator, or no token is
+/// `None`, which the caller turns into the same bare 401 as a wrong token.
+///
+/// This only picks the credentials out; it is not the gate. `AuthToken::parse`
+/// already ignores spaces and hyphens anywhere and is case-insensitive, so the
+/// leading-space trim below (RFC 7235's `1*SP`) accepts nothing new -- the
+/// token's decoded bytes, compared in constant time, decide.
+fn bearer_credentials(value: &str) -> Option<&str> {
+    let (scheme, rest) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return None;
+    }
+    let token = rest.trim_start_matches(' ');
+    (!token.is_empty()).then_some(token)
 }
 
 #[cfg(test)]
@@ -134,6 +153,69 @@ mod tests {
                 "{path} must require a token"
             );
         }
+    }
+
+    #[test]
+    fn the_bearer_scheme_is_matched_case_insensitively() {
+        // RFC 7235 section 2.1: the auth-scheme is a case-insensitive token.
+        for header in [
+            "Bearer abc",
+            "bearer abc",
+            "BEARER abc",
+            "bEaReR abc",
+            "Bearer  abc",
+        ] {
+            assert_eq!(super::bearer_credentials(header), Some("abc"), "{header:?}");
+        }
+    }
+
+    #[test]
+    fn anything_but_a_bearer_scheme_with_a_token_is_refused() {
+        for header in [
+            "Basic abc",
+            "Bearerabc",
+            "Bearer",
+            "Bearer ",
+            "Bearer   ",
+            "",
+            " Bearer abc",
+            "Bearer\tabc",
+        ] {
+            assert_eq!(super::bearer_credentials(header), None, "{header:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn accepts_the_configured_token_under_a_lowercase_scheme() {
+        let (router, token) = crate::api::tests_support::test_router_with_token();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .header("Authorization", format!("bearer {}", token.render()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_lowercase_scheme_does_not_relax_the_token_check() {
+        let router = test_router();
+        let wrong = navette_auth::AuthToken::generate().render();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .header("Authorization", format!("bearer {wrong}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

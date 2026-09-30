@@ -462,6 +462,51 @@ Any output means the binary predates the source. Restart the daemon.
 **Android: sideloaded APK behaves like an old build.**
 Set `debuggableVariants = []` and clear `/tmp/metro-cache`.
 
+**Android: text too small to read on the phone.**
+Use the **Scale** menu on the session screen (1×/1.5×/2×/3×). The phone
+reports `surface / factor` as its viewport, the guest lays out for that
+smaller screen, and `MediaCodec` upscales the frame. Phones default to 2×,
+tablets (sw ≥ 600 dp) to 1×; a pick is remembered per host. Each change is
+one encoder restart on the daemon (`DISC` +1 on the HUD).
+
+**Android: no Esc / Tab / Ctrl / arrows on the soft keyboard.**
+The **Keys** bar appears with the keyboard; **Keys** toggles it either way,
+so it can also be shown without the keyboard (arrow keys in a pager) or
+hidden while typing. Tap **Ctrl**/**Alt** to arm it for the next key,
+long-press to lock it, tap again to release. The hidden IME field is
+password-typed on purpose, which is what turns off Gboard's suggestions,
+autocorrect and glide typing — and autofill is switched off for the session
+screen so no password manager can offer to fill it.
+
+A modifier applies to the *next* key, including Backspace: with Ctrl armed, a
+Backspace on an empty field goes through the same chord path and sends
+Ctrl+Backspace, which deletes a word in most shells. Intended, but it
+surprises people. A multi-character commit (a paste) chords only its first
+character.
+
+**Android: characters repeat in the guest** (`echo` arrives as `eeeecho`).
+The client sends one press and one release per character (confirmed with
+per-keycode logging); the guest repeats a key whose release arrives late.
+`wprsd` creates its seat at 200 ms / 200 keys/s, so builds before the fixes
+below repeated after any 200 ms stall, at one character per 5 ms. The bridge
+now sets 600 ms / 25 keys/s on every connection (`transport.rs`,
+`connect_preamble`) and the phone sends with `TCP_NODELAY`, so a repeat now
+needs a stall of over 600 ms and costs ~25 characters a second. If it still
+happens, look for that stall -- host load first.
+
+**Android: the guest behaves as if Ctrl (or Alt) is stuck down.**
+Tap that chip on the **Keys** bar: turning a modifier off always sends its
+release, which is the recovery when one went out but never arrived. Leaving
+the session releases Ctrl, Alt and Shift too. If it persists, the guest is
+holding a key this client never pressed — check a hardware keyboard.
+
+**Android: the keyboard covers the stream.**
+Expected only on builds before this shipped. The activity needs
+`windowSoftInputMode="adjustResize"` (in the manifest) for the IME inset to
+be reported below API 30; on Android 15+ the window never resizes for the
+keyboard and `imePadding()` in `SessionScreen` is what shrinks the stream.
+Raising and hiding the keyboard is one encoder restart each (`DISC` +1).
+
 ## Rollback
 
 No deploy system, so rollback is git plus a rebuild:

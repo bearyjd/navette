@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.net.Uri
+import android.view.KeyEvent
 import android.view.SurfaceView
 import android.view.View
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -12,10 +13,17 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -30,14 +38,28 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.ComposeUiFlags
+import androidx.compose.ui.ExperimentalComposeUiApi
+import androidx.compose.ui.autofill.ContentDataType
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.semantics.contentDataType
+import androidx.compose.ui.semantics.hideFromAccessibility
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
@@ -47,6 +69,7 @@ import androidx.lifecycle.repeatOnLifecycle
 import androidx.core.content.FileProvider
 import com.greponlabs.navette.net.MAX_BLOB_BYTES
 import com.greponlabs.navette.net.Pairing
+import com.greponlabs.navette.net.ViewScale
 import com.greponlabs.navette.net.mediaWebSocketUrl
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.Dispatchers
@@ -65,9 +88,11 @@ import java.io.File
  * server-validated to `320..3840` x `240..2160`
  * (`crates/navette-protocol/src/media.rs:307-311`) -- bounds shaped for a
  * desktop viewport, which a typical phone portrait size fails outright. The
- * surface reports its own pixel size as the viewport and the bridge
- * re-encodes at that size, exactly as the desktop viewer does, so there is no
- * letterbox and no aspect-fit mapping to do.
+ * surface reports its own pixel size, divided by the logical [ViewScale], as
+ * the viewport and the bridge re-encodes at that size; MediaCodec's default
+ * scale-to-fit stretches the frame back over the surface, so there is no
+ * letterbox and no aspect-fit mapping to do (see `InputMapper.scaledViewport`
+ * for the one place the aspect has to be defended).
  *
  * State comes in and events go out, per this project's Compose convention --
  * but unlike `DrawerScreen` this screen necessarily owns live connection and
@@ -89,10 +114,19 @@ internal fun claimClipboardImageBeforeMime(
     return mime.takeIf { it in setOf("image/png", "image/jpeg", "image/webp") }?.let { token to it }
 }
 
+/**
+ * [viewScale] is the logical scale to attach at -- the host's saved preset or
+ * the device default, resolved by the caller. The controller is built with it
+ * and later values reach it through `setViewScale`; [onViewScaleChange] is
+ * how the Scale menu asks the caller to persist a pick.
+ */
+@OptIn(ExperimentalComposeUiApi::class)
 @Composable
 fun SessionScreen(
     sessionName: String,
     pairing: Pairing,
+    viewScale: ViewScale,
+    onViewScaleChange: (ViewScale) -> Unit,
     onLeave: () -> Unit,
 ) {
     // A reconnect is a clean rebuild: bumping the nonce recreates the
@@ -143,9 +177,14 @@ fun SessionScreen(
                 transformHolder,
                 clipboardBridge,
                 pendingBlobAnnouncement = pendingBlobAnnouncement,
+                initialViewScale = viewScale,
             )
         }
     val state by controller.state.collectAsState()
+    // The first value is already in the controller; this is for a pick made
+    // while attached. Same preset is a no-op inside, so the effect re-running
+    // for a rebuilt controller costs nothing.
+    LaunchedEffect(controller, viewScale) { controller.setViewScale(viewScale) }
     val focusRequester = remember { FocusRequester() }
     // Not owned by ImeLayer: the reconnect-safe effect below needs to
     // re-assert this focus target itself, not merely decline to steal it --
@@ -165,10 +204,36 @@ fun SessionScreen(
     // reconnect must not silently drop the user out of the on-screen
     // keyboard they had raised.
     var imeRaised by remember(pairing.host, sessionName) { mutableStateOf(false) }
+    // Session-keyed like imeRaised. The sticky Ctrl/Alt state on the bar lives
+    // in the controller's keyboard and does reset on a rebuild -- see
+    // StickyModifiers.
+    var keyBar by remember(pairing.host, sessionName) { mutableStateOf(KeyBarState()) }
     // Keyed like imeRaised, not the nonce: a reconnect rebuild must not
     // silently turn the HUD off while someone is watching it.
     var hudVisible by remember(pairing.host, sessionName) { mutableStateOf(false) }
+    val modifiers by controller.keyboard.modifiers.collectAsState()
     LockLandscapeWhileAttached()
+
+    // The hidden IME field is a password-typed editable (see ImeLayer for why
+    // that type is load-bearing), and every "Keyboard" tap focuses it -- which
+    // is exactly what prompts the platform's Autofill Framework to offer a
+    // saved credential. Filling it would diff the credential into the guest as
+    // key events, sending a password to the remote machine on one tap. Compose
+    // has no way to clear the content-type hint the password type implies
+    // (`ContentType` has no `None` in 1.10.6), so autofill is switched off at
+    // the view level for the whole session screen and restored on the way out,
+    // leaving the Connect screen's own fields alone.
+    val hostView = LocalView.current
+    DisposableEffect(hostView) {
+        val previousImportance = hostView.importantForAutofill
+        val previousSemanticAutofill = ComposeUiFlags.isSemanticAutofillEnabled
+        hostView.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
+        ComposeUiFlags.isSemanticAutofillEnabled = false
+        onDispose {
+            hostView.importantForAutofill = previousImportance
+            ComposeUiFlags.isSemanticAutofillEnabled = previousSemanticAutofill
+        }
+    }
 
     // Clipboard listener and lifecycle observer registered and torn down here,
     // in the same effect that opens and closes the controller -- so a leaked
@@ -324,95 +389,138 @@ fun SessionScreen(
         reconnectNonce += 1
     }
 
-    Box(
+    Column(
         modifier =
             Modifier
                 .fillMaxSize()
                 .background(Color.Black)
-                .focusRequester(focusRequester)
-                .focusable()
-                .onKeyEvent { event -> controller.onKeyEvent(event.nativeKeyEvent) },
+                // Consumes WindowInsets.ime: the stream box below shrinks, its
+                // onSizeChanged fires, and the existing resize path re-lays
+                // the guest out above the keyboard. One encoder reconfigure
+                // per show/hide (crates/navetted/src/bridge.rs:790-818),
+                // gated by the controller's RESIZE_DEBOUNCE_MS so the inset
+                // animation's intermediate sizes are never sent. Background
+                // before padding so the black ground extends behind the key
+                // bar. On Android 15+ (edge-to-edge enforced under targetSdk
+                // 36) this is the only thing that moves the stream; below it
+                // the manifest's adjustResize makes the inset reported at all.
+                .imePadding(),
     ) {
-        // Rebuilt whenever the reconnect nonce changes: a fresh SurfaceView
-        // re-runs the factory below against the freshly-remembered controller,
-        // which is what wires that controller's surface callback -- an
-        // already-created holder never re-fires surfaceCreated for a callback
-        // added later, so a controller swap without a new view would render
-        // nothing.
-        key(reconnectNonce) {
-            AndroidView(
-            // Touch is wired via View.setOnTouchListener on the raw
-            // SurfaceView, not a Compose pointerInput modifier. This was
-            // tried first because AndroidView always installs an internal
-            // pointerInteropFilter that dispatches to the wrapped View
-            // during Compose's Initial pointer-event pass, before ANY
-            // pointerInput's Main-pass awaitFirstDown() runs -- a real,
-            // documented mechanism by which a pointerInput on or around an
-            // AndroidView can go silent. On this device, though, that
-            // wasn't actually the fault: touch was reaching sendMotion/
-            // sendButton correctly the whole time, under both this and the
-            // original pointerInput-based approach: the real bug was
-            // MediaInput's client_id/surface_id serializing as negative
-            // Longs (see MediaProtocol.kt's header comment), which the
-            // bridge silently rejected regardless of how input reached this
-            // client. Kept anyway, now that it's verified working end to
-            // end on a real device: it sidesteps the pointerInteropFilter
-            // question entirely rather than merely ruling it out this once,
-            // and needs no coroutine gesture-scope ceremony for
-            // single-pointer tracking.
-            factory = { context ->
-                SurfaceView(context).apply {
-                    holder.addCallback(controller.surfaceCallback)
-                    setOnTouchListener { _, event -> controller.onTouchEvent(event) }
-                    // Zoom and pan are a scale+translate on this view, applied
-                    // by the controller synchronously from the touch path --
-                    // not through Compose state and this AndroidView's
-                    // `update` lambda. The framework inverse-maps every touch
-                    // through the view's matrix before it reaches the listener
-                    // (verified on device: a tap at screen x=2400 under a 2x
-                    // scale arrived as x=1200), and the controller lifts it
-                    // back into screen space using the transform it believes
-                    // is applied. Those two must be the same matrix, and a
-                    // transform that lands a frame later via recomposition
-                    // would make every pinch step read the fingers through a
-                    // stale one. Only the view's transform changes when
-                    // zooming; its layout size never does, so no resize is
-                    // reported and the guest window keeps its dimensions.
-                    controller.bindView(this)
-                }
-            },
+        Box(
             modifier =
                 Modifier
-                    .fillMaxSize()
-                    .onSizeChanged { size -> controller.onSurfaceResized(size.width, size.height) },
+                    .weight(1f)
+                    .fillMaxWidth()
+                    // The hardware-keyboard focus target the reconnect effect
+                    // above re-asserts; kept on the stream box, not the column.
+                    .focusRequester(focusRequester)
+                    .focusable()
+                    .onKeyEvent { event -> controller.keyboard.onKeyEvent(event.nativeKeyEvent) },
+        ) {
+            // Rebuilt whenever the reconnect nonce changes: a fresh SurfaceView
+            // re-runs the factory below against the freshly-remembered controller,
+            // which is what wires that controller's surface callback -- an
+            // already-created holder never re-fires surfaceCreated for a callback
+            // added later, so a controller swap without a new view would render
+            // nothing.
+            key(reconnectNonce) {
+                AndroidView(
+                // Touch is wired via View.setOnTouchListener on the raw
+                // SurfaceView, not a Compose pointerInput modifier. This was
+                // tried first because AndroidView always installs an internal
+                // pointerInteropFilter that dispatches to the wrapped View
+                // during Compose's Initial pointer-event pass, before ANY
+                // pointerInput's Main-pass awaitFirstDown() runs -- a real,
+                // documented mechanism by which a pointerInput on or around an
+                // AndroidView can go silent. On this device, though, that
+                // wasn't actually the fault: touch was reaching sendMotion/
+                // sendButton correctly the whole time, under both this and the
+                // original pointerInput-based approach: the real bug was
+                // MediaInput's client_id/surface_id serializing as negative
+                // Longs (see MediaProtocol.kt's header comment), which the
+                // bridge silently rejected regardless of how input reached this
+                // client. Kept anyway, now that it's verified working end to
+                // end on a real device: it sidesteps the pointerInteropFilter
+                // question entirely rather than merely ruling it out this once,
+                // and needs no coroutine gesture-scope ceremony for
+                // single-pointer tracking.
+                factory = { context ->
+                    SurfaceView(context).apply {
+                        holder.addCallback(controller.surfaceCallback)
+                        setOnTouchListener { _, event -> controller.onTouchEvent(event) }
+                        // Zoom and pan are a scale+translate on this view, applied
+                        // by the controller synchronously from the touch path --
+                        // not through Compose state and this AndroidView's
+                        // `update` lambda. The framework inverse-maps every touch
+                        // through the view's matrix before it reaches the listener
+                        // (verified on device: a tap at screen x=2400 under a 2x
+                        // scale arrived as x=1200), and the controller lifts it
+                        // back into screen space using the transform it believes
+                        // is applied. Those two must be the same matrix, and a
+                        // transform that lands a frame later via recomposition
+                        // would make every pinch step read the fingers through a
+                        // stale one. Only the view's transform changes when
+                        // zooming; its layout size never does, so no resize is
+                        // reported and the guest window keeps its dimensions.
+                        controller.bindView(this)
+                    }
+                },
+                modifier =
+                    Modifier
+                        .fillMaxSize()
+                        .onSizeChanged { size -> controller.onSurfaceResized(size.width, size.height) },
+                )
+            }
+
+            ImeLayer(
+                keyboard = controller.keyboard,
+                surfaceFocus = focusRequester,
+                fieldFocus = fieldFocus,
+                imeRaised = imeRaised,
+                onImeRaisedChange = { imeRaised = it },
+                keyBarShown = keyBar.visible(imeRaised),
+                onToggleKeyBar = { keyBar = keyBar.toggled(imeRaised) },
+                viewScale = state.viewScale,
+                // Applied to the controller here, not only through the
+                // parameter: a save that fails (or a pairing that was never
+                // stored) leaves `viewScale` where it was, and the pick must
+                // still take effect for this session. The menu's label reads
+                // the controller's state, so it shows the effective preset.
+                onViewScaleChange = { scale ->
+                    controller.setViewScale(scale)
+                    onViewScaleChange(scale)
+                },
+            )
+
+            FileTransferLayer(
+                state = fileTransferState,
+                onPick = { filePicker.launch(arrayOf("*/*")) },
+                onCancel = fileTransferCoordinator::cancel,
+                onRetry = fileTransferCoordinator::retry,
+            )
+
+            SessionHudOverlay(sample = state.hud, visible = hudVisible)
+
+            // Inside the stream box so "Waiting for the first frame..." is
+            // centred on the video, not on the column that includes the key bar.
+            SessionOverlay(
+                state = state,
+                reconnecting = reconnecting,
+                reconnectAttempt = reconnectAttempt,
+                maxAttempts = MAX_RECONNECT_ATTEMPTS,
+                onReconnect = onReconnect,
+                onLeave = onLeave,
             )
         }
 
-        ImeLayer(
-            controller = controller,
-            surfaceFocus = focusRequester,
-            fieldFocus = fieldFocus,
-            imeRaised = imeRaised,
-            onImeRaisedChange = { imeRaised = it },
-        )
-
-        FileTransferLayer(
-            state = fileTransferState,
-            onPick = { filePicker.launch(arrayOf("*/*")) },
-            onCancel = fileTransferCoordinator::cancel,
-            onRetry = fileTransferCoordinator::retry,
-        )
-
-        SessionHudOverlay(sample = state.hud, visible = hudVisible)
-
-        SessionOverlay(
-            state = state,
-            reconnecting = reconnecting,
-            reconnectAttempt = reconnectAttempt,
-            maxAttempts = MAX_RECONNECT_ATTEMPTS,
-            onReconnect = onReconnect,
-            onLeave = onLeave,
-        )
+        if (keyBar.visible(imeRaised)) {
+            SessionKeyBar(
+                modifiers = modifiers,
+                onKey = controller.keyboard::onKeyBarKey,
+                onModifierTapped = controller.keyboard::onModifierTapped,
+                onModifierLocked = controller.keyboard::onModifierLocked,
+            )
+        }
     }
 }
 
@@ -459,68 +567,6 @@ private fun BoxScope.FileTransferLayer(
     }
 }
 
-/**
- * The on-screen-keyboard path: an off-screen text field that reports what the
- * IME commits, plus the toggle that raises it.
- *
- * The field is sized 1.dp at zero alpha rather than truly zero-size, since a
- * zero-size composable can be skipped by the IME system on some versions.
- *
- * **The field is never cleared.** Clearing it would fire `onValueChange("")`,
- * which diffs as a deletion of everything typed so far and would send that
- * many backspaces to the guest -- destroying the very text the user just
- * committed. `typed` advances in lockstep with the field instead, so every
- * change is diffed against exactly what preceded it.
- *
- * The toggle exists because focus is the screen's scarce resource: while the
- * field holds it the soft keyboard is up and consuming keys, and while the
- * video surface holds it a hardware keyboard works. Handing focus back to
- * [surfaceFocus] on dismissal is what restores the hardware path.
- *
- * [imeRaised] and [fieldFocus] are hoisted to the caller rather than owned
- * here: a reconnect's own focus-restoring effect needs both -- whether the
- * IME is up, and the exact [FocusRequester] to point back at -- to actively
- * re-assert the field's focus after every rebuild, not merely decline to
- * steal it (see that effect's comment for why the weaker form measured wrong
- * on a real device).
- */
-@Composable
-private fun BoxScope.ImeLayer(
-    controller: SessionController,
-    surfaceFocus: FocusRequester,
-    fieldFocus: FocusRequester,
-    imeRaised: Boolean,
-    onImeRaisedChange: (Boolean) -> Unit,
-) {
-    var typed by remember { mutableStateOf("") }
-    val keyboard = LocalSoftwareKeyboardController.current
-
-    BasicTextField(
-        value = typed,
-        onValueChange = { next ->
-            controller.onImeText(previous = typed, current = next)
-            typed = next
-        },
-        modifier = Modifier.size(1.dp).alpha(0f).focusRequester(fieldFocus),
-    )
-
-    TextButton(
-        onClick = {
-            val raised = !imeRaised
-            onImeRaisedChange(raised)
-            if (raised) {
-                fieldFocus.requestFocus()
-                keyboard?.show()
-            } else {
-                keyboard?.hide()
-                surfaceFocus.requestFocus()
-            }
-        },
-        modifier = Modifier.align(Alignment.TopEnd).padding(8.dp),
-    ) {
-        Text(text = if (imeRaised) "Hide keyboard" else "Keyboard", color = Color.White)
-    }
-}
 
 private fun readBoundedClipboardImage(context: Context, uri: Uri): ByteArray? =
     runCatching {

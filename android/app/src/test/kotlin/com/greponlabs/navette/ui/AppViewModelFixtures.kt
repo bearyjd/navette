@@ -6,6 +6,7 @@ import com.greponlabs.navette.net.Pairing
 import com.greponlabs.navette.net.PairingRegistry
 import com.greponlabs.navette.net.PairingStore
 import com.greponlabs.navette.net.SavedPairing
+import com.greponlabs.navette.net.ViewScale
 import com.greponlabs.navette.net.WakeResult
 import com.greponlabs.navette.net.WakeTarget
 import com.greponlabs.navette.net.WakeTransport
@@ -70,6 +71,9 @@ internal class FakePairingStore(initial: Pairing? = null) : PairingStore {
     // memoize a thrown initializer, so the real store re-throws on every
     // touch rather than failing once -- hence a sticky flag, not a one-shot.
     var failOnSave = false
+
+    /** What a failing save throws; a keystore fault unless a test says otherwise. */
+    var saveFailure: Exception = IllegalStateException("keystore unavailable")
     var failOnLoad = false
 
     override fun load(): Pairing? {
@@ -78,7 +82,7 @@ internal class FakePairingStore(initial: Pairing? = null) : PairingStore {
     }
 
     override fun save(pairing: Pairing) {
-        if (failOnSave) throw IllegalStateException("keystore unavailable")
+        if (failOnSave) throw saveFailure
         stored = pairing
     }
 
@@ -88,10 +92,10 @@ internal class FakePairingStore(initial: Pairing? = null) : PairingStore {
     }
 
     override fun upsert(pairing: Pairing): PairingRegistry {
-        if (failOnSave) throw IllegalStateException("keystore unavailable")
+        if (failOnSave) throw saveFailure
         val existing = registry.hosts.firstOrNull { it.pairing.host == pairing.host && it.pairing.port == pairing.port }
-        // Like the real codec: re-pairing rotates the token and keeps the wake target.
-        val saved = SavedPairing(existing?.id ?: "host-${registry.hosts.size + 1}", pairing, existing?.wake)
+        // Like the real codec: re-pairing rotates the token and keeps the wake target and view scale.
+        val saved = SavedPairing(existing?.id ?: "host-${registry.hosts.size + 1}", pairing, existing?.wake, existing?.viewScale)
         registry = PairingRegistry(registry.hosts.filterNot { it.id == saved.id } + saved, saved.id)
         stored = pairing
         return registry
@@ -111,9 +115,16 @@ internal class FakePairingStore(initial: Pairing? = null) : PairingStore {
     }
 
     override fun setWake(hostId: String, wake: WakeTarget?): PairingRegistry {
-        if (failOnSave) throw IllegalStateException("keystore unavailable")
+        if (failOnSave) throw saveFailure
         require(registry.hosts.any { it.id == hostId }) { "unknown host" }
         registry = registry.copy(hosts = registry.hosts.map { if (it.id == hostId) it.copy(wake = wake) else it })
+        return registry
+    }
+
+    override fun setViewScale(hostId: String, scale: ViewScale?): PairingRegistry {
+        if (failOnSave) throw saveFailure
+        require(registry.hosts.any { it.id == hostId }) { "unknown host" }
+        registry = registry.copy(hosts = registry.hosts.map { if (it.id == hostId) it.copy(viewScale = scale) else it })
         return registry
     }
 

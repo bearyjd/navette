@@ -37,7 +37,49 @@ class PairingRegistryTest {
     fun `corrupt and future snapshots fail closed`() {
         assertEquals(RegistryDecode.Corrupt, PairingRegistryCodec.decode("not json"))
         assertEquals(RegistryDecode.Corrupt, PairingRegistryCodec.decode("""{"version":0,"hosts":[]}"""))
-        assertEquals(RegistryDecode.Future, PairingRegistryCodec.decode("""{"version":3,"hosts":[]}"""))
+        assertEquals(RegistryDecode.Future, PairingRegistryCodec.decode("""{"version":4,"hosts":[]}"""))
+        // The current schema is not the future: this literal moves up with every bump.
+        assertEquals(RegistryDecode.Valid(PairingRegistry()), PairingRegistryCodec.decode("""{"version":3,"hosts":[]}"""))
+    }
+
+    @Test
+    fun `a newer schema that added keys is Future, not Corrupt`() {
+        // A downgraded APK reading a registry written by a newer build must refuse
+        // to overwrite it. Corrupt maps to an empty registry that the next write
+        // replaces -- which, with ignoreUnknownKeys = false, is what used to happen
+        // to any newer schema that added a field.
+        val newer = """{"version":4,"hosts":[{"id":"a","host":"tower","port":9417,"token":"$token","fromTheFuture":1}],"alsoNew":true}"""
+        assertEquals(RegistryDecode.Future, PairingRegistryCodec.decode(newer))
+        assertEquals(RegistryDecode.Future, PairingRegistryCodec.decode("""{"version":99,"somethingElse":[1,2]}"""))
+    }
+
+    @Test
+    fun `a quoted version is read the way the strict decoder reads it`() {
+        // The strict decoder coerces "4" to 4; the pre-parse must agree, or a
+        // quoted newer version with new keys would still be wiped as Corrupt.
+        assertEquals(RegistryDecode.Future, PairingRegistryCodec.decode("""{"version":"4","hosts":[],"alsoNew":1}"""))
+        assertEquals(RegistryDecode.Future, PairingRegistryCodec.decode("""{"version":"4","hosts":[]}"""))
+    }
+
+    @Test
+    fun `a duplicated version key is read as its last value by both parsers`() {
+        assertEquals(RegistryDecode.Future, PairingRegistryCodec.decode("""{"version":3,"version":4,"hosts":[]}"""))
+        assertEquals(RegistryDecode.Valid(PairingRegistry()), PairingRegistryCodec.decode("""{"version":4,"version":3,"hosts":[]}"""))
+    }
+
+    @Test
+    fun `an unknown key at a known version is still corrupt`() {
+        assertEquals(RegistryDecode.Corrupt, PairingRegistryCodec.decode("""{"version":3,"hosts":[],"alsoNew":true}"""))
+        assertEquals(RegistryDecode.Corrupt, PairingRegistryCodec.decode("""{"version":2,"hosts":[],"alsoNew":true}"""))
+    }
+
+    @Test
+    fun `a version that is not a whole number is corrupt, not future`() {
+        for (version in listOf("4.5", "null", "true", "99999999999", "[4]")) {
+            assertEquals(version, RegistryDecode.Corrupt, PairingRegistryCodec.decode("""{"version":$version,"hosts":[]}"""))
+        }
+        assertEquals(RegistryDecode.Corrupt, PairingRegistryCodec.decode("""[{"version":4}]"""))
+        assertEquals(RegistryDecode.Corrupt, PairingRegistryCodec.decode("""{"hosts":[]}"""))
     }
 
     // -- schema v2: wake targets --------------------------------------------
@@ -69,10 +111,11 @@ class PairingRegistryTest {
     }
 
     @Test
-    fun `encode writes version 2 and a wake target round trips`() {
+    fun `encode writes version 3 and a wake target round trips`() {
+        // No host here has a view scale: the current version is written regardless.
         val registry = PairingRegistryCodec.setWake(twoHosts, towerId, WakeTarget("AA-BB-CC-DD-EE-FF", nasId))
         val encoded = PairingRegistryCodec.encode(registry)
-        assertTrue(encoded, encoded.contains(""""version":2"""))
+        assertTrue(encoded, encoded.contains(""""version":3"""))
         val decoded = decodeValid(encoded)
         assertEquals(WakeTarget("aa:bb:cc:dd:ee:ff", nasId), decoded.hosts.first { it.id == towerId }.wake)
         assertEquals(null, decoded.hosts.first { it.id == nasId }.wake)
@@ -211,6 +254,118 @@ class PairingRegistryTest {
     private inline fun <reified T : Throwable> assertThrows(label: String, block: () -> Unit) {
         val thrown = runCatching(block).exceptionOrNull()
         assertTrue("$label: expected ${T::class.simpleName}, got $thrown", thrown is T)
+    }
+
+    // -- schema v3: view scale ----------------------------------------------
+
+    private fun v3(hosts: String, activeId: String = "a") = """{"version":3,"activeId":"$activeId","hosts":[$hosts]}"""
+
+    @Test
+    fun `encode writes version 3 and a view scale round trips`() {
+        val registry = PairingRegistryCodec.setViewScale(twoHosts, towerId, ViewScale.X2)
+        val encoded = PairingRegistryCodec.encode(registry)
+        assertTrue(encoded, encoded.contains(""""version":3"""))
+        val decoded = decodeValid(encoded)
+        assertEquals(ViewScale.X2, decoded.hosts.first { it.id == towerId }.viewScale)
+        assertEquals(null, decoded.hosts.first { it.id == nasId }.viewScale)
+        assertEquals(registry, decoded)
+    }
+
+    @Test
+    fun `every preset survives a round trip`() {
+        // fromFactor compares Float exactly; this is what makes that safe for the four literals kotlinx writes.
+        for (scale in ViewScale.entries) {
+            val registry = PairingRegistryCodec.setViewScale(twoHosts, towerId, scale)
+            assertEquals(scale, decodeValid(PairingRegistryCodec.encode(registry)).hosts.first { it.id == towerId }.viewScale)
+        }
+    }
+
+    @Test
+    fun `a host without a view scale encodes without the key`() {
+        // Compact, and the shape a v3 reader already accepts as "no preference".
+        val encoded = PairingRegistryCodec.encode(twoHosts)
+        assertFalse(encoded, encoded.contains("viewScale"))
+    }
+
+    @Test
+    fun `a version 2 snapshot still decodes, with no view scale and its wake target intact`() {
+        val v2 = v2("${hostJson("a", "tower", ""","mac":"aa:bb:cc:dd:ee:ff","wakeViaId":"b"""")},${hostJson("b", "nas")}")
+        val registry = decodeValid(v2)
+        assertEquals(listOf("a", "b"), registry.hosts.map { it.id })
+        assertTrue("no v2 host has a scale, got ${registry.hosts}", registry.hosts.all { it.viewScale == null })
+        assertEquals(WakeTarget("aa:bb:cc:dd:ee:ff", "b"), registry.hosts.first { it.id == "a" }.wake)
+    }
+
+    @Test
+    fun `a version 1 or 2 snapshot carrying a view scale is corrupt, not an early adopter`() {
+        // Mirrors the wake rule: no shipped v1 or v2 writer ever produced this key.
+        val v1 = """{"version":1,"hosts":[${hostJson("a", "tower", ""","viewScale":2.0""")}]}"""
+        val v2 = v2("${hostJson("a", "tower", ""","viewScale":2.0""")},${hostJson("b", "nas")}")
+        assertEquals(RegistryDecode.Corrupt, PairingRegistryCodec.decode(v1))
+        assertEquals(RegistryDecode.Corrupt, PairingRegistryCodec.decode(v2))
+    }
+
+    @Test
+    fun `a view scale that is not a preset decodes as no preference, keeping the host`() {
+        // Degrade, never Corrupt: a scale is recoverable, the pairing it hangs off is not.
+        for (bad in listOf("2.5", "0", "-1", "1e9")) {
+            val registry = decodeValid(v3("${hostJson("a", "tower", ""","viewScale":$bad""")},${hostJson("b", "nas")}"))
+            assertEquals("host kept for viewScale=$bad", listOf("a", "b"), registry.hosts.map { it.id })
+            assertEquals("scale dropped for viewScale=$bad", null, registry.hosts.first { it.id == "a" }.viewScale)
+            assertEquals("tower", registry.hosts.first { it.id == "a" }.pairing.host)
+        }
+    }
+
+    @Test
+    fun `a bad view scale beside a good wake target drops only the scale`() {
+        val mixed = v3("${hostJson("a", "tower", ""","mac":"aa:bb:cc:dd:ee:ff","wakeViaId":"b","viewScale":7.0""")},${hostJson("b", "nas", ""","viewScale":1.5""")}")
+        val registry = decodeValid(mixed)
+        assertEquals(WakeTarget("aa:bb:cc:dd:ee:ff", "b"), registry.hosts.first { it.id == "a" }.wake)
+        assertEquals(null, registry.hosts.first { it.id == "a" }.viewScale)
+        assertEquals(ViewScale.X1_5, registry.hosts.first { it.id == "b" }.viewScale)
+        assertEquals(registry, decodeValid(PairingRegistryCodec.encode(registry)))
+    }
+
+    @Test
+    fun `a view scale that is not a number is corrupt`() {
+        // The strict wire type is the boundary: a string here is not a stale preset, it is damage.
+        assertEquals(RegistryDecode.Corrupt, PairingRegistryCodec.decode(v3(hostJson("a", "tower", ""","viewScale":"2×""""))))
+    }
+
+    @Test
+    fun `setViewScale stores on the named host only, and clears with null`() {
+        val set = PairingRegistryCodec.setViewScale(twoHosts, towerId, ViewScale.X3)
+        assertEquals(ViewScale.X3, set.hosts.first { it.id == towerId }.viewScale)
+        assertEquals(null, set.hosts.first { it.id == nasId }.viewScale)
+        assertEquals("the original registry is not mutated", null, twoHosts.hosts.first { it.id == towerId }.viewScale)
+        assertEquals(twoHosts.activeId, set.activeId)
+
+        val cleared = PairingRegistryCodec.setViewScale(set, towerId, null)
+        assertEquals(twoHosts, cleared)
+    }
+
+    @Test
+    fun `setViewScale rejects an unknown host, even to clear`() {
+        assertThrows<IllegalArgumentException>("unknown host") { PairingRegistryCodec.setViewScale(twoHosts, "ghost", ViewScale.X2) }
+        assertThrows<IllegalArgumentException>("unknown host, null") { PairingRegistryCodec.setViewScale(twoHosts, "ghost", null) }
+    }
+
+    @Test
+    fun `re-pairing a host keeps its view scale`() {
+        // The scale belongs to the machine's screen, not the token.
+        val withScale = PairingRegistryCodec.setViewScale(twoHosts, towerId, ViewScale.X2)
+        val repaired = PairingRegistryCodec.upsert(withScale, Pairing("TOWER", 9417, "ZZZZ1234ZZZZ1234ZZZZ1234"))
+        val tower = repaired.hosts.first { it.id == towerId }
+        assertEquals("ZZZZ1234ZZZZ1234ZZZZ1234", tower.pairing.token)
+        assertEquals(ViewScale.X2, tower.viewScale)
+        assertEquals(2, repaired.hosts.size)
+    }
+
+    @Test
+    fun `removing a host leaves the other hosts' view scales alone`() {
+        val withScale = PairingRegistryCodec.setViewScale(twoHosts, towerId, ViewScale.X2)
+        val removed = PairingRegistryCodec.remove(withScale, nasId)
+        assertEquals(ViewScale.X2, removed.hosts.single().viewScale)
     }
 
     @Test

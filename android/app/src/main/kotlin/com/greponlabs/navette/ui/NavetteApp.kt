@@ -4,9 +4,11 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.greponlabs.navette.net.ConnectionPhase
+import com.greponlabs.navette.net.ViewScale
 import com.greponlabs.navette.net.phase
 import com.greponlabs.navette.ui.connect.ConnectScreen
 import com.greponlabs.navette.ui.drawer.DrawerScreen
@@ -40,9 +42,25 @@ fun NavetteApp(
             // System back leaves the session rather than the app, matching the
             // Back button the session screen shows on a dead connection.
             BackHandler { viewModel.onEvent(AppEvent.LeaveSession) }
+            val saved = state.savedForPairing
+            // The device default is resolved here and never stored: a saved
+            // `null` means "whatever this device defaults to", which is what
+            // lets a phone and a tablet share a host entry. LocalConfiguration,
+            // not LocalContext.resources.configuration: only the former
+            // recomposes when the Configuration changes (Compose's own
+            // LocalContextConfigurationRead lint). So this does follow a
+            // fold/unfold -- a cover screen is sw < 600 dp and the inner
+            // screen may not be, so the default can flip mid-session on a
+            // device with no saved preset; the guest re-lays out once, and
+            // saving any preset pins it.
+            val smallestWidthDp = LocalConfiguration.current.smallestScreenWidthDp
             SessionScreen(
                 sessionName = activeSession,
                 pairing = pairing,
+                viewScale = saved?.viewScale ?: ViewScale.defaultFor(smallestWidthDp),
+                // An unsaved pairing (failed keystore write) still gets the
+                // control; the choice just lives for the session.
+                onViewScaleChange = { scale -> saved?.let { viewModel.onEvent(AppEvent.SetViewScale(it.id, scale)) } },
                 onLeave = { viewModel.onEvent(AppEvent.LeaveSession) },
             )
         }
