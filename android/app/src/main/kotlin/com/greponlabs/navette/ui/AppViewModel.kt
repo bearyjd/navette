@@ -20,6 +20,7 @@ import com.greponlabs.navette.net.Pairing
 import com.greponlabs.navette.net.PairingRegistry
 import com.greponlabs.navette.net.PairingStore
 import com.greponlabs.navette.net.SavedPairing
+import com.greponlabs.navette.net.ViewScale
 import com.greponlabs.navette.net.WakeResult
 import com.greponlabs.navette.net.WakeTarget
 import com.greponlabs.navette.net.WakeTransport
@@ -80,6 +81,16 @@ data class AppUiState(
             val via = registry.hosts.firstOrNull { it.id == target.viaId } ?: return null
             return WakeRoute(target.mac, via)
         }
+
+    /**
+     * The saved entry for [pairing], or `null` after a failed save (the pairing
+     * in use was never stored). Resolved from [pairing] for the same reason
+     * [wakeRoute] is: the registry's active id may name a different computer.
+     * The session screen reads its `viewScale` from here and addresses
+     * [AppEvent.SetViewScale] to its `id`.
+     */
+    val savedForPairing: SavedPairing?
+        get() = pairing?.let { current -> registry.hosts.firstOrNull { it.pairing.host == current.host && it.pairing.port == current.port } }
 }
 
 /** [mac] is the sleeping host's; [via] is the saved always-on daemon that broadcasts the packet for it. */
@@ -123,6 +134,9 @@ sealed interface AppEvent {
 
     /** Sets (or, with `null`, clears) how the saved host [hostId] is woken. */
     data class SetWake(val hostId: String, val wake: WakeTarget?) : AppEvent
+
+    /** Remembers the logical scale for the saved host [hostId]; `null` clears it back to the device default. */
+    data class SetViewScale(val hostId: String, val scale: ViewScale?) : AppEvent
 
     /**
      * Asks the relay in [AppUiState.wakeRoute] to send a magic packet to the
@@ -242,6 +256,7 @@ class AppViewModel(
             is AppEvent.SelectHost -> selectHost(event.id)
             is AppEvent.DeleteHost -> deleteHost(event.id)
             is AppEvent.SetWake -> setWake(event.hostId, event.wake)
+            is AppEvent.SetViewScale -> setViewScale(event.hostId, event.scale)
             AppEvent.WakeActive -> wakeActive()
             AppEvent.Reconnect -> reconnect()
             AppEvent.Refresh -> refresh()
@@ -394,6 +409,19 @@ class AppViewModel(
         }
         wakeJob?.cancel()
         _state.update { it.copy(registry = updated, wake = WakeUiState.Idle) }
+    }
+
+    /**
+     * Guarded like [setWake]. Unlike a wake target, a scale that did not stick
+     * has already taken effect for this session (the controller applied it),
+     * so a failure is logged rather than surfaced: the session screen has no
+     * snackbar host, and the drawer would show the message minutes later.
+     */
+    private fun setViewScale(hostId: String, scale: ViewScale?) {
+        val updated = runCatching { pairingStore.setViewScale(hostId, scale) }
+            .onFailure { Log.w(TAG, "failed to save the view scale: ${it.message}") }
+            .getOrNull() ?: return
+        _state.update { it.copy(registry = updated) }
     }
 
     /**

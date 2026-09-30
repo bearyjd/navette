@@ -12,10 +12,13 @@ import java.util.UUID
  */
 data class WakeTarget(val mac: String, val viaId: String)
 
-/** A saved endpoint label is derived; neither it nor the token is user-editable metadata. */
-data class SavedPairing(val id: String, val pairing: Pairing, val wake: WakeTarget? = null) {
+/**
+ * A saved endpoint label is derived; neither it nor the token is user-editable
+ * metadata. [viewScale] `null` means "device default", resolved by the screen.
+ */
+data class SavedPairing(val id: String, val pairing: Pairing, val wake: WakeTarget? = null, val viewScale: ViewScale? = null) {
     val endpointLabel: String get() = if (pairing.host.contains(':')) "[${pairing.host}]:${pairing.port}" else "${pairing.host}:${pairing.port}"
-    override fun toString(): String = "SavedPairing(id=$id, endpoint=$endpointLabel, pairing=$pairing, wake=$wake)"
+    override fun toString(): String = "SavedPairing(id=$id, endpoint=$endpointLabel, pairing=$pairing, wake=$wake, viewScale=$viewScale)"
 }
 
 data class PairingRegistry(val hosts: List<SavedPairing> = emptyList(), val activeId: String? = null) {
@@ -25,9 +28,20 @@ data class PairingRegistry(val hosts: List<SavedPairing> = emptyList(), val acti
 @Serializable
 private data class RegistryWire(val version: Int, val activeId: String? = null, val hosts: List<HostWire> = emptyList())
 
-/** `mac` and `wakeViaId` arrived together in version 2; [PairingRegistryCodec.decode] reads one without the other as no wake target. */
+/**
+ * `mac` and `wakeViaId` arrived together in version 2; [PairingRegistryCodec.decode] reads one without the other as no wake target.
+ * `viewScale` arrived in version 3; a value that is not one of the presets decodes as no preference.
+ */
 @Serializable
-private data class HostWire(val id: String, val host: String, val port: Int, val token: String, val mac: String? = null, val wakeViaId: String? = null)
+private data class HostWire(
+    val id: String,
+    val host: String,
+    val port: Int,
+    val token: String,
+    val mac: String? = null,
+    val wakeViaId: String? = null,
+    val viewScale: Float? = null,
+)
 
 internal sealed interface RegistryDecode {
     data class Valid(val registry: PairingRegistry) : RegistryDecode
@@ -37,8 +51,9 @@ internal sealed interface RegistryDecode {
 
 /** Pure codec so malformed storage can be tested without Android keystore plumbing. */
 internal object PairingRegistryCodec {
-    private const val VERSION = 2
+    private const val VERSION = 3
     private const val FIRST_VERSION_WITH_WAKE = 2
+    private const val FIRST_VERSION_WITH_VIEW_SCALE = 3
     private val json = Json { ignoreUnknownKeys = false }
 
     fun encode(registry: PairingRegistry): String {
@@ -49,7 +64,7 @@ internal object PairingRegistryCodec {
             val pairing = validatedPairing(saved.pairing.host, saved.pairing.port, saved.pairing.token)
                 ?: error("attempted to persist an invalid pairing")
             val wake = saved.wake?.let { validatedWake(saved.id, it.mac, it.viaId, ids) ?: error("attempted to persist an invalid wake target") }
-            HostWire(saved.id, pairing.host, pairing.port, pairing.token, wake?.mac, wake?.viaId)
+            HostWire(saved.id, pairing.host, pairing.port, pairing.token, wake?.mac, wake?.viaId, saved.viewScale?.factor)
         }
         return json.encodeToString(RegistryWire.serializer(), RegistryWire(VERSION, registry.activeId, hosts))
     }
@@ -63,6 +78,8 @@ internal object PairingRegistryCodec {
      * Corrupt to an empty registry and the next write overwrites the blob, so
      * a Corrupt over recoverable metadata would cost every host and token.
      * [encode] still refuses to write such a target; this is the reader's half.
+     * A `viewScale` that is not one of the presets degrades the same way, to
+     * "no preference" ([ViewScale.fromFactor]).
      */
     fun decode(raw: String): RegistryDecode {
         val wire = runCatching { json.decodeFromString(RegistryWire.serializer(), raw) }.getOrNull() ?: return RegistryDecode.Corrupt
@@ -71,20 +88,25 @@ internal object PairingRegistryCodec {
         if (wire.version !in 1..VERSION || ids.size != wire.hosts.size || wire.hosts.any { it.id.isBlank() }) return RegistryDecode.Corrupt
         // No shipped version 1 writer ever emitted wake fields, so their presence is corruption, not an early adopter.
         if (wire.version < FIRST_VERSION_WITH_WAKE && wire.hosts.any { it.mac != null || it.wakeViaId != null }) return RegistryDecode.Corrupt
+        // Mirrors the wake rule above: no v1 or v2 writer ever emitted viewScale.
+        if (wire.version < FIRST_VERSION_WITH_VIEW_SCALE && wire.hosts.any { it.viewScale != null }) return RegistryDecode.Corrupt
         val hosts = wire.hosts.map { item ->
             val pairing = validatedPairing(item.host, item.port, item.token) ?: return RegistryDecode.Corrupt
             val wake = item.mac?.let { mac -> item.wakeViaId?.let { via -> validatedWake(item.id, mac, via, ids) } }
-            SavedPairing(item.id, pairing, wake)
+            SavedPairing(item.id, pairing, wake, ViewScale.fromFactor(item.viewScale))
         }
         if (wire.activeId != null && wire.activeId !in ids) return RegistryDecode.Corrupt
         return RegistryDecode.Valid(PairingRegistry(hosts, wire.activeId))
     }
 
-    /** Re-pairing an endpoint rotates its token; the wake target belongs to the machine, not the token, so it stays. */
+    /**
+     * Re-pairing an endpoint rotates its token; the wake target and the view
+     * scale belong to the machine (and its screen), not the token, so they stay.
+     */
     fun upsert(registry: PairingRegistry, pairing: Pairing): PairingRegistry {
         val valid = validatedPairing(pairing.host, pairing.port, pairing.token) ?: throw IllegalArgumentException("invalid pairing")
         val existing = registry.hosts.firstOrNull { it.pairing.host == valid.host && it.pairing.port == valid.port }
-        val saved = SavedPairing(existing?.id ?: UUID.randomUUID().toString(), valid, existing?.wake)
+        val saved = SavedPairing(existing?.id ?: UUID.randomUUID().toString(), valid, existing?.wake, existing?.viewScale)
         val hosts = registry.hosts.filterNot { it.id == saved.id } + saved
         return PairingRegistry(hosts, saved.id)
     }
@@ -112,6 +134,12 @@ internal object PairingRegistryCodec {
                 WakeTarget(mac, it.viaId)
             }
         return registry.copy(hosts = registry.hosts.map { if (it.id == hostId) it.copy(wake = validated) else it })
+    }
+
+    /** Sets or clears (`scale == null`) the logical scale used when attaching to [hostId]. */
+    fun setViewScale(registry: PairingRegistry, hostId: String, scale: ViewScale?): PairingRegistry {
+        require(registry.hosts.any { it.id == hostId }) { "unknown host" }
+        return registry.copy(hosts = registry.hosts.map { if (it.id == hostId) it.copy(viewScale = scale) else it })
     }
 
     private fun validatedWake(hostId: String, mac: String, viaId: String, ids: Set<String>): WakeTarget? {

@@ -31,12 +31,18 @@
             already-landscape value, permanently landscape-locking the whole
             app. Handling these configs here means entering and leaving the
             session screen never recreates anything.
+
+            windowSoftInputMode=adjustResize is required for IME insets on
+            API < 30; on Android 15+ (targetSdk 36) edge-to-edge is enforced,
+            the window no longer resizes for the keyboard, and imePadding() in
+            SessionScreen is what moves the stream above it.
         -->
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|screenSize|screenLayout"
             android:exported="true"
-            android:theme="@style/Theme.Navette">
+            android:theme="@style/Theme.Navette"
+            android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
