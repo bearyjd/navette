@@ -3,6 +3,8 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Acquiring a WifiLock requires it (StreamWifiLock); a normal permission, granted at install. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!--
         Backup stays on, but the pairing store is excluded from it by both rule
