@@ -2,6 +2,7 @@ package com.greponlabs.navette.media
 
 import android.media.MediaCodec
 import android.media.MediaFormat
+import android.os.Build
 import android.os.HandlerThread
 import android.util.Log
 import android.view.Surface
@@ -223,6 +224,16 @@ class H264Decoder(
         if (pps != null) format.setByteBuffer("csd-1", ByteBuffer.wrap(pps))
         if (sps == null || pps == null) {
             Log.w(TAG, "stream config carried no ${if (sps == null) "SPS" else "PPS"}; relying on in-band headers")
+        }
+        // Ask for each frame to be output as soon as it is decoded. A desktop
+        // stream sends a frame only when something changes, so a decoder that
+        // buffered output would keep the screen one change behind. The stream
+        // allows it: the encoder sends no B-frames (`-bf 0`). Insurance, not a
+        // measured fix -- the Pixel 10's c2.google.avc.decoder showed frames
+        // just as promptly without it (A/B, 2026-10-03). Decoders without the
+        // feature ignore the key.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
         }
         return format
     }
