@@ -14,6 +14,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -84,72 +85,81 @@ internal fun BoxScope.ImeLayer(
     viewScale: ViewScale,
     onViewScaleChange: (ViewScale) -> Unit,
 ) {
-    var typed by remember { mutableStateOf(TextFieldValue()) }
     val softKeyboard = LocalSoftwareKeyboardController.current
 
-    BasicTextField(
-        value = typed,
-        onValueChange = { next ->
-            val chorded = keyboard.onImeText(previous = typed.text, current = next.text)
-            val reset =
-                InputMapper.shouldResetImeBuffer(
-                    text = next.text,
-                    hasComposition = next.composition != null,
-                    chorded = chorded,
-                )
-            typed = if (reset) TextFieldValue() else next
-        },
-        keyboardOptions =
-            KeyboardOptions(
-                // Password, not Text + no-suggestions: Compose 1.10.6 never
-                // sets TYPE_TEXT_FLAG_NO_SUGGESTIONS, and Gboard turns off
-                // suggestions, autocorrect and glide typing only for the
-                // password variation. Each of those otherwise arrives as a
-                // composition update the diff turns into a backspace-and-
-                // retype burst on the guest.
-                keyboardType = KeyboardType.Password,
-                autoCorrectEnabled = false,
-                // Default, not None or Done: with singleLine = false this is
-                // what adds IME_FLAG_NO_ENTER_ACTION, so Enter inserts "\n"
-                // and the diff maps it to KEY_ENTER (KeycodeMap.asciiCharToEvdev).
-                imeAction = ImeAction.Default,
-            ),
-        // The field is invisible anyway; None keeps the password type from
-        // substituting bullets into `typed.text`, which is the diff base.
-        visualTransformation = VisualTransformation.None,
-        modifier =
-            Modifier
-                .size(1.dp)
-                .alpha(0f)
-                // Belt and braces beside the view-level switch above: no
-                // autofill data type, and out of the accessibility tree that
-                // autofill walks. The field is invisible and 1.dp, so nothing
-                // is lost by hiding it from either.
-                .semantics {
-                    contentDataType = ContentDataType.None
-                    hideFromAccessibility()
-                }
-                .focusRequester(fieldFocus)
-                // Gboard deletes with deleteSurroundingText while there is
-                // text; on an empty field it sends KEYCODE_DEL as a key event
-                // instead, which the diff cannot see. Preview, not onKeyEvent:
-                // the field's own handler would consume DEL before it bubbled.
-                // The raw text is checked, not sendableText: an untypable
-                // leftover (a curly quote) still gives Gboard something to
-                // deleteSurroundingText, which produces neither a diff nor a
-                // key event -- the pre-existing "deleting only the unmapped
-                // character sends nothing" case. Repeats are skipped as the
-                // hardware path does; Gboard's own repeat is fresh down/up pairs.
-                .onPreviewKeyEvent { event ->
-                    if (event.nativeKeyEvent.keyCode != KeyEvent.KEYCODE_DEL || typed.text.isNotEmpty()) {
-                        return@onPreviewKeyEvent false
+    // A reconnect replaces SessionKeyboard. Key the actual editable to that
+    // instance, rather than merely updating its callback, so Compose disposes
+    // the old editable and creates a fresh, empty field. The prior buffer and
+    // composition must not carry over to the new controller. imeRaised is
+    // hoisted, so the focus-restoring effect requests focus and shows the
+    // keyboard again.
+    key(keyboard) {
+        var typed by remember { mutableStateOf(TextFieldValue()) }
+
+        BasicTextField(
+            value = typed,
+            onValueChange = { next ->
+                val chorded = keyboard.onImeText(previous = typed.text, current = next.text)
+                val reset =
+                    InputMapper.shouldResetImeBuffer(
+                        text = next.text,
+                        hasComposition = next.composition != null,
+                        chorded = chorded,
+                    )
+                typed = if (reset) TextFieldValue() else next
+            },
+            keyboardOptions =
+                KeyboardOptions(
+                    // Password, not Text + no-suggestions: Compose 1.10.6 never
+                    // sets TYPE_TEXT_FLAG_NO_SUGGESTIONS, and Gboard turns off
+                    // suggestions, autocorrect and glide typing only for the
+                    // password variation. Each of those otherwise arrives as a
+                    // composition update the diff turns into a backspace-and-
+                    // retype burst on the guest.
+                    keyboardType = KeyboardType.Password,
+                    autoCorrectEnabled = false,
+                    // Default, not None or Done: with singleLine = false this is
+                    // what adds IME_FLAG_NO_ENTER_ACTION, so Enter inserts "\n"
+                    // and the diff maps it to KEY_ENTER (KeycodeMap.asciiCharToEvdev).
+                    imeAction = ImeAction.Default,
+                ),
+            // The field is invisible anyway; None keeps the password type from
+            // substituting bullets into `typed.text`, which is the diff base.
+            visualTransformation = VisualTransformation.None,
+            modifier =
+                Modifier
+                    .size(1.dp)
+                    .alpha(0f)
+                    // Belt and braces beside the view-level switch above: no
+                    // autofill data type, and out of the accessibility tree that
+                    // autofill walks. The field is invisible and 1.dp, so nothing
+                    // is lost by hiding it from either.
+                    .semantics {
+                        contentDataType = ContentDataType.None
+                        hideFromAccessibility()
                     }
-                    if (event.type == KeyEventType.KeyDown && event.nativeKeyEvent.repeatCount == 0) {
-                        keyboard.onKeyBarKey(KeycodeMap.KEY_BACKSPACE)
-                    }
-                    true
-                },
-    )
+                    .focusRequester(fieldFocus)
+                    // Gboard deletes with deleteSurroundingText while there is
+                    // text; on an empty field it sends KEYCODE_DEL as a key event
+                    // instead, which the diff cannot see. Preview, not onKeyEvent:
+                    // the field's own handler would consume DEL before it bubbled.
+                    // The raw text is checked, not sendableText: an untypable
+                    // leftover (a curly quote) still gives Gboard something to
+                    // deleteSurroundingText, which produces neither a diff nor a
+                    // key event -- the pre-existing "deleting only the unmapped
+                    // character sends nothing" case. Repeats are skipped as the
+                    // hardware path does; Gboard's own repeat is fresh down/up pairs.
+                    .onPreviewKeyEvent { event ->
+                        if (event.nativeKeyEvent.keyCode != KeyEvent.KEYCODE_DEL || typed.text.isNotEmpty()) {
+                            return@onPreviewKeyEvent false
+                        }
+                        if (event.type == KeyEventType.KeyDown && event.nativeKeyEvent.repeatCount == 0) {
+                            keyboard.onKeyBarKey(KeycodeMap.KEY_BACKSPACE)
+                        }
+                        true
+                    },
+        )
+    }
 
     Row(modifier = Modifier.align(Alignment.TopEnd).padding(8.dp)) {
         TextButton(onClick = onToggleKeyBar) {

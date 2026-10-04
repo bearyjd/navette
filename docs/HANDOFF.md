@@ -3743,3 +3743,38 @@ The reporter still has to confirm in their own setup.
   earlier session, and Tailscale is on. The phone's keyboard is now WM Keyboard
   (`com.wasimaster.wmkeyboard`); its clipboard strip shows personal text, so keep it out
   of logs and screenshots.
+
+## Unexpected Enter investigation and IME reconnect hardening (2026-10-04)
+
+The original Enter remains unexplained. A diagnostic APK logged only the source of
+Enter events, never input text. An explicit hardware Enter produced the expected
+down/up log entries. Background/foreground with IME switches, an Android process
+restart, and a temporary host-daemon restart while the keyboard was raised produced
+no additional Enter entries. Earlier zero-log observations from an APK without the
+trace were discarded; only runs with a verified positive control count as evidence.
+
+Code inspection found that the hidden editable retained its `TextFieldValue` while
+a reconnect replaced `SessionKeyboard`. `ImeLayer` now keys the editable subtree to
+that keyboard instance, recreating its local buffer and input session on reconnect.
+The hoisted keyboard visibility and focus-restoring effect remain in place. This is
+hardening against stale editor state, not a proven explanation for the original Enter.
+
+`ImeLayerTest` adds two Compose instrumentation tests: controller replacement clears
+the field and restores focus before the next edit, sends no replay, and preserves
+intentional Enter; ordinary scale recomposition retains the existing buffer. These
+exercise the real editable with captured keyboard events, but do not inject delayed
+commands through an obsolete native `InputConnection`. Both tests passed on the
+Pixel 10 Pro Fold running Android 17, with no failures or skips. After Gradle cleaned
+up its test installation, the updated debug APK was installed separately for use.
+To repeat from `android/`:
+`ANDROID_SERIAL=57211FDCG0023C ./gradlew :app:connectedDebugAndroidTest`.
+
+The first device run failed before assertions because Compose's test dependency
+inherited Espresso 3.5.0, which reflects the removed `InputManager.getInstance` API.
+Instrumentation now explicitly uses Espresso 3.7.0; its official release notes
+document replacing that reflection with `getSystemService`. The rerun passed.
+
+The temporary daemon, orphaned WPRS child, credentials, config, and log were removed;
+Navette's temporary pairing data was cleared. Gboard was last selected. The phone
+has since reconnected and the updated build is installed. Keep personal IME/clipboard
+content out of captures.
