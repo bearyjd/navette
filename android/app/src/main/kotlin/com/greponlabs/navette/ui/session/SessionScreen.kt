@@ -213,6 +213,7 @@ fun SessionScreen(
     var hudVisible by remember(pairing.host, sessionName) { mutableStateOf(false) }
     val modifiers by controller.keyboard.modifiers.collectAsState()
     LockLandscapeWhileAttached()
+    HoldLowLatencyWifiWhileAttached()
 
     // The hidden IME field is a password-typed editable (see ImeLayer for why
     // that type is load-bearing), and every "Keyboard" tap focuses it -- which
