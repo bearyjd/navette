@@ -3670,3 +3670,111 @@ Xwayland runs, its lock file protects the number). The supervisor passes
 and always sets the app's `DISPLAY=:<n>`. Live after the fix: two sessions got `:100` and
 `:101`, both Xwayland servers up, no panic; an xterm session had `DISPLAY=:100`, streamed,
 and took a key.
+
+## Typing lag "one key behind": Wi-Fi power save, fixed in #47 (2026-10-03)
+
+The report: on the Pixel 10, some keys appeared only when the next key was typed. It
+came from `foot` on a distrobox daemon, using Gboard, and lagged on almost every key.
+#46 and #47 are both merged (`54fdedc`, `8eaf6b6`). Master CI is green.
+
+**Cause: the phone's Wi-Fi power save.** After the phone transmits, its radio stays
+awake for only about 50 ms. A frame that arrives later is buffered at the access point
+until the next beacon or the phone's next transmission, and when typing quickly that
+next transmission is the next keystroke. Evidence came from a delayed-echo guest: a
+raw-mode Python script in `foot` echoed each key after a cycling 0–500 ms delay, keys
+were injected 2.5 s apart, and ACK timing was captured on `tailscale0`.
+
+| echo leaves the host… | master (no lock) | #47 (lock) |
+|---|---|---|
+| within ~65 ms of the key (phone quiet ≤ 45 ms) | ACKed in 11–15 ms | 7–14 ms |
+| later (phone quiet ≥ ~47 ms) | 39–180 ms (10 of 11) | 10–21 ms (two at ~58 ms) |
+
+Frames the host sends unprompted show the same thing (pty writes from the host): first
+segment ACKed after 51–114 ms idle, 10–18 ms with the lock. Host→phone pings every
+0.5 s showed median 60 / p90 148 ms without the lock and 12 / 21 ms with it.
+Phone→host pings stayed at 13–29 ms throughout.
+
+**#47:** `StreamWifiLock` + `HoldLowLatencyWifiWhileAttached()` hold a
+`WIFI_MODE_FULL_LOW_LATENCY` lock while the session screen is composed (API 29+), and
+the `WAKE_LOCK` permission is added. The system honours the lock only in the foreground
+with the screen on: `dumpsys wifi` showed `Current operation mode: 4` in a session and
+`0` once backgrounded, which is what bounds the battery cost.
+
+**Not reproduced as reported.** Konsole and `foot` on an idle host echo in 17–38 ms,
+inside the awake window. Real taps on WM Keyboard and Gboard and 8-key `input text`
+bursts all showed every key with no follow-up key, with and without the lock. So the
+original lag needed a slower echo, probably from a loaded host; that is unconfirmed.
+The reporter still has to confirm in their own setup.
+
+**Ruled out along the way:**
+- **Decoder holding frames (#46).** `KEY_LOW_LATENCY` is applied (`config diff is ...
+  algo.low-latency.value = 1`) but changed nothing. The `= 0` line #46 originally cited
+  is Codec2's default-config dump, logged for every decoder. #46 was reworded as
+  insurance before it merged.
+- **Host-side Nagle.** Frames left with data still unacked; axum's `serve` does leave
+  `TCP_NODELAY` off, but it doesn't matter here.
+- **Frame-callback throttling.** Writes 100 ms apart each left the host as a frame
+  26–38 ms later.
+- **IME / hidden-field batching.** Every key was sent on its own tap.
+
+**How to measure this again.** The scripts lived in the session scratchpad, not the repo.
+- **Frames without input:** `printf` to the guest shell's `/dev/pts/N`, found with
+  `ps -o pid=,tty= --ppid <terminal pid>`, via `host-spawn` for a host-daemon session.
+- **Network delivery:** `host-spawn sudo tcpdump -l -S -nn -tt -i tailscale0 'host <host>
+  and host <phone> and tcp port <port>'`, then time each host segment until the phone
+  ACK that covers it. A single small segment's ACK can carry the phone's ~40 ms delayed
+  ACK.
+- **Display:** `screenrecord --bugreport --display-id 4619827677550801153`. Anchor the pts
+  with the timestamp overlay and extract with `ffmpeg -fps_mode passthrough`. It's noisy,
+  about ±50 ms.
+- **Key injection:** with the keyboard raised, `adb shell input text abc` reaches the guest
+  through the hidden field. `input keyevent` with the keyboard down reaches nothing (the
+  stream box doesn't hold focus).
+- **Dead ends:** SurfaceFlinger `--latency`/`--frametimeline` don't cover the MediaCodec
+  SurfaceView, and perfetto atrace came back empty on this phone.
+
+**Open:**
+- **An Enter nobody typed.** `abcdefgh`, injected at a `foot` prompt, later ran as a
+  command. In between, the phone sat at the launcher (possibly someone picked it up),
+  `ime set` switched the keyboard, and navette came back to the front. Not reproduced
+  yet. If the app can send Enter on a background/foreground or IME change, it can run
+  whatever is at a prompt.
+- **Phone state.** The phone's saved computers still list `100.111.143.67:9519`, from an
+  earlier session, and Tailscale is on. The phone's keyboard is now WM Keyboard
+  (`com.wasimaster.wmkeyboard`); its clipboard strip shows personal text, so keep it out
+  of logs and screenshots.
+
+## Unexpected Enter investigation and IME reconnect hardening (2026-10-04)
+
+The original Enter remains unexplained. A diagnostic APK logged only the source of
+Enter events, never input text. An explicit hardware Enter produced the expected
+down/up log entries. Background/foreground with IME switches, an Android process
+restart, and a temporary host-daemon restart while the keyboard was raised produced
+no additional Enter entries. Earlier zero-log observations from an APK without the
+trace were discarded; only runs with a verified positive control count as evidence.
+
+Code inspection found that the hidden editable retained its `TextFieldValue` while
+a reconnect replaced `SessionKeyboard`. `ImeLayer` now keys the editable subtree to
+that keyboard instance, recreating its local buffer and input session on reconnect.
+The hoisted keyboard visibility and focus-restoring effect remain in place. This is
+hardening against stale editor state, not a proven explanation for the original Enter.
+
+`ImeLayerTest` adds two Compose instrumentation tests: controller replacement clears
+the field and restores focus before the next edit, sends no replay, and preserves
+intentional Enter; ordinary scale recomposition retains the existing buffer. These
+exercise the real editable with captured keyboard events, but do not inject delayed
+commands through an obsolete native `InputConnection`. Both tests passed on the
+Pixel 10 Pro Fold running Android 17, with no failures or skips. After Gradle cleaned
+up its test installation, the updated debug APK was installed separately for use.
+To repeat from `android/`:
+`ANDROID_SERIAL=57211FDCG0023C ./gradlew :app:connectedDebugAndroidTest`.
+
+The first device run failed before assertions because Compose's test dependency
+inherited Espresso 3.5.0, which reflects the removed `InputManager.getInstance` API.
+Instrumentation now explicitly uses Espresso 3.7.0; its official release notes
+document replacing that reflection with `getSystemService`. The rerun passed.
+
+The temporary daemon, orphaned WPRS child, credentials, config, and log were removed;
+Navette's temporary pairing data was cleared. Gboard was last selected. The phone
+has since reconnected and the updated build is installed. Keep personal IME/clipboard
+content out of captures.

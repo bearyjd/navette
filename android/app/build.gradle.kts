@@ -15,6 +15,7 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "0.1.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
@@ -66,6 +67,12 @@ dependencies {
     implementation(libs.code.scanner)
 
     debugImplementation(libs.compose.ui.tooling)
+    debugImplementation(libs.compose.ui.test.manifest)
+
+    androidTestImplementation(platform(libs.compose.bom))
+    androidTestImplementation(libs.compose.ui.test.junit4)
+    // Compose inherits Espresso 3.5.0; 3.7.0 avoids removed InputManager reflection.
+    androidTestImplementation(libs.espresso.core)
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
