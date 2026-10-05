@@ -29,7 +29,7 @@ navette-auth = { path = "../navette-auth" }
 # relied on). Both touch key handling, so this pin was verified against the
 # 480-edge rollover harness before landing: zero duplicate presses, zero
 # unpaired releases, nothing latched, every key balanced.
-minifb = { git = "https://github.com/emoon/rust_minifb.git", rev = "3a711add95bc6b9ffd4db09c93c3550178359905" }
+minifb = { git = "https://github.com/emoon/rust_minifb.git", rev = "a048a0320391589e5206a25b13bd0be8e00630e0" }
 navette-protocol = { path = "../navette-protocol" }
 nix = { version = "0.30", features = ["signal"] }
 serde_json = "1"
