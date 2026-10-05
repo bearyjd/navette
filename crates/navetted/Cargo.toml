@@ -25,7 +25,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 calloop = "0.14"
-wprs = { git = "https://github.com/bearyjd/wprs.git", rev = "38c61feb7b05ad196cab95f7c66c33dfa95c8eee" }
+wprs = { git = "https://github.com/bearyjd/wprs.git", rev = "f45c5d5b9ce09e9030eb2cd144b9ac4f774062bc" }
 
 [dev-dependencies]
 tokio-tungstenite = "0.30"
