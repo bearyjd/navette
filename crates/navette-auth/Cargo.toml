@@ -7,7 +7,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow = "1"
-rand = "0.8"
+rand = "0.10"
 subtle = "2.6"
 thiserror = "2"
 url = "2"
