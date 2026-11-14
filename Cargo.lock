@@ -638,7 +638,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1404,7 +1404,7 @@ dependencies = [
  "calloop",
  "jpeg-encoder",
  "navette-protocol",
- "nix 0.30.1",
+ "nix 0.32.0",
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
@@ -1421,7 +1421,7 @@ dependencies = [
  "navette-auth",
  "navette-protocol",
  "navette-wake",
- "nix 0.30.1",
+ "nix 0.32.0",
  "qrcode",
  "reqwest",
  "serde",
@@ -1454,7 +1454,7 @@ dependencies = [
  "navette-bridge",
  "navette-protocol",
  "navetted",
- "nix 0.30.1",
+ "nix 0.32.0",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
@@ -1486,7 +1486,7 @@ dependencies = [
  "navette-bridge",
  "navette-protocol",
  "navette-wake",
- "nix 0.30.1",
+ "nix 0.32.0",
  "serde",
  "serde_json",
  "tempfile",
@@ -1529,6 +1529,18 @@ name = "nix"
 version = "0.31.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags 2.13.1",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
+name = "nix"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77730ed34f01f4990cb2ea67fec715ecebc6fab9a6396cf83c5529b13f581bdc"
 dependencies = [
  "bitflags 2.13.1",
  "cfg-if",
@@ -1863,7 +1875,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2177,7 +2189,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2590,10 +2602,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3376,7 +3388,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
