@@ -20,14 +20,16 @@ jobs:
           rustup update stable
           rustup default stable
           rustup component add clippy rustfmt
+      - name: Check cargo --locked
+        run: contrib/check-ci-locked.sh
       - name: Format
         run: cargo fmt --all -- --check
       - name: Lint
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
       - name: Build
-        run: cargo build --workspace
+        run: cargo build --locked --workspace
 
   viewer-display:
     runs-on: ubuntu-latest
@@ -53,7 +55,7 @@ jobs:
         # reintroducing the single-update-per-loop bug that commit f5be106
         # fixed by reading minifb's source alone, with no way to verify it
         # in the sandbox that wrote the fix.
-        run: "xvfb-run -a cargo test -p navette-viewer -- --ignored native::"
+        run: "xvfb-run -a cargo test --locked -p navette-viewer -- --ignored native::"
 
   android:
     runs-on: ubuntu-latest
