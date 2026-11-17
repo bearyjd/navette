@@ -86,4 +86,13 @@ class ReconnectPolicyTest {
             assertFalse(state.toString(), ReconnectPolicy.isRejected(state))
         }
     }
+
+    @Test
+    fun `control backoff doubles and is capped`() {
+        assertEquals(CONTROL_RECONNECT_BASE_DELAY_MS, ReconnectPolicy.controlDelayMs(1))
+        assertEquals(CONTROL_RECONNECT_BASE_DELAY_MS * 2, ReconnectPolicy.controlDelayMs(2))
+        assertEquals(CONTROL_RECONNECT_BASE_DELAY_MS * 4, ReconnectPolicy.controlDelayMs(3))
+        assertEquals(CONTROL_RECONNECT_MAX_DELAY_MS, ReconnectPolicy.controlDelayMs(60))
+        assertEquals(CONTROL_RECONNECT_BASE_DELAY_MS, ReconnectPolicy.controlDelayMs(0))
+    }
 }

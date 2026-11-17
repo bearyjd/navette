@@ -22,6 +22,15 @@ const val MAX_RECONNECT_ATTEMPTS: Int = 5
  */
 const val RECONNECT_BASE_DELAY_MS: Long = 1_000L
 
+/** Rebuilds a dropped control channel gets before the user must press Retry. */
+const val MAX_CONTROL_RECONNECT_ATTEMPTS: Int = 6
+
+/** First control-channel retry delay; each later retry doubles it. */
+const val CONTROL_RECONNECT_BASE_DELAY_MS: Long = 1_000L
+
+/** Ceiling on the doubling, so a long outage is probed at a bounded rate. */
+const val CONTROL_RECONNECT_MAX_DELAY_MS: Long = 30_000L
+
 /**
  * The retry policy for a dropped media socket, as pure functions over plain
  * values so every decision is unit-tested rather than trusted. The session
@@ -72,4 +81,10 @@ object ReconnectPolicy {
 
     /** How long to wait before retry number [attempt], counting from one. */
     fun delayMs(attempt: Int): Long = RECONNECT_BASE_DELAY_MS * attempt.coerceAtLeast(1)
+
+    /** Exponential backoff for control-channel retry number [attempt] (from one), capped. */
+    fun controlDelayMs(attempt: Int): Long {
+        val doublings = (attempt - 1).coerceIn(0, 20)
+        return (CONTROL_RECONNECT_BASE_DELAY_MS shl doublings).coerceAtMost(CONTROL_RECONNECT_MAX_DELAY_MS)
+    }
 }
