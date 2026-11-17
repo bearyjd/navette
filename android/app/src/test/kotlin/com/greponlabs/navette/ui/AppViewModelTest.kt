@@ -10,6 +10,8 @@ import com.greponlabs.navette.protocol.RequestCommand
 import com.greponlabs.navette.protocol.Response
 import com.greponlabs.navette.protocol.ResponseOutcome
 import com.greponlabs.navette.protocol.ResponseResult
+import com.greponlabs.navette.ui.session.MAX_CONTROL_RECONNECT_ATTEMPTS
+import com.greponlabs.navette.ui.session.ReconnectPolicy
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -529,5 +531,75 @@ class AppViewModelTest {
             vm.onEvent(AppEvent.ShowHosts)
             assertTrue(vm.state.value.showingHosts)
             assertEquals(1, vm.state.value.registry.hosts.size)
+        }
+
+    @Test
+    fun `a dropped control channel is reopened after an exponential backoff`() =
+        runTest {
+            val clients = mutableListOf<FakeNavetteApi>()
+            val vm = AppViewModel(pairingStore = FakePairingStore(), clientFactory = { FakeNavetteApi().also(clients::add) })
+            vm.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            clients[0].emit(ConnectionState.Failed("network lost"))
+            testScheduler.runCurrent()
+
+            testScheduler.advanceTimeBy(ReconnectPolicy.controlDelayMs(1) - 1)
+            testScheduler.runCurrent()
+            assertEquals(1, clients.size)
+            testScheduler.advanceTimeBy(1)
+            testScheduler.runCurrent()
+            assertEquals(2, clients.size)
+            assertTrue(clients[0].closed)
+
+            clients[1].emit(ConnectionState.Failed("still down"))
+            testScheduler.runCurrent()
+            testScheduler.advanceTimeBy(ReconnectPolicy.controlDelayMs(2) - 1)
+            testScheduler.runCurrent()
+            assertEquals(2, clients.size)
+            testScheduler.advanceTimeBy(1)
+            testScheduler.runCurrent()
+            assertEquals(3, clients.size)
+        }
+
+    @Test
+    fun `a rejected token is never retried`() =
+        runTest {
+            var opened = 0
+            val vm = AppViewModel(pairingStore = FakePairingStore(), clientFactory = { opened++; fake })
+            vm.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            fake.emit(ConnectionState.Unauthorized)
+            testScheduler.advanceUntilIdle()
+            assertEquals(1, opened)
+        }
+
+    @Test
+    fun `control channel retries stop after the attempt budget`() =
+        runTest {
+            val clients = mutableListOf<FakeNavetteApi>()
+            val vm = AppViewModel(
+                pairingStore = FakePairingStore(),
+                clientFactory = { FakeNavetteApi().also { it.emit(ConnectionState.Failed("down")); clients.add(it) } },
+            )
+            vm.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.advanceUntilIdle()
+            assertEquals(1 + MAX_CONTROL_RECONNECT_ATTEMPTS, clients.size)
+        }
+
+    @Test
+    fun `a successful reconnect restores the retry budget and keeps the session`() =
+        runTest {
+            val clients = mutableListOf<FakeNavetteApi>()
+            val vm = AppViewModel(pairingStore = FakePairingStore(), clientFactory = { FakeNavetteApi().also(clients::add) })
+            vm.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            clients[0].emit(ConnectionState.Failed("blip"))
+            testScheduler.advanceUntilIdle()
+            clients[1].emit(ConnectionState.Connected)
+            testScheduler.advanceUntilIdle()
+            clients[1].emit(ConnectionState.Failed("blip again"))
+            testScheduler.advanceTimeBy(ReconnectPolicy.controlDelayMs(1))
+            testScheduler.runCurrent()
+            assertEquals(3, clients.size)
         }
 }
