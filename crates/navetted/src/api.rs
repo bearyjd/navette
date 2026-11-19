@@ -232,6 +232,21 @@ impl<R: ProcessRunner> ApiState<R> {
         }
     }
 
+    /// Single per-session teardown entry point for the state owned by the
+    /// blob and file-transfer stores: it revokes their writer leases and
+    /// removes their on-disk namespaces (blobs, drop directory, staging).
+    /// The supervisor deliberately never deletes these paths itself. Failures
+    /// are logged, not returned, so teardown of one store cannot skip the
+    /// other.
+    pub fn teardown_session_stores(&self, session: &str) {
+        if let Err(error) = self.blobs.deactivate(session) {
+            tracing::warn!(%session, %error, "blob store teardown failed");
+        }
+        if let Err(error) = self.files.deactivate(session) {
+            tracing::warn!(%session, %error, "file transfer store teardown failed");
+        }
+    }
+
     /// Serializes destructive lifecycle transitions for the same session
     /// name. In particular, a successful old Kill cannot deactivate blobs or
     /// stop a bridge after a concurrent Run has recreated that name.
@@ -1118,14 +1133,15 @@ pub async fn dispatch<R: ProcessRunner>(state: &ApiState<R>, request: Request) -
                     match state.blobs.activate(&session.name) {
                         Err(error) => {
                             let _ = state.supervisor.kill(&session.name).await;
+                            state.teardown_session_stores(&session.name);
                             Err(ApiFailure::internal(format!(
                                 "failed to initialize clipboard blob namespace: {error}"
                             )))
                         }
                         Ok(()) => match state.files.activate_prepared(&session.name) {
                             Err(error) => {
-                                let _ = state.blobs.deactivate(&session.name);
                                 let _ = state.supervisor.kill(&session.name).await;
+                                state.teardown_session_stores(&session.name);
                                 Err(ApiFailure::internal(format!(
                                     "failed to initialize file drop namespace: {error}"
                                 )))
@@ -1133,9 +1149,8 @@ pub async fn dispatch<R: ProcessRunner>(state: &ApiState<R>, request: Request) -
                             Ok(()) => match state.bridges.start(&session) {
                                 Ok(()) => Ok(ResponseResult::Session { session }),
                                 Err(error) => {
-                                    let _ = state.files.deactivate(&session.name);
-                                    let _ = state.blobs.deactivate(&session.name);
                                     let _ = state.supervisor.kill(&session.name).await;
+                                    state.teardown_session_stores(&session.name);
                                     Err(ApiFailure::internal(format!(
                                         "failed to start media bridge: {error}"
                                     )))
@@ -1161,8 +1176,7 @@ pub async fn dispatch<R: ProcessRunner>(state: &ApiState<R>, request: Request) -
                         // unregister its bridge until process teardown and
                         // registry removal succeeded. A failed kill must leave
                         // the still-running session fully usable.
-                        let _ = state.blobs.deactivate(&session);
-                        let _ = state.files.deactivate(&session);
+                        state.teardown_session_stores(&session);
                         // Stop first, forget second. `stop` joins the encode
                         // thread, and that thread drains what is still
                         // queued -- a `Snapshot` from the last detach, a
@@ -2074,6 +2088,26 @@ mod tests {
             Arc::new(navette_auth::AuthToken::generate()),
         );
         assert_eq!(std::fs::read(path).unwrap(), b"data");
+    }
+
+    #[test]
+    fn teardown_session_stores_removes_blob_drop_and_staging_state() {
+        let temp = TempDir::new().unwrap();
+        let state = test_state(&temp);
+        add_running_session(&state, "work");
+        let blob_dir = state.supervisor.blob_root().join("work");
+        let drop_dir = state.supervisor.drop_root().join("work");
+        let staging_dir = state.supervisor.drop_root().join(".staging").join("work");
+        for dir in [&blob_dir, &drop_dir, &staging_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("leftover"), b"old").unwrap();
+        }
+
+        state.teardown_session_stores("work");
+
+        assert!(!blob_dir.exists(), "blob namespace must be removed");
+        assert!(!drop_dir.exists(), "drop directory must be removed");
+        assert!(!staging_dir.exists(), "partial uploads must be removed");
     }
 
     #[test]
