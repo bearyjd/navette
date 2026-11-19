@@ -140,6 +140,7 @@ async fn main() -> Result<()> {
     // Never log the value itself.
     tracing::info!(path = %token_path.display(), "API token loaded");
     let state = ApiState::new(apps, supervisor, auth).with_wake_broadcast(arguments.wake_broadcast);
+    state.teardown_inactive_session_stores();
     state.start_existing_bridges();
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())

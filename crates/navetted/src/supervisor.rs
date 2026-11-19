@@ -163,10 +163,6 @@ impl<R: ProcessRunner> Supervisor<R> {
         self.drop_root.clone()
     }
 
-    pub fn drop_staging_root(&self) -> PathBuf {
-        self.drop_root.join(".staging")
-    }
-
     #[cfg(test)]
     pub(crate) fn with_drop_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.drop_root = root.into();
@@ -350,9 +346,8 @@ impl<R: ProcessRunner> Supervisor<R> {
             .map_err(|_| SupervisorError::RegistryLock)?
             .remove(name)?;
         let _ = fs::remove_dir_all(self.runtime_root.join(name));
-        let _ = fs::remove_dir_all(self.blob_root().join(name));
-        let _ = fs::remove_dir_all(self.drop_root().join(name));
-        let _ = fs::remove_dir_all(self.drop_staging_root().join(name));
+        // Blob and file-transfer directories are owned by their stores; the
+        // caller tears them down via `ApiState::teardown_session_stores`.
         let _ = fs::remove_file(self.xdg_runtime_dir.join(&session.wayland_display));
         let xwayland = format!("{}-xwayland", session.wayland_display);
         let _ = fs::remove_file(self.xdg_runtime_dir.join(&xwayland));
@@ -360,7 +355,9 @@ impl<R: ProcessRunner> Supervisor<R> {
         Ok(removed)
     }
 
-    pub fn reconcile(&self) -> Result<bool, SupervisorError> {
+    /// Marks sessions whose processes died as stopped and returns their names
+    /// so the caller can tear down the store-owned state of each one.
+    pub fn reconcile(&self) -> Result<Vec<String>, SupervisorError> {
         let runner = &self.runner;
         let mut registry = self
             .registry
@@ -372,7 +369,7 @@ impl<R: ProcessRunner> Supervisor<R> {
             .filter(|session| session.status == SessionStatus::Running)
             .map(|session| session.name)
             .collect();
-        let changed = registry.reconcile(|pid| runner.is_alive(pid))?;
+        registry.reconcile(|pid| runner.is_alive(pid))?;
         let stopped: Vec<String> = running_before
             .into_iter()
             .filter(|name| {
@@ -382,13 +379,10 @@ impl<R: ProcessRunner> Supervisor<R> {
             })
             .collect();
         drop(registry);
-        for name in stopped {
-            let _ = fs::remove_file(self.runtime_root.join(&name).join(X_DISPLAY_FILE));
-            let _ = fs::remove_dir_all(self.blob_root().join(&name));
-            let _ = fs::remove_dir_all(self.drop_root().join(&name));
-            let _ = fs::remove_dir_all(self.drop_staging_root().join(name));
+        for name in &stopped {
+            let _ = fs::remove_file(self.runtime_root.join(name).join(X_DISPLAY_FILE));
         }
-        Ok(changed)
+        Ok(stopped)
     }
 
     fn spawn(&self, spec: ProcessSpec) -> Result<u32, SupervisorError> {
@@ -1047,26 +1041,14 @@ mod tests {
         supervisor.start(&app(), Some("work")).await.unwrap();
         let blob_dir = supervisor.blob_root().join("work");
         fs::create_dir_all(&blob_dir).unwrap();
-        fs::write(blob_dir.join("stale-blob"), b"old").unwrap();
-        let staging_dir = supervisor.drop_staging_root().join("work");
-        fs::create_dir_all(&staging_dir).unwrap();
-        fs::write(staging_dir.join("partial.part"), b"partial").unwrap();
+        fs::write(blob_dir.join("store-owned"), b"kept").unwrap();
 
         let removed = supervisor.kill("work").await.unwrap();
         assert_eq!(removed.name, "work");
         assert!(supervisor.registry.lock().unwrap().get("work").is_none());
         assert!(
-            !blob_dir.exists(),
-            "killing a session must discard its blob namespace before the name can be reused"
-        );
-        assert!(
-            !staging_dir.exists(),
-            "killing a session must discard partial file uploads before the name can be reused"
-        );
-        supervisor.start(&app(), Some("work")).await.unwrap();
-        assert!(
-            !blob_dir.exists(),
-            "recreating the same session name must not resurrect stale blob data"
+            blob_dir.join("store-owned").exists(),
+            "store-owned directories are torn down by the stores, not the supervisor"
         );
         assert_eq!(
             runner.state.lock().unwrap().terminated,
@@ -1100,22 +1082,15 @@ mod tests {
             .unwrap();
         let blob_dir = supervisor.blob_root().join("work");
         fs::create_dir_all(&blob_dir).unwrap();
-        fs::write(blob_dir.join("stale-blob"), b"old").unwrap();
-        let staging_dir = supervisor.drop_staging_root().join("work");
-        fs::create_dir_all(&staging_dir).unwrap();
-        fs::write(staging_dir.join("partial.part"), b"partial").unwrap();
+        fs::write(blob_dir.join("store-owned"), b"kept").unwrap();
 
-        assert!(supervisor.reconcile().unwrap());
+        assert_eq!(supervisor.reconcile().unwrap(), ["work"]);
         let registry = supervisor.registry.lock().unwrap();
         assert_eq!(registry.get("work").unwrap().status, SessionStatus::Stopped);
         assert_eq!(registry.get("work").unwrap().client_count, 0);
         assert!(
-            !blob_dir.exists(),
-            "crash reconciliation must remove stale blob namespaces"
-        );
-        assert!(
-            !staging_dir.exists(),
-            "crash reconciliation must remove stale partial file uploads"
+            blob_dir.join("store-owned").exists(),
+            "reconcile reports stopped sessions; the stores tear down their own state"
         );
     }
 }
