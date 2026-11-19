@@ -652,6 +652,87 @@ class AppViewModelReconnectTest {
         }
 
     @Test
+    fun `a connection that upgrades then drops does not reset the retry budget`() =
+        runTest {
+            viewModel.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            // Every client upgrades, then drops before any call succeeds.
+            repeat(6) { i ->
+                clients.last().responseFor = { error("no round trip") }
+                clients.last().emit(ConnectionState.Connected)
+                testScheduler.runCurrent()
+                clients.last().emit(ConnectionState.Failed("flap $i"))
+                testScheduler.advanceUntilIdle()
+            }
+            assertEquals(6, clients.size)
+            testScheduler.advanceTimeBy(60_000)
+            testScheduler.runCurrent()
+            assertEquals(6, clients.size)
+        }
+
+    @Test
+    fun `no retry is attempted while the app is stopped`() =
+        runTest {
+            viewModel.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            viewModel.onEvent(AppEvent.AppStopped)
+            clients.last().emit(ConnectionState.Failed("down"))
+            testScheduler.advanceTimeBy(60_000)
+            testScheduler.runCurrent()
+            assertEquals(1, clients.size)
+        }
+
+    @Test
+    fun `a pending retry is cancelled on stop`() =
+        runTest {
+            viewModel.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            clients.last().emit(ConnectionState.Failed("down"))
+            testScheduler.runCurrent()
+            viewModel.onEvent(AppEvent.AppStopped)
+            testScheduler.advanceTimeBy(60_000)
+            testScheduler.runCurrent()
+            assertEquals(1, clients.size)
+        }
+
+    @Test
+    fun `returning to the foreground retries a failed connection with a fresh budget`() =
+        runTest {
+            viewModel.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            repeat(6) { i ->
+                clients.last().emit(ConnectionState.Failed("down $i"))
+                testScheduler.advanceUntilIdle()
+            }
+            assertEquals(6, clients.size)
+            viewModel.onEvent(AppEvent.AppStarted)
+            testScheduler.runCurrent()
+            assertEquals(7, clients.size)
+            // Budget is fresh: the new client gets retried again.
+            clients.last().emit(ConnectionState.Failed("still down"))
+            testScheduler.advanceTimeBy(1_000)
+            testScheduler.runCurrent()
+            assertEquals(8, clients.size)
+        }
+
+    @Test
+    fun `starting while connected or unauthorized does not reconnect`() =
+        runTest {
+            viewModel.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            clients.last().emit(ConnectionState.Connected)
+            testScheduler.advanceUntilIdle()
+            viewModel.onEvent(AppEvent.AppStarted)
+            testScheduler.runCurrent()
+            assertEquals(1, clients.size)
+            clients.last().emit(ConnectionState.Unauthorized)
+            testScheduler.runCurrent()
+            viewModel.onEvent(AppEvent.AppStarted)
+            testScheduler.runCurrent()
+            assertEquals(1, clients.size)
+        }
+
+    @Test
     fun `a retry keeps the attached session`() =
         runTest {
             viewModel.onEvent(AppEvent.Paired(testPairing))

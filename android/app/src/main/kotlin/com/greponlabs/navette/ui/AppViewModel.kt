@@ -157,6 +157,15 @@ sealed interface AppEvent {
 
     data object Refresh : AppEvent
 
+    /**
+     * The app left the foreground. Automatic retries pause: with the network
+     * restricted behind the keyguard they would burn the whole budget unseen.
+     */
+    data object AppStopped : AppEvent
+
+    /** The app is visible again. A failed connection is retried with a fresh budget. */
+    data object AppStarted : AppEvent
+
     data class RunApp(val appId: String) : AppEvent
 
     data class AttachSession(val session: String) : AppEvent
@@ -227,6 +236,7 @@ class AppViewModel(
     // wherever the connection is deliberately replaced.
     private var retryJob: Job? = null
     private var consecutiveFailures = 0
+    private var appStopped = false
 
     // Guards against two refresh() calls overlapping -- e.g. a manual
     // Refresh while the post-Connect refresh is still in flight -- where
@@ -270,6 +280,8 @@ class AppViewModel(
             AppEvent.WakeActive -> wakeActive()
             AppEvent.Reconnect -> reconnect()
             AppEvent.Refresh -> refresh()
+            AppEvent.AppStopped -> onAppStopped()
+            AppEvent.AppStarted -> onAppStarted()
             is AppEvent.RunApp -> runApp(event.appId)
             is AppEvent.AttachSession -> attachSession(event.session)
             AppEvent.LeaveSession -> leaveSession()
@@ -513,7 +525,10 @@ class AppViewModel(
                     _state.update { it.copy(connection = connectionState) }
                     when (connectionState) {
                         is ConnectionState.Connected -> {
-                            consecutiveFailures = 0
+                            // The failure count is NOT reset here: an upgrade
+                            // that is closed straight away (proxy, crash loop)
+                            // must keep consuming the budget. refresh() resets
+                            // it after a call actually round-trips.
                             // A wake verdict is advice about an outage that is
                             // over; recovery without a Retry tap (automatic
                             // retry) must not leave it on the next failure.
@@ -540,6 +555,19 @@ class AppViewModel(
 
     private var retryNotice: String? = null
 
+    private fun onAppStopped() {
+        appStopped = true
+        retryJob?.cancel()
+    }
+
+    private fun onAppStarted() {
+        appStopped = false
+        val pairing = _state.value.pairing ?: return
+        if (_state.value.connection !is ConnectionState.Failed) return
+        consecutiveFailures = 0
+        startConnection(pairing)
+    }
+
     private fun onConnectionFailed(pairing: Pairing, reason: String) {
         consecutiveFailures += 1
         val failures = consecutiveFailures
@@ -547,7 +575,7 @@ class AppViewModel(
             retryNotice = reason
             _state.update { it.copy(snackbarMessage = reason) }
         }
-        if (!ControlReconnectPolicy.shouldRetry(failures)) return
+        if (appStopped || !ControlReconnectPolicy.shouldRetry(failures)) return
         retryJob?.cancel()
         retryJob =
             viewModelScope.launch {
@@ -585,6 +613,9 @@ class AppViewModel(
                             apps.await() to sessions.await()
                         }
                     val firstError = appsResponse.errorOrNull() ?: sessionsResponse.errorOrNull()
+                    // A control round trip succeeded: the connection is
+                    // genuinely healthy, so the retry budget restarts.
+                    if (firstError == null && client === current) consecutiveFailures = 0
                     _state.update {
                         it.copy(
                             apps = appsResponse.appsOrNull() ?: it.apps,

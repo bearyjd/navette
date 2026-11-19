@@ -4,6 +4,8 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -29,6 +31,8 @@ fun NavetteApp(
     viewModel: AppViewModel = viewModel(factory = AppViewModel.factory(LocalContext.current)),
 ) {
     val state by viewModel.state.collectAsState()
+    LifecycleEventEffect(Lifecycle.Event.ON_STOP) { viewModel.onEvent(AppEvent.AppStopped) }
+    LifecycleEventEffect(Lifecycle.Event.ON_START) { viewModel.onEvent(AppEvent.AppStarted) }
     val activeSession = state.activeSession
     val pairing = state.pairing
 
