@@ -1135,7 +1135,10 @@ mod tests {
         let result = store.deactivate("work");
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(matches!(result, Err(FileTransferError::Io(_))));
-        assert!(!staging.exists(), "staging must be removed despite drop failure");
+        assert!(
+            !staging.exists(),
+            "staging must be removed despite drop failure"
+        );
     }
 
     fn request(name: &str, size: u64) -> FilePreflight {
