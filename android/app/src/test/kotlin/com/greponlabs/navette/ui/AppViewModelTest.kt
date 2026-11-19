@@ -704,4 +704,37 @@ class AppViewModelReconnectTest {
             testScheduler.advanceUntilIdle()
             assertEquals(null, viewModel.state.value.snackbarMessage)
         }
+
+    @Test
+    fun `a call failing because the connection just dropped does not show a snackbar`() =
+        runTest {
+            viewModel.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            val first = clients.last()
+            first.responseFor = {
+                // The socket dies under the in-flight refresh: the client goes
+                // Failed and fails its pending call in the same breath.
+                first.emit(ConnectionState.Failed("socket closed"))
+                throw java.io.IOException("socket closed")
+            }
+            first.emit(ConnectionState.Connected)
+            testScheduler.runCurrent()
+
+            // First failure: only the reconnect policy may decide to show it.
+            assertEquals(null, viewModel.state.value.snackbarMessage)
+        }
+
+    @Test
+    fun `a transport error from a replaced client is dropped`() =
+        runTest {
+            viewModel.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            val old = clients.last()
+            old.responseFor = { throw java.io.IOException("old socket closed") }
+            old.emit(ConnectionState.Connected)
+            viewModel.onEvent(AppEvent.Reconnect)
+            testScheduler.advanceUntilIdle()
+
+            assertEquals(null, viewModel.state.value.snackbarMessage)
+        }
 }

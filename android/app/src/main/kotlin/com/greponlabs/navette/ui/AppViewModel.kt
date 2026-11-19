@@ -514,6 +514,11 @@ class AppViewModel(
                     when (connectionState) {
                         is ConnectionState.Connected -> {
                             consecutiveFailures = 0
+                            // A wake verdict is advice about an outage that is
+                            // over; recovery without a Retry tap (automatic
+                            // retry) must not leave it on the next failure.
+                            wakeJob?.cancel()
+                            _state.update { it.copy(wake = WakeUiState.Idle) }
                             // A retry notice describes an outage that is over;
                             // leaving it would show a stale failure on the
                             // drawer right after the reconnect worked. Only
@@ -551,6 +556,21 @@ class AppViewModel(
             }
     }
 
+    /**
+     * Shows a failed call's message only while [current] is still the live,
+     * connected client. A client that just dropped fails its pending calls in
+     * the same breath as going Failed, and a replaced client's stragglers are
+     * stale: surfacing either would show an outage on the first failure, which
+     * is [ControlReconnectPolicy]'s decision alone.
+     */
+    private fun reportCallError(current: NavetteApi, message: String) {
+        if (client !== current || current.connectionState.value !is ConnectionState.Connected) {
+            Log.d(TAG, "dropping transport error from a dropped client: $message")
+            return
+        }
+        _state.update { it.copy(snackbarMessage = message) }
+    }
+
     private fun refresh() {
         val current = client ?: return
         refreshJob?.cancel()
@@ -577,9 +597,8 @@ class AppViewModel(
                 } catch (error: CancellationException) {
                     throw error
                 } catch (error: Exception) {
-                    _state.update {
-                        it.copy(isLoading = false, snackbarMessage = error.message ?: "refresh failed")
-                    }
+                    _state.update { it.copy(isLoading = false) }
+                    reportCallError(current, error.message ?: "refresh failed")
                 }
             }
     }
@@ -598,7 +617,7 @@ class AppViewModel(
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
-                _state.update { it.copy(snackbarMessage = error.message ?: "run failed") }
+                reportCallError(current, error.message ?: "run failed")
             }
         }
     }
@@ -622,7 +641,7 @@ class AppViewModel(
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
-                _state.update { it.copy(snackbarMessage = error.message ?: "attach failed") }
+                reportCallError(current, error.message ?: "attach failed")
             }
         }
     }

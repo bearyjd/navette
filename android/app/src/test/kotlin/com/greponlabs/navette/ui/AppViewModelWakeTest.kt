@@ -168,6 +168,21 @@ class AppViewModelWakeTest {
         }
 
     @Test
+    fun `automatic recovery clears a stale wake verdict`() =
+        runTest {
+            val vm = pairSleeperAndRelay(FakeWakeTransport(WakeResult.Sent))
+            vm.onEvent(AppEvent.WakeActive)
+            testScheduler.advanceUntilIdle()
+            assertEquals(WakeUiState.Sent("nas:9417"), vm.state.value.wake)
+
+            // The host booted and an automatic retry connected: no Retry tap.
+            fake.emit(ConnectionState.Connected)
+            testScheduler.advanceUntilIdle()
+
+            assertEquals(WakeUiState.Idle, vm.state.value.wake)
+        }
+
+    @Test
     fun `clearing the wake target removes the relay from the failed host`() =
         runTest {
             val vm = pairSleeperAndRelay(FakeWakeTransport())
