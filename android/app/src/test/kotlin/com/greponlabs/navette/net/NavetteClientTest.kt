@@ -98,4 +98,21 @@ class NavetteClientTest {
             fileTransferCollectionUrl("ws://[fd7a:115c:a1e0::1]:9417/v1/sessions/work/media"),
         )
     }
+
+    @Test
+    fun `a peer-initiated close is a failure so it is retried and shown`() {
+        val state = stateAfterClose(closedByClient = false, reason = "bye")
+        assertEquals(ConnectionState.Failed("connection closed by peer: bye"), state)
+    }
+
+    @Test
+    fun `a peer close with no reason still has a message`() {
+        val state = stateAfterClose(closedByClient = false, reason = "")
+        assertEquals(ConnectionState.Failed("connection closed by peer"), state)
+    }
+
+    @Test
+    fun `a close the client asked for stays Disconnected`() {
+        assertEquals(ConnectionState.Disconnected, stateAfterClose(closedByClient = true, reason = "client closing"))
+    }
 }

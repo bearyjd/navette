@@ -1,6 +1,7 @@
 package com.greponlabs.navette.ui.connect
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -12,9 +13,12 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -96,6 +100,38 @@ fun ConnectScreen(
     wake: WakeUiState = WakeUiState.Idle,
     wakeViaLabel: String? = null,
     onWake: () -> Unit = {},
+    snackbarMessage: String? = null,
+    onSnackbarDismissed: (shown: String) -> Unit = {},
+    modifier: Modifier = Modifier,
+) {
+    // The retry notice has to surface here: a failed connection renders this
+    // screen, not the drawer, so a message left in state would go unseen.
+    val snackbarHostState = remember { SnackbarHostState() }
+    LaunchedEffect(snackbarMessage) {
+        if (snackbarMessage != null) {
+            snackbarHostState.showSnackbar(snackbarMessage)
+            onSnackbarDismissed(snackbarMessage)
+        }
+    }
+    Box(modifier = modifier.fillMaxSize()) {
+        ConnectContent(
+            connection = connection, onPaired = onPaired, onRetry = onRetry, onBack = onBack,
+            onManageHosts = onManageHosts, wake = wake, wakeViaLabel = wakeViaLabel, onWake = onWake,
+        )
+        SnackbarHost(snackbarHostState, modifier = Modifier.align(Alignment.BottomCenter))
+    }
+}
+
+@Composable
+private fun ConnectContent(
+    connection: ConnectionState,
+    onPaired: (Pairing) -> Unit,
+    onRetry: () -> Unit,
+    onBack: (() -> Unit)?,
+    onManageHosts: (() -> Unit)?,
+    wake: WakeUiState,
+    wakeViaLabel: String?,
+    onWake: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current

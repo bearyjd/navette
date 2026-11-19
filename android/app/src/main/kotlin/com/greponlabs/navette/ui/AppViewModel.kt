@@ -514,6 +514,15 @@ class AppViewModel(
                     when (connectionState) {
                         is ConnectionState.Connected -> {
                             consecutiveFailures = 0
+                            // A retry notice describes an outage that is over;
+                            // leaving it would show a stale failure on the
+                            // drawer right after the reconnect worked. Only
+                            // that notice is cleared, not other messages.
+                            val stale = retryNotice
+                            retryNotice = null
+                            if (stale != null) {
+                                _state.update { if (it.snackbarMessage == stale) it.copy(snackbarMessage = null) else it }
+                            }
                             refresh()
                         }
                         is ConnectionState.Failed -> onConnectionFailed(pairing, connectionState.reason)
@@ -524,10 +533,13 @@ class AppViewModel(
         newClient.connect()
     }
 
+    private var retryNotice: String? = null
+
     private fun onConnectionFailed(pairing: Pairing, reason: String) {
         consecutiveFailures += 1
         val failures = consecutiveFailures
         if (ControlReconnectPolicy.shouldNotify(failures)) {
+            retryNotice = reason
             _state.update { it.copy(snackbarMessage = reason) }
         }
         if (!ControlReconnectPolicy.shouldRetry(failures)) return

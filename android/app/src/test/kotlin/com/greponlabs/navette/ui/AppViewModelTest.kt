@@ -667,4 +667,41 @@ class AppViewModelReconnectTest {
             testScheduler.runCurrent()
             assertEquals("main", viewModel.state.value.activeSession)
         }
+
+    @Test
+    fun `a retry notice is cleared when the connection recovers`() =
+        runTest {
+            viewModel.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            clients.last().emit(ConnectionState.Failed("down 1"))
+            testScheduler.advanceTimeBy(1_000)
+            testScheduler.runCurrent()
+            clients.last().emit(ConnectionState.Failed("down 2"))
+            testScheduler.runCurrent()
+            assertEquals("down 2", viewModel.state.value.snackbarMessage)
+
+            testScheduler.advanceTimeBy(2_000)
+            testScheduler.runCurrent()
+            clients.last().emit(ConnectionState.Connected)
+            testScheduler.advanceUntilIdle()
+            assertEquals(null, viewModel.state.value.snackbarMessage)
+        }
+
+    @Test
+    fun `recovery after the retry notice was dismissed leaves no message`() =
+        runTest {
+            viewModel.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            clients.last().emit(ConnectionState.Failed("down 1"))
+            testScheduler.advanceTimeBy(1_000)
+            testScheduler.runCurrent()
+            clients.last().emit(ConnectionState.Failed("down 2"))
+            testScheduler.runCurrent()
+            viewModel.onEvent(AppEvent.DismissSnackbar("down 2"))
+            testScheduler.advanceTimeBy(2_000)
+            testScheduler.runCurrent()
+            clients.last().emit(ConnectionState.Connected)
+            testScheduler.advanceUntilIdle()
+            assertEquals(null, viewModel.state.value.snackbarMessage)
+        }
 }

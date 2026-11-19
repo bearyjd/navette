@@ -102,6 +102,8 @@ fun NavetteApp(
                 onRetry = { viewModel.onEvent(AppEvent.Reconnect) },
                 onBack = if (state.addingHost) ({ viewModel.onEvent(AppEvent.CancelAddHost) }) else null,
                 onManageHosts = if (state.registry.hosts.isNotEmpty()) ({ viewModel.onEvent(AppEvent.ShowHosts) }) else null,
+                snackbarMessage = state.snackbarMessage,
+                onSnackbarDismissed = { shown -> viewModel.onEvent(AppEvent.DismissSnackbar(shown)) },
                 wake = state.wake,
                 wakeViaLabel = state.wakeRoute?.via?.endpointLabel,
                 onWake = { viewModel.onEvent(AppEvent.WakeActive) },

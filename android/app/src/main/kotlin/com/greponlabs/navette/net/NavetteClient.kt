@@ -134,7 +134,10 @@ class NavetteClient(private val webSocketUrl: String, private val token: String)
         }
     }
 
+    @Volatile private var closedByClient = false
+
     override fun close() {
+        closedByClient = true
         webSocket?.close(NORMAL_CLOSURE, "client closing")
         webSocket = null
         _connectionState.value = ConnectionState.Disconnected
@@ -181,8 +184,14 @@ class NavetteClient(private val webSocketUrl: String, private val token: String)
                 failAllPending(t)
             }
 
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                // Complete the close handshake; otherwise the peer's close
+                // frame is never acknowledged and onClosed waits on a timeout.
+                webSocket.close(NORMAL_CLOSURE, "peer closing")
+            }
+
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                _connectionState.value = ConnectionState.Disconnected
+                _connectionState.value = stateAfterClose(closedByClient, reason)
                 failAllPending(IllegalStateException("connection closed: $reason"))
             }
         }
@@ -192,6 +201,19 @@ class NavetteClient(private val webSocketUrl: String, private val token: String)
         const val CALL_TIMEOUT_MS = 15_000L
     }
 }
+
+/**
+ * What a finished close means. A close the client asked for is terminal
+ * [ConnectionState.Disconnected]; one the peer or a proxy initiated is a
+ * [ConnectionState.Failed], so it is retried and shown rather than leaving
+ * the user on a screen with no reason and no Retry.
+ */
+internal fun stateAfterClose(closedByClient: Boolean, reason: String): ConnectionState =
+    if (closedByClient) {
+        ConnectionState.Disconnected
+    } else {
+        ConnectionState.Failed(if (reason.isBlank()) "connection closed by peer" else "connection closed by peer: $reason")
+    }
 
 /**
  * Bracket-wraps a bare IPv6 literal (e.g. a Tailscale address like
