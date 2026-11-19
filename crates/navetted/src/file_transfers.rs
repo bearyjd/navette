@@ -255,9 +255,12 @@ impl FileTransferStore {
         let mut entries = self.lock_entries()?;
         entries.retain(|(entry_session, _), _| entry_session != session);
         drop(entries);
-        remove_tree(&self.drop_dir(session))?;
-        remove_tree(&self.staging_dir(session))?;
+        // Attempt both removals: a guest-made undeletable entry in the drop dir
+        // must not leave the daemon-private staging data behind.
+        let drop_result = remove_tree(&self.drop_dir(session));
+        let staging_result = remove_tree(&self.staging_dir(session));
         drop(lifecycle);
+        drop_result.and(staging_result)?;
         Ok(())
     }
 
@@ -1106,6 +1109,33 @@ mod tests {
         );
         store.activate("work").unwrap();
         store
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deactivate_removes_staging_even_when_drop_dir_removal_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let preflight = store.preflight("work", request("a.pdf", 4)).unwrap();
+        let mut upload = store.begin_upload("work", &preflight.transfer_id).unwrap();
+        upload.write_chunk(b"data").unwrap();
+        upload.finish().unwrap();
+        let locked = store.drop_dir("work").join("d");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("f"), b"x").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&locked).is_ok() {
+            // Running as root: permissions are not enforced, nothing to prove.
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let staging = store.staging_dir("work");
+        assert!(staging.exists());
+        let result = store.deactivate("work");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(result, Err(FileTransferError::Io(_))));
+        assert!(!staging.exists(), "staging must be removed despite drop failure");
     }
 
     fn request(name: &str, size: u64) -> FilePreflight {
