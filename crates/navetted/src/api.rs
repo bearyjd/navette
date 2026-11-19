@@ -247,6 +247,28 @@ impl<R: ProcessRunner> ApiState<R> {
         }
     }
 
+    /// Startup sweep: tears down the store state of every registry session
+    /// that is not Running. Idempotent and independent of what
+    /// `Supervisor::reconcile` returned, so a boot that failed after reconcile
+    /// persisted `Stopped` (bind or token error) is still cleaned next boot.
+    pub fn teardown_inactive_session_stores(&self) {
+        let names: Vec<String> = match self.supervisor.registry().lock() {
+            Ok(registry) => registry
+                .list()
+                .into_iter()
+                .filter(|session| session.status != navette_protocol::SessionStatus::Running)
+                .map(|session| session.name)
+                .collect(),
+            Err(_) => {
+                tracing::warn!("registry lock poisoned; skipping startup store teardown");
+                return;
+            }
+        };
+        for name in &names {
+            self.teardown_session_stores(name);
+        }
+    }
+
     /// Serializes destructive lifecycle transitions for the same session
     /// name. In particular, a successful old Kill cannot deactivate blobs or
     /// stop a bridge after a concurrent Run has recreated that name.
@@ -2108,6 +2130,36 @@ mod tests {
         assert!(!blob_dir.exists(), "blob namespace must be removed");
         assert!(!drop_dir.exists(), "drop directory must be removed");
         assert!(!staging_dir.exists(), "partial uploads must be removed");
+    }
+
+    #[test]
+    fn startup_sweep_tears_down_already_stopped_sessions_only() {
+        let temp = TempDir::new().unwrap();
+        let state = test_state(&temp);
+        add_running_session(&state, "dead");
+        add_running_session(&state, "live");
+        // Make only "dead" stopped, as a prior boot's reconcile would have.
+        {
+            let mut registry = state.supervisor.registry().lock().unwrap();
+            let mut dead = registry.get("dead").unwrap().clone();
+            dead.status = SessionStatus::Stopped;
+            registry.replace(dead).unwrap();
+        }
+        let dead_dirs = [
+            state.supervisor.blob_root().join("dead"),
+            state.supervisor.drop_root().join("dead"),
+        ];
+        let live_drop = state.supervisor.drop_root().join("live");
+        for dir in dead_dirs.iter().chain([&live_drop]) {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        state.teardown_inactive_session_stores();
+
+        for dir in &dead_dirs {
+            assert!(!dir.exists(), "stopped session state must be removed");
+        }
+        assert!(live_drop.exists(), "running session state must be kept");
     }
 
     #[test]
