@@ -36,6 +36,7 @@ import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -177,8 +178,10 @@ sealed interface AppEvent {
  * Owns the active [NavetteApi] control connection, the encrypted host
  * registry, and which session (if any) is currently attached. Selecting a
  * host persists that active choice, cancels collectors for the old client,
- * closes it, and clears the old session before the replacement connects. No
- * reconnect/backoff beyond [AppEvent.Reconnect].
+ * closes it, and clears the old session before the replacement connects. A
+ * failed control channel is retried automatically per [ControlReconnectPolicy]
+ * (never when the token is rejected); [AppEvent.Reconnect] restarts that
+ * budget.
  *
  * Media state is deliberately not here: `SessionScreen` owns its own
  * `MediaClient` and decoder, and this ViewModel stays the control-channel
@@ -218,6 +221,12 @@ class AppViewModel(
     // Failed state) leaks a collector that sits idle for the rest of this
     // ViewModel's lifetime instead of stopping when its client is replaced.
     private var connectionJob: Job? = null
+
+    // The pending backoff wait before the next automatic retry, and the run of
+    // failures since the last Connected (or fresh pairing). Both are reset
+    // wherever the connection is deliberately replaced.
+    private var retryJob: Job? = null
+    private var consecutiveFailures = 0
 
     // Guards against two refresh() calls overlapping -- e.g. a manual
     // Refresh while the post-Connect refresh is still in flight -- where
@@ -381,6 +390,7 @@ class AppViewModel(
             return
         }
         connectionJob?.cancel()
+        retryJob?.cancel()
         refreshJob?.cancel()
         wakeJob?.cancel()
         client?.close()
@@ -470,10 +480,9 @@ class AppViewModel(
     }
 
     private fun connectWithPairing(pairing: Pairing) {
-        connectionJob?.cancel()
         refreshJob?.cancel()
         wakeJob?.cancel()
-        client?.close()
+        consecutiveFailures = 0
         // Every pairing change funnels through here (init, pair, reconnect,
         // selectHost), so this is the one place the image cache needs clearing
         // for host A's thumbnails never to appear on host B's drawer.
@@ -482,6 +491,19 @@ class AppViewModel(
         // the connection being replaced, nor carry a wake verdict that was
         // advice for the previous attempt.
         _state.update { it.copy(pairing = pairing, activeSession = null, showingHosts = false, addingHost = false, wake = WakeUiState.Idle) }
+        startConnection(pairing)
+    }
+
+    /**
+     * Replaces the current client with a fresh one for [pairing]. Shared by a
+     * deliberate (re)connect and the automatic retry, which differ only in
+     * what they reset first: a retry keeps the session screen and the failure
+     * count, since it is the same connection attempt continuing.
+     */
+    private fun startConnection(pairing: Pairing) {
+        connectionJob?.cancel()
+        retryJob?.cancel()
+        client?.close()
         val newClient = clientFactory(pairing)
         client = newClient
 
@@ -489,15 +511,32 @@ class AppViewModel(
             viewModelScope.launch {
                 newClient.connectionState.collect { connectionState ->
                     _state.update { it.copy(connection = connectionState) }
-                    if (connectionState is ConnectionState.Connected) {
-                        refresh()
-                    }
-                    if (connectionState is ConnectionState.Failed) {
-                        _state.update { it.copy(snackbarMessage = connectionState.reason) }
+                    when (connectionState) {
+                        is ConnectionState.Connected -> {
+                            consecutiveFailures = 0
+                            refresh()
+                        }
+                        is ConnectionState.Failed -> onConnectionFailed(pairing, connectionState.reason)
+                        else -> Unit
                     }
                 }
             }
         newClient.connect()
+    }
+
+    private fun onConnectionFailed(pairing: Pairing, reason: String) {
+        consecutiveFailures += 1
+        val failures = consecutiveFailures
+        if (ControlReconnectPolicy.shouldNotify(failures)) {
+            _state.update { it.copy(snackbarMessage = reason) }
+        }
+        if (!ControlReconnectPolicy.shouldRetry(failures)) return
+        retryJob?.cancel()
+        retryJob =
+            viewModelScope.launch {
+                delay(ControlReconnectPolicy.delayMs(failures))
+                startConnection(pairing)
+            }
     }
 
     private fun refresh() {
