@@ -36,6 +36,7 @@ import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -156,6 +157,15 @@ sealed interface AppEvent {
 
     data object Refresh : AppEvent
 
+    /**
+     * The app left the foreground. Automatic retries pause: with the network
+     * restricted behind the keyguard they would burn the whole budget unseen.
+     */
+    data object AppStopped : AppEvent
+
+    /** The app is visible again. A failed connection is retried with a fresh budget. */
+    data object AppStarted : AppEvent
+
     data class RunApp(val appId: String) : AppEvent
 
     data class AttachSession(val session: String) : AppEvent
@@ -177,8 +187,10 @@ sealed interface AppEvent {
  * Owns the active [NavetteApi] control connection, the encrypted host
  * registry, and which session (if any) is currently attached. Selecting a
  * host persists that active choice, cancels collectors for the old client,
- * closes it, and clears the old session before the replacement connects. No
- * reconnect/backoff beyond [AppEvent.Reconnect].
+ * closes it, and clears the old session before the replacement connects. A
+ * failed control channel is retried automatically per [ControlReconnectPolicy]
+ * (never when the token is rejected); [AppEvent.Reconnect] restarts that
+ * budget.
  *
  * Media state is deliberately not here: `SessionScreen` owns its own
  * `MediaClient` and decoder, and this ViewModel stays the control-channel
@@ -218,6 +230,13 @@ class AppViewModel(
     // Failed state) leaks a collector that sits idle for the rest of this
     // ViewModel's lifetime instead of stopping when its client is replaced.
     private var connectionJob: Job? = null
+
+    // The pending backoff wait before the next automatic retry, and the run of
+    // failures since the last Connected (or fresh pairing). Both are reset
+    // wherever the connection is deliberately replaced.
+    private var retryJob: Job? = null
+    private var consecutiveFailures = 0
+    private var appStopped = false
 
     // Guards against two refresh() calls overlapping -- e.g. a manual
     // Refresh while the post-Connect refresh is still in flight -- where
@@ -261,6 +280,8 @@ class AppViewModel(
             AppEvent.WakeActive -> wakeActive()
             AppEvent.Reconnect -> reconnect()
             AppEvent.Refresh -> refresh()
+            AppEvent.AppStopped -> onAppStopped()
+            AppEvent.AppStarted -> onAppStarted()
             is AppEvent.RunApp -> runApp(event.appId)
             is AppEvent.AttachSession -> attachSession(event.session)
             AppEvent.LeaveSession -> leaveSession()
@@ -381,6 +402,7 @@ class AppViewModel(
             return
         }
         connectionJob?.cancel()
+        retryJob?.cancel()
         refreshJob?.cancel()
         wakeJob?.cancel()
         client?.close()
@@ -470,10 +492,9 @@ class AppViewModel(
     }
 
     private fun connectWithPairing(pairing: Pairing) {
-        connectionJob?.cancel()
         refreshJob?.cancel()
         wakeJob?.cancel()
-        client?.close()
+        consecutiveFailures = 0
         // Every pairing change funnels through here (init, pair, reconnect,
         // selectHost), so this is the one place the image cache needs clearing
         // for host A's thumbnails never to appear on host B's drawer.
@@ -482,6 +503,19 @@ class AppViewModel(
         // the connection being replaced, nor carry a wake verdict that was
         // advice for the previous attempt.
         _state.update { it.copy(pairing = pairing, activeSession = null, showingHosts = false, addingHost = false, wake = WakeUiState.Idle) }
+        startConnection(pairing)
+    }
+
+    /**
+     * Replaces the current client with a fresh one for [pairing]. Shared by a
+     * deliberate (re)connect and the automatic retry, which differ only in
+     * what they reset first: a retry keeps the session screen and the failure
+     * count, since it is the same connection attempt continuing.
+     */
+    private fun startConnection(pairing: Pairing) {
+        connectionJob?.cancel()
+        retryJob?.cancel()
+        client?.close()
         val newClient = clientFactory(pairing)
         client = newClient
 
@@ -489,15 +523,80 @@ class AppViewModel(
             viewModelScope.launch {
                 newClient.connectionState.collect { connectionState ->
                     _state.update { it.copy(connection = connectionState) }
-                    if (connectionState is ConnectionState.Connected) {
-                        refresh()
-                    }
-                    if (connectionState is ConnectionState.Failed) {
-                        _state.update { it.copy(snackbarMessage = connectionState.reason) }
+                    when (connectionState) {
+                        is ConnectionState.Connected -> {
+                            // The failure count is NOT reset here: an upgrade
+                            // that is closed straight away (proxy, crash loop)
+                            // must keep consuming the budget. refresh() resets
+                            // it after a call actually round-trips.
+                            // A wake verdict is advice about an outage that is
+                            // over; recovery without a Retry tap (automatic
+                            // retry) must not leave it on the next failure.
+                            wakeJob?.cancel()
+                            _state.update { it.copy(wake = WakeUiState.Idle) }
+                            // A retry notice describes an outage that is over;
+                            // leaving it would show a stale failure on the
+                            // drawer right after the reconnect worked. Only
+                            // that notice is cleared, not other messages.
+                            val stale = retryNotice
+                            retryNotice = null
+                            if (stale != null) {
+                                _state.update { if (it.snackbarMessage == stale) it.copy(snackbarMessage = null) else it }
+                            }
+                            refresh()
+                        }
+                        is ConnectionState.Failed -> onConnectionFailed(pairing, connectionState.reason)
+                        else -> Unit
                     }
                 }
             }
         newClient.connect()
+    }
+
+    private var retryNotice: String? = null
+
+    private fun onAppStopped() {
+        appStopped = true
+        retryJob?.cancel()
+    }
+
+    private fun onAppStarted() {
+        appStopped = false
+        val pairing = _state.value.pairing ?: return
+        if (_state.value.connection !is ConnectionState.Failed) return
+        consecutiveFailures = 0
+        startConnection(pairing)
+    }
+
+    private fun onConnectionFailed(pairing: Pairing, reason: String) {
+        consecutiveFailures += 1
+        val failures = consecutiveFailures
+        if (ControlReconnectPolicy.shouldNotify(failures)) {
+            retryNotice = reason
+            _state.update { it.copy(snackbarMessage = reason) }
+        }
+        if (appStopped || !ControlReconnectPolicy.shouldRetry(failures)) return
+        retryJob?.cancel()
+        retryJob =
+            viewModelScope.launch {
+                delay(ControlReconnectPolicy.delayMs(failures))
+                startConnection(pairing)
+            }
+    }
+
+    /**
+     * Shows a failed call's message only while [current] is still the live,
+     * connected client. A client that just dropped fails its pending calls in
+     * the same breath as going Failed, and a replaced client's stragglers are
+     * stale: surfacing either would show an outage on the first failure, which
+     * is [ControlReconnectPolicy]'s decision alone.
+     */
+    private fun reportCallError(current: NavetteApi, message: String) {
+        if (client !== current || current.connectionState.value !is ConnectionState.Connected) {
+            Log.d(TAG, "dropping transport error from a dropped client: $message")
+            return
+        }
+        _state.update { it.copy(snackbarMessage = message) }
     }
 
     private fun refresh() {
@@ -514,6 +613,9 @@ class AppViewModel(
                             apps.await() to sessions.await()
                         }
                     val firstError = appsResponse.errorOrNull() ?: sessionsResponse.errorOrNull()
+                    // A control round trip succeeded: the connection is
+                    // genuinely healthy, so the retry budget restarts.
+                    if (firstError == null && client === current) consecutiveFailures = 0
                     _state.update {
                         it.copy(
                             apps = appsResponse.appsOrNull() ?: it.apps,
@@ -526,9 +628,8 @@ class AppViewModel(
                 } catch (error: CancellationException) {
                     throw error
                 } catch (error: Exception) {
-                    _state.update {
-                        it.copy(isLoading = false, snackbarMessage = error.message ?: "refresh failed")
-                    }
+                    _state.update { it.copy(isLoading = false) }
+                    reportCallError(current, error.message ?: "refresh failed")
                 }
             }
     }
@@ -547,7 +648,7 @@ class AppViewModel(
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
-                _state.update { it.copy(snackbarMessage = error.message ?: "run failed") }
+                reportCallError(current, error.message ?: "run failed")
             }
         }
     }
@@ -571,7 +672,7 @@ class AppViewModel(
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
-                _state.update { it.copy(snackbarMessage = error.message ?: "attach failed") }
+                reportCallError(current, error.message ?: "attach failed")
             }
         }
     }

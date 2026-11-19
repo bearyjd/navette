@@ -90,7 +90,7 @@ class AppViewModelTest {
             // would still reach state and flip it back to Failed.
             firstClient.emit(ConnectionState.Failed("stale, should be ignored"))
             testScheduler.advanceUntilIdle()
-            assertEquals(ConnectionState.Disconnected, vm.state.value.connection)
+            assertEquals(ConnectionState.Connecting, vm.state.value.connection)
         }
 
     @Test
@@ -201,7 +201,11 @@ class AppViewModelTest {
 
             vm.onEvent(AppEvent.Paired(testPairing))
             fake.emit(ConnectionState.Failed("connection refused"))
-            testScheduler.advanceUntilIdle()
+            // The snackbar only appears from the second consecutive failure.
+            testScheduler.advanceTimeBy(1_000)
+            testScheduler.runCurrent()
+            fake.emit(ConnectionState.Failed("connection refused"))
+            testScheduler.runCurrent()
 
             assertEquals("connection refused", vm.state.value.snackbarMessage)
         }
@@ -298,12 +302,17 @@ class AppViewModelTest {
     fun `dismissing an older snackbar message does not clear a newer one`() =
         runTest {
             viewModel.onEvent(AppEvent.Paired(testPairing))
+            fake.emit(ConnectionState.Failed("warm-up"))
+            testScheduler.advanceTimeBy(1_000)
+            testScheduler.runCurrent()
             fake.emit(ConnectionState.Failed("first error"))
-            testScheduler.advanceUntilIdle()
+            testScheduler.runCurrent()
             assertEquals("first error", viewModel.state.value.snackbarMessage)
 
+            testScheduler.advanceTimeBy(2_000)
+            testScheduler.runCurrent()
             fake.emit(ConnectionState.Failed("second error"))
-            testScheduler.advanceUntilIdle()
+            testScheduler.runCurrent()
             assertEquals("second error", viewModel.state.value.snackbarMessage)
 
             // Dismissing the FIRST (stale) message must not clear the second.
@@ -529,5 +538,284 @@ class AppViewModelTest {
             vm.onEvent(AppEvent.ShowHosts)
             assertTrue(vm.state.value.showingHosts)
             assertEquals(1, vm.state.value.registry.hosts.size)
+        }
+}
+
+@OptIn(ExperimentalCoroutinesApi::class)
+class AppViewModelReconnectTest {
+    private lateinit var clients: MutableList<FakeNavetteApi>
+    private lateinit var viewModel: AppViewModel
+
+    @Before
+    fun setUp() {
+        Dispatchers.setMain(StandardTestDispatcher())
+        clients = mutableListOf()
+        viewModel =
+            AppViewModel(
+                pairingStore = FakePairingStore(),
+                clientFactory = { FakeNavetteApi().also(clients::add) },
+            )
+    }
+
+    @After
+    fun tearDown() {
+        Dispatchers.resetMain()
+    }
+
+    @Test
+    fun `a failure schedules a retry only after the backoff delay`() =
+        runTest {
+            viewModel.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            clients.last().emit(ConnectionState.Failed("down"))
+            testScheduler.runCurrent()
+            assertEquals(1, clients.size)
+
+            testScheduler.advanceTimeBy(999)
+            testScheduler.runCurrent()
+            assertEquals(1, clients.size)
+
+            testScheduler.advanceTimeBy(1)
+            testScheduler.runCurrent()
+            assertEquals(2, clients.size)
+            assertTrue(clients[0].closed)
+        }
+
+    @Test
+    fun `snackbar appears on the second failure, not the first`() =
+        runTest {
+            viewModel.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            clients.last().emit(ConnectionState.Failed("down 1"))
+            testScheduler.runCurrent()
+            assertEquals(null, viewModel.state.value.snackbarMessage)
+
+            testScheduler.advanceTimeBy(1_000)
+            testScheduler.runCurrent()
+            clients.last().emit(ConnectionState.Failed("down 2"))
+            testScheduler.runCurrent()
+            assertEquals("down 2", viewModel.state.value.snackbarMessage)
+        }
+
+    @Test
+    fun `gives up after five retries`() =
+        runTest {
+            viewModel.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            repeat(6) { i ->
+                clients.last().emit(ConnectionState.Failed("down $i"))
+                testScheduler.advanceUntilIdle()
+            }
+            // One initial client plus five retries; the sixth failure is final.
+            assertEquals(6, clients.size)
+            testScheduler.advanceTimeBy(60_000)
+            testScheduler.runCurrent()
+            assertEquals(6, clients.size)
+        }
+
+    @Test
+    fun `an unauthorized token is never retried`() =
+        runTest {
+            viewModel.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            clients.last().emit(ConnectionState.Unauthorized)
+            testScheduler.advanceUntilIdle()
+            assertEquals(1, clients.size)
+        }
+
+    @Test
+    fun `reconnecting refreshes apps and sessions and resets the failure count`() =
+        runTest {
+            viewModel.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            clients.last().emit(ConnectionState.Failed("down"))
+            testScheduler.advanceTimeBy(1_000)
+            testScheduler.runCurrent()
+            val retried = clients.last()
+            retried.responseFor = { command ->
+                when (command) {
+                    RequestCommand.ListApps -> Response(1, ResponseOutcome.Ok(ResponseResult.Apps(listOf(testApp))))
+                    RequestCommand.ListSessions ->
+                        Response(2, ResponseOutcome.Ok(ResponseResult.Sessions(listOf(testSession))))
+                    else -> error("unexpected command: $command")
+                }
+            }
+            retried.emit(ConnectionState.Connected)
+            testScheduler.advanceUntilIdle()
+            assertEquals(listOf(testApp), viewModel.state.value.apps)
+            assertEquals(listOf(testSession), viewModel.state.value.sessions)
+
+            // The count restarted: one new failure is again silent.
+            retried.emit(ConnectionState.Failed("blip"))
+            testScheduler.runCurrent()
+            assertEquals(null, viewModel.state.value.snackbarMessage)
+        }
+
+    @Test
+    fun `a connection that upgrades then drops does not reset the retry budget`() =
+        runTest {
+            viewModel.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            // Every client upgrades, then drops before any call succeeds.
+            repeat(6) { i ->
+                clients.last().responseFor = { error("no round trip") }
+                clients.last().emit(ConnectionState.Connected)
+                testScheduler.runCurrent()
+                clients.last().emit(ConnectionState.Failed("flap $i"))
+                testScheduler.advanceUntilIdle()
+            }
+            assertEquals(6, clients.size)
+            testScheduler.advanceTimeBy(60_000)
+            testScheduler.runCurrent()
+            assertEquals(6, clients.size)
+        }
+
+    @Test
+    fun `no retry is attempted while the app is stopped`() =
+        runTest {
+            viewModel.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            viewModel.onEvent(AppEvent.AppStopped)
+            clients.last().emit(ConnectionState.Failed("down"))
+            testScheduler.advanceTimeBy(60_000)
+            testScheduler.runCurrent()
+            assertEquals(1, clients.size)
+        }
+
+    @Test
+    fun `a pending retry is cancelled on stop`() =
+        runTest {
+            viewModel.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            clients.last().emit(ConnectionState.Failed("down"))
+            testScheduler.runCurrent()
+            viewModel.onEvent(AppEvent.AppStopped)
+            testScheduler.advanceTimeBy(60_000)
+            testScheduler.runCurrent()
+            assertEquals(1, clients.size)
+        }
+
+    @Test
+    fun `returning to the foreground retries a failed connection with a fresh budget`() =
+        runTest {
+            viewModel.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            repeat(6) { i ->
+                clients.last().emit(ConnectionState.Failed("down $i"))
+                testScheduler.advanceUntilIdle()
+            }
+            assertEquals(6, clients.size)
+            viewModel.onEvent(AppEvent.AppStarted)
+            testScheduler.runCurrent()
+            assertEquals(7, clients.size)
+            // Budget is fresh: the new client gets retried again.
+            clients.last().emit(ConnectionState.Failed("still down"))
+            testScheduler.advanceTimeBy(1_000)
+            testScheduler.runCurrent()
+            assertEquals(8, clients.size)
+        }
+
+    @Test
+    fun `starting while connected or unauthorized does not reconnect`() =
+        runTest {
+            viewModel.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            clients.last().emit(ConnectionState.Connected)
+            testScheduler.advanceUntilIdle()
+            viewModel.onEvent(AppEvent.AppStarted)
+            testScheduler.runCurrent()
+            assertEquals(1, clients.size)
+            clients.last().emit(ConnectionState.Unauthorized)
+            testScheduler.runCurrent()
+            viewModel.onEvent(AppEvent.AppStarted)
+            testScheduler.runCurrent()
+            assertEquals(1, clients.size)
+        }
+
+    @Test
+    fun `a retry keeps the attached session`() =
+        runTest {
+            viewModel.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            clients.last().emit(ConnectionState.Connected)
+            testScheduler.advanceUntilIdle()
+            viewModel.onEvent(AppEvent.AttachSession("main"))
+            testScheduler.advanceUntilIdle()
+            assertEquals("main", viewModel.state.value.activeSession)
+
+            clients.last().emit(ConnectionState.Failed("blip"))
+            testScheduler.advanceTimeBy(1_000)
+            testScheduler.runCurrent()
+            assertEquals("main", viewModel.state.value.activeSession)
+        }
+
+    @Test
+    fun `a retry notice is cleared when the connection recovers`() =
+        runTest {
+            viewModel.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            clients.last().emit(ConnectionState.Failed("down 1"))
+            testScheduler.advanceTimeBy(1_000)
+            testScheduler.runCurrent()
+            clients.last().emit(ConnectionState.Failed("down 2"))
+            testScheduler.runCurrent()
+            assertEquals("down 2", viewModel.state.value.snackbarMessage)
+
+            testScheduler.advanceTimeBy(2_000)
+            testScheduler.runCurrent()
+            clients.last().emit(ConnectionState.Connected)
+            testScheduler.advanceUntilIdle()
+            assertEquals(null, viewModel.state.value.snackbarMessage)
+        }
+
+    @Test
+    fun `recovery after the retry notice was dismissed leaves no message`() =
+        runTest {
+            viewModel.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            clients.last().emit(ConnectionState.Failed("down 1"))
+            testScheduler.advanceTimeBy(1_000)
+            testScheduler.runCurrent()
+            clients.last().emit(ConnectionState.Failed("down 2"))
+            testScheduler.runCurrent()
+            viewModel.onEvent(AppEvent.DismissSnackbar("down 2"))
+            testScheduler.advanceTimeBy(2_000)
+            testScheduler.runCurrent()
+            clients.last().emit(ConnectionState.Connected)
+            testScheduler.advanceUntilIdle()
+            assertEquals(null, viewModel.state.value.snackbarMessage)
+        }
+
+    @Test
+    fun `a call failing because the connection just dropped does not show a snackbar`() =
+        runTest {
+            viewModel.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            val first = clients.last()
+            first.responseFor = {
+                // The socket dies under the in-flight refresh: the client goes
+                // Failed and fails its pending call in the same breath.
+                first.emit(ConnectionState.Failed("socket closed"))
+                throw java.io.IOException("socket closed")
+            }
+            first.emit(ConnectionState.Connected)
+            testScheduler.runCurrent()
+
+            // First failure: only the reconnect policy may decide to show it.
+            assertEquals(null, viewModel.state.value.snackbarMessage)
+        }
+
+    @Test
+    fun `a transport error from a replaced client is dropped`() =
+        runTest {
+            viewModel.onEvent(AppEvent.Paired(testPairing))
+            testScheduler.runCurrent()
+            val old = clients.last()
+            old.responseFor = { throw java.io.IOException("old socket closed") }
+            old.emit(ConnectionState.Connected)
+            viewModel.onEvent(AppEvent.Reconnect)
+            testScheduler.advanceUntilIdle()
+
+            assertEquals(null, viewModel.state.value.snackbarMessage)
         }
 }

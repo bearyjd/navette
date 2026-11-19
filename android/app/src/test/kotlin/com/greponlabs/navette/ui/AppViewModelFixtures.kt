@@ -43,9 +43,14 @@ internal class FakeNavetteApi : NavetteApi {
         _connectionState.value = state
     }
 
+    var connectCount = 0
+        private set
+
+    // Like the real client, a fresh connect() leaves the Failed state behind;
+    // otherwise a retry onto this same fake would replay the old failure.
     override fun connect() {
-        // The test drives connection state directly via emit(); a real
-        // connect() would start the actual WebSocket handshake.
+        connectCount++
+        _connectionState.value = ConnectionState.Connecting
     }
 
     override suspend fun call(command: RequestCommand): Response {

@@ -66,9 +66,10 @@ interface NavetteApi {
  * dispatcher (in practice, `AppViewModel`'s `viewModelScope`, which defaults
  * to `Dispatchers.Main.immediate`) -- calling `connect()`/`call()`/`close()`
  * from more than one dispatcher concurrently is not supported. This is the
- * first slice, not the hardened version -- reconnection, backoff, and
- * multi-host management are explicitly out of scope here (see
- * android/README.md and this session's PR description).
+ * first slice, not the hardened version -- multi-host management is out of
+ * scope here. Reconnection and backoff live in `AppViewModel` (see
+ * `ControlReconnectPolicy`), which replaces a failed client with a fresh one
+ * rather than reusing this instance.
  */
 class NavetteClient(private val webSocketUrl: String, private val token: String) : NavetteApi {
     private val httpClient =
@@ -133,7 +134,10 @@ class NavetteClient(private val webSocketUrl: String, private val token: String)
         }
     }
 
+    @Volatile private var closedByClient = false
+
     override fun close() {
+        closedByClient = true
         webSocket?.close(NORMAL_CLOSURE, "client closing")
         webSocket = null
         _connectionState.value = ConnectionState.Disconnected
@@ -167,13 +171,10 @@ class NavetteClient(private val webSocketUrl: String, private val token: String)
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: OkHttpResponse?) {
-                // NavetteClient has no reconnect loop of its own to stop
-                // (see this class's doc comment), so distinguishing
-                // Unauthorized here is purely about surfacing: the user must
-                // see "pairing rejected", not a generic connection failure
-                // they would otherwise blame on the network. When
-                // reconnection is added here, it inherits the terminal rule
-                // ReconnectPolicy already enforces for the media path.
+                // Distinguishing Unauthorized is about surfacing and about
+                // stopping: AppViewModel never auto-retries it (a rotated
+                // token cannot recover), and the user must see "pairing
+                // rejected", not a generic network failure.
                 _connectionState.value =
                     if (response?.code == 401) {
                         ConnectionState.Unauthorized
@@ -183,8 +184,14 @@ class NavetteClient(private val webSocketUrl: String, private val token: String)
                 failAllPending(t)
             }
 
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                // Complete the close handshake; otherwise the peer's close
+                // frame is never acknowledged and onClosed waits on a timeout.
+                webSocket.close(NORMAL_CLOSURE, "peer closing")
+            }
+
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                _connectionState.value = ConnectionState.Disconnected
+                _connectionState.value = stateAfterClose(closedByClient, reason)
                 failAllPending(IllegalStateException("connection closed: $reason"))
             }
         }
@@ -194,6 +201,19 @@ class NavetteClient(private val webSocketUrl: String, private val token: String)
         const val CALL_TIMEOUT_MS = 15_000L
     }
 }
+
+/**
+ * What a finished close means. A close the client asked for is terminal
+ * [ConnectionState.Disconnected]; one the peer or a proxy initiated is a
+ * [ConnectionState.Failed], so it is retried and shown rather than leaving
+ * the user on a screen with no reason and no Retry.
+ */
+internal fun stateAfterClose(closedByClient: Boolean, reason: String): ConnectionState =
+    if (closedByClient) {
+        ConnectionState.Disconnected
+    } else {
+        ConnectionState.Failed(if (reason.isBlank()) "connection closed by peer" else "connection closed by peer: $reason")
+    }
 
 /**
  * Bracket-wraps a bare IPv6 literal (e.g. a Tailscale address like
