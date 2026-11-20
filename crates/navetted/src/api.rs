@@ -185,8 +185,8 @@ impl<R: ProcessRunner> ApiState<R> {
         let blobs = BlobStore::new(supervisor.blob_root());
         let files = FileTransferStore::new(supervisor.drop_root());
         let thumbnails = ThumbnailStore::default();
-        if let Ok(registry) = supervisor.registry().lock() {
-            for session in registry.list() {
+        if let Ok(sessions) = supervisor.list_sessions() {
+            for session in sessions {
                 if session.status == navette_protocol::SessionStatus::Running {
                     let _ = blobs.activate(&session.name);
                     if let Err(error) = files.recover(&session.name) {
@@ -252,9 +252,8 @@ impl<R: ProcessRunner> ApiState<R> {
     /// `Supervisor::reconcile` returned, so a boot that failed after reconcile
     /// persisted `Stopped` (bind or token error) is still cleaned next boot.
     pub fn teardown_inactive_session_stores(&self) {
-        let names: Vec<String> = match self.supervisor.registry().lock() {
-            Ok(registry) => registry
-                .list()
+        let names: Vec<String> = match self.supervisor.list_sessions() {
+            Ok(sessions) => sessions
                 .into_iter()
                 .filter(|session| session.status != navette_protocol::SessionStatus::Running)
                 .map(|session| session.name)
@@ -285,12 +284,7 @@ impl<R: ProcessRunner> ApiState<R> {
     }
 
     pub fn start_existing_bridges(&self) {
-        let sessions = self
-            .supervisor
-            .registry()
-            .lock()
-            .map(|registry| registry.list())
-            .unwrap_or_default();
+        let sessions = self.supervisor.list_sessions().unwrap_or_default();
         for session in sessions {
             if matches!(session.status, navette_protocol::SessionStatus::Running)
                 && let Err(error) = self.bridges.start(&session)
@@ -824,11 +818,12 @@ fn image_response(
 
 fn is_live_session<R: ProcessRunner>(state: &ApiState<R>, session: &str) -> bool {
     validate_session_name(session).is_ok()
-        && state.supervisor.registry().lock().is_ok_and(|registry| {
-            registry
-                .get(session)
-                .is_some_and(|record| record.status == navette_protocol::SessionStatus::Running)
-        })
+        && state
+            .supervisor
+            .get_session(session)
+            .ok()
+            .flatten()
+            .is_some_and(|record| record.status == navette_protocol::SessionStatus::Running)
 }
 
 fn blob_error_response(error: BlobStoreError) -> HttpResponse {
@@ -896,10 +891,9 @@ async fn media_websocket<R: ProcessRunner>(
     }
     let exists = state
         .supervisor
-        .registry()
-        .lock()
+        .get_session(&session)
         .ok()
-        .and_then(|registry| registry.get(&session).cloned())
+        .flatten()
         .is_some_and(|record| {
             matches!(
                 record.status,
@@ -1117,12 +1111,9 @@ pub async fn dispatch<R: ProcessRunner>(state: &ApiState<R>, request: Request) -
         }),
         RequestCommand::ListSessions => state
             .supervisor
-            .registry()
-            .lock()
-            .map(|registry| ResponseResult::Sessions {
-                sessions: registry.list(),
-            })
-            .map_err(|_| ApiFailure::internal("session registry lock is poisoned")),
+            .list_sessions()
+            .map(|sessions| ResponseResult::Sessions { sessions })
+            .map_err(ApiFailure::from),
         RequestCommand::Run { app_id, name } => {
             let Some(app) = state.apps.get(&app_id) else {
                 return Response::error(
@@ -1221,14 +1212,8 @@ pub async fn dispatch<R: ProcessRunner>(state: &ApiState<R>, request: Request) -
                 let now = now_ms();
                 state
                     .supervisor
-                    .registry()
-                    .lock()
-                    .map_err(|_| ApiFailure::internal("session registry lock is poisoned"))
-                    .and_then(|mut registry| {
-                        registry
-                            .mark_attached(&session, now)
-                            .map_err(ApiFailure::from)
-                    })
+                    .mark_attached(&session, now)
+                    .map_err(ApiFailure::from)
                     .map(|record| ResponseResult::Attach {
                         attach: AttachInfo {
                             session: record.name,
@@ -1239,10 +1224,8 @@ pub async fn dispatch<R: ProcessRunner>(state: &ApiState<R>, request: Request) -
         }
         RequestCommand::Detach { session } => state
             .supervisor
-            .registry()
-            .lock()
-            .map_err(|_| ApiFailure::internal("session registry lock is poisoned"))
-            .and_then(|mut registry| registry.mark_detached(&session).map_err(ApiFailure::from))
+            .mark_detached(&session)
+            .map_err(ApiFailure::from)
             .map(|_| ResponseResult::Ack),
     };
 

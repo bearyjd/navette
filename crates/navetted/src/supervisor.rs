@@ -191,6 +191,28 @@ impl<R: ProcessRunner> Supervisor<R> {
         &self.registry
     }
 
+    fn lock_registry(&self) -> Result<std::sync::MutexGuard<'_, Registry>, SupervisorError> {
+        self.registry
+            .lock()
+            .map_err(|_| SupervisorError::RegistryLock)
+    }
+
+    pub fn list_sessions(&self) -> Result<Vec<Session>, SupervisorError> {
+        Ok(self.lock_registry()?.list())
+    }
+
+    pub fn get_session(&self, name: &str) -> Result<Option<Session>, SupervisorError> {
+        Ok(self.lock_registry()?.get(name).cloned())
+    }
+
+    pub fn mark_attached(&self, name: &str, now_ms: u64) -> Result<Session, SupervisorError> {
+        Ok(self.lock_registry()?.mark_attached(name, now_ms)?)
+    }
+
+    pub fn mark_detached(&self, name: &str) -> Result<Session, SupervisorError> {
+        Ok(self.lock_registry()?.mark_detached(name)?)
+    }
+
     pub async fn start(&self, app: &App, name: Option<&str>) -> Result<Session, SupervisorError> {
         let name = name
             .map(str::to_string)
@@ -1092,5 +1114,85 @@ mod tests {
             blob_dir.join("store-owned").exists(),
             "reconcile reports stopped sessions; the stores tear down their own state"
         );
+    }
+
+    fn sample_session(name: &str) -> Session {
+        Session {
+            name: name.into(),
+            app_id: "firefox".into(),
+            app_pid: 100,
+            daemon_pid: 101,
+            wayland_display: format!("navette-{name}"),
+            socket_path: format!("/run/{name}.sock"),
+            created_at_ms: 0,
+            last_attached_at_ms: None,
+            client_count: 0,
+            status: SessionStatus::Running,
+        }
+    }
+
+    fn poisoned_harness(temp: &TempDir) -> Supervisor<FakeRunner> {
+        let supervisor = harness(Arc::new(FakeRunner::new(temp.path().join("runtime"))), temp);
+        let registry = supervisor.registry().clone();
+        let _ = thread::spawn(move || {
+            let _guard = registry.lock().unwrap();
+            panic!("poison the registry lock");
+        })
+        .join();
+        supervisor
+    }
+
+    #[test]
+    fn session_accessors_read_and_update_the_registry() {
+        let temp = TempDir::new().unwrap();
+        let supervisor = harness(
+            Arc::new(FakeRunner::new(temp.path().join("runtime"))),
+            &temp,
+        );
+        supervisor
+            .registry()
+            .lock()
+            .unwrap()
+            .insert(sample_session("work"))
+            .unwrap();
+
+        assert_eq!(supervisor.list_sessions().unwrap().len(), 1);
+        assert_eq!(
+            supervisor.get_session("work").unwrap().unwrap().name,
+            "work"
+        );
+        assert!(supervisor.get_session("missing").unwrap().is_none());
+
+        let attached = supervisor.mark_attached("work", 200).unwrap();
+        assert_eq!(attached.client_count, 1);
+        assert_eq!(attached.last_attached_at_ms, Some(200));
+        assert_eq!(supervisor.mark_detached("work").unwrap().client_count, 0);
+        assert!(matches!(
+            supervisor.mark_attached("missing", 1),
+            Err(SupervisorError::Registry(RegistryError::NotFound(_)))
+        ));
+    }
+
+    #[test]
+    fn session_accessors_report_a_poisoned_lock() {
+        let temp = TempDir::new().unwrap();
+        let supervisor = poisoned_harness(&temp);
+
+        assert!(matches!(
+            supervisor.list_sessions(),
+            Err(SupervisorError::RegistryLock)
+        ));
+        assert!(matches!(
+            supervisor.get_session("work"),
+            Err(SupervisorError::RegistryLock)
+        ));
+        assert!(matches!(
+            supervisor.mark_attached("work", 1),
+            Err(SupervisorError::RegistryLock)
+        ));
+        assert!(matches!(
+            supervisor.mark_detached("work"),
+            Err(SupervisorError::RegistryLock)
+        ));
     }
 }
