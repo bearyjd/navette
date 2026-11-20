@@ -5,12 +5,16 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use navette_auth::SecretString;
+pub use navette_protocol::{
+    FilePreflight, FilePreflightResponse, FileTransferState, FileTransferStatus,
+};
 use navette_protocol::{
     Request, RequestCommand, Response, ResponseOutcome, ResponseResult, WEBSOCKET_SUBPROTOCOL,
+    WakeRequest,
 };
 use navette_wake::MacAddress;
 use reqwest::StatusCode;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::de::DeserializeOwned;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -30,55 +34,6 @@ const WAKE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct Client {
     url: String,
     token: SecretString,
-}
-
-/// Metadata reserved before a file's bytes are uploaded.
-#[derive(Clone, Debug, Deserialize)]
-pub struct FilePreflightResponse {
-    pub transfer_id: String,
-    pub upload_url: String,
-    pub expires_at: u64,
-}
-
-/// The daemon's view of a file transfer.
-#[derive(Clone, Debug, Deserialize)]
-pub struct FileTransferStatus {
-    pub transfer_id: String,
-    pub name: String,
-    pub mime: String,
-    pub size: u64,
-    pub bytes_received: u64,
-    pub state: FileTransferState,
-    pub expires_at: Option<u64>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FileTransferState {
-    AwaitingUpload,
-    Queued,
-    Materializing,
-    Delivered,
-    Failed,
-    Cancelled,
-}
-
-#[derive(Serialize)]
-struct FilePreflight<'a> {
-    name: &'a str,
-    mime: &'a str,
-    size: u64,
-}
-
-/// Body of `POST /v1/wake`. Omitted fields take the daemon's defaults
-/// (`255.255.255.255`, port 9) rather than a copy of them held here.
-#[derive(Serialize)]
-struct WakeRequest {
-    mac: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    broadcast: Option<Ipv4Addr>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    port: Option<u16>,
 }
 
 impl Client {
@@ -158,7 +113,11 @@ impl Client {
             .http_client()?
             .post(url)
             .header(reqwest::header::AUTHORIZATION, self.authorization_header()?)
-            .json(&FilePreflight { name, mime, size })
+            .json(&FilePreflight {
+                name: name.to_owned(),
+                mime: mime.to_owned(),
+                size,
+            })
             .send()
             .await
             .context("failed to preflight file transfer")?;

@@ -18,12 +18,11 @@ use navette_protocol::media::{
 };
 use navette_protocol::{
     API_VERSION, AttachInfo, ErrorCode, Request, RequestCommand, Response, ResponseResult,
-    WEBSOCKET_SUBPROTOCOL,
+    WEBSOCKET_SUBPROTOCOL, WakeRequest,
 };
 use navette_wake::{
     DEFAULT_BROADCAST, DEFAULT_PORT, LAN_BROADCAST_RULE, MacAddress, is_lan_broadcast_target,
 };
-use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
@@ -328,15 +327,6 @@ pub fn router<R: ProcessRunner>(state: ApiState<R>) -> Router {
         .with_state(state)
 }
 
-/// Body of `POST /v1/wake`. `broadcast` is an IPv4 literal and `port` is
-/// 1-65535; both default when omitted.
-#[derive(Debug, Deserialize)]
-pub struct WakeRequest {
-    pub mac: String,
-    pub broadcast: Option<String>,
-    pub port: Option<u16>,
-}
-
 /// A validated wake request, ready to send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WakeTarget {
@@ -356,9 +346,7 @@ fn parse_wake_request(
         serde_json::from_slice(body).map_err(|_| "body is not a valid wake request")?;
     let mac = request.mac.parse().map_err(|_| "invalid MAC address")?;
     let broadcast = match request.broadcast {
-        Some(literal) => literal
-            .parse()
-            .map_err(|_| "broadcast must be an IPv4 literal")?,
+        Some(broadcast) => broadcast,
         None => default_broadcast,
     };
     if !is_lan_broadcast_target(broadcast) {
