@@ -20,7 +20,9 @@ use nix::sys::stat::{Mode, SFlag, fchmod, fstat, mkdirat};
 use nix::unistd::{UnlinkatFlags, unlinkat};
 
 use navette_protocol::media::{BLOB_ID_LEN, MAX_BLOB_BYTES, is_valid_mime};
-use serde::{Deserialize, Serialize};
+pub use navette_protocol::{
+    FilePreflight, FilePreflightResponse, FileTransferState, FileTransferStatus,
+};
 use thiserror::Error;
 
 use crate::registry::validate_session_name;
@@ -33,43 +35,6 @@ pub const MAX_SESSION_FILE_OBJECTS: u64 = 64;
 /// an unbounded in-memory registry.
 pub const MAX_TERMINAL_TRANSFERS_PER_SESSION: usize = 64;
 pub const TRANSFER_EXPIRY: Duration = Duration::from_secs(15 * 60);
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct FilePreflight {
-    pub name: String,
-    pub mime: String,
-    pub size: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
-pub struct FileTransferStatus {
-    pub transfer_id: String,
-    pub name: String,
-    pub mime: String,
-    pub size: u64,
-    pub bytes_received: u64,
-    pub state: FileTransferState,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<u64>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FileTransferState {
-    AwaitingUpload,
-    Queued,
-    Materializing,
-    Delivered,
-    Failed,
-    Cancelled,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct FilePreflightResponse {
-    pub transfer_id: String,
-    pub upload_url: String,
-    pub expires_at: u64,
-}
 
 /// Opaque proof that a request observed one particular live session
 /// incarnation. It is intentionally not serializable or forgeable by callers.

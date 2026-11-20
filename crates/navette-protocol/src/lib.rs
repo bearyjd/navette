@@ -5,7 +5,12 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod http;
 pub mod media;
+
+pub use http::{
+    FilePreflight, FilePreflightResponse, FileTransferState, FileTransferStatus, WakeRequest,
+};
 
 /// WebSocket subprotocol negotiated by v1 clients and servers.
 pub const WEBSOCKET_SUBPROTOCOL: &str = "navette.v1";

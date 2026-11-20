@@ -338,7 +338,9 @@ async fn copy_file(
                 print_file_status(&status);
                 return Ok(());
             }
-            FileTransferState::Failed | FileTransferState::Cancelled => {
+            FileTransferState::Failed
+            | FileTransferState::Cancelled
+            | FileTransferState::Unknown => {
                 let _ = client.cancel_file(session, &transfer_id).await;
                 bail!("file transfer {transfer_id} ended as {:?}", status.state);
             }
@@ -363,7 +365,9 @@ async fn copy_file(
                 }
                 if matches!(
                     status.state,
-                    FileTransferState::Failed | FileTransferState::Cancelled
+                    FileTransferState::Failed
+                        | FileTransferState::Cancelled
+                        | FileTransferState::Unknown
                 ) {
                     let _ = client.cancel_file(session, &transfer_id).await;
                     bail!("file transfer {transfer_id} ended as {:?}", status.state);
